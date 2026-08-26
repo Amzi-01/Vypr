@@ -48,6 +48,7 @@ enum sash_msg_type {
     SASH_MSG_CLOSE            = 72,  /* sash_msg_window_id */
     SASH_MSG_PING             = 73,  /* sash_msg_ping */
     SASH_MSG_WINDOW_STATE     = 74,  /* sash_msg_window_state */
+    SASH_MSG_MIC              = 75,  /* sash_msg_audio + interleaved float */
 
     /* 128 and up are host-internal: they travel between sashd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the

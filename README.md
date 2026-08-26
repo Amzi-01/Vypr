@@ -208,6 +208,23 @@ was audio cutting out exactly when something loud happened. Dropping loses the
 same audio in ten-millisecond pieces spread across the drain, which is close to
 inaudible.
 
+### Microphone
+
+The host captures its microphone and sends it to the guest, which plays it into
+VB-Audio's virtual cable: what is written to the cable's playback side comes out
+of its recording side, which Windows apps see as an ordinary microphone. The
+guest had no capture device at all before this, so `CABLE Output` is the only
+one it has and applications pick it up without being told to.
+
+Latency is queue depth here too, so the queue is kept to 60ms and old audio is
+dropped rather than played behind the speaker - a microphone that arrives late
+is worse than one that loses a syllable. The host requests 48 kHz stereo float
+so the guest usually has nothing to convert; where the cable disagrees, the
+guest matches its rate and channel count.
+
+Exactly one window carries the microphone, or the guest would hear the same
+voice several times over.
+
 Audio does not go through the shared region. It is tiny beside video - a tenth
 of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
 reliability far more than it wants the last microsecond of latency, which is

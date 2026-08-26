@@ -102,6 +102,10 @@ struct daemon {
     uint64_t    dismissed[MAX_WINDOWS];
     int         dismissed_count;
 
+    /* Only one window may send the microphone, or the guest hears several
+     * copies of the same voice. */
+    uint64_t    mic_owner;
+
     int         clock_logged;
     uint64_t    last_ping_ns;
 
@@ -190,6 +194,7 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
         struct sash_msg_window_id gone = { .window_id = w->id };
         msg_send(d->agent_fd, SASH_MSG_DETACH, &gone, sizeof(gone));
     }
+    if (d->mic_owner == w->id) d->mic_owner = 0;   /* let another window take it */
     if (w->has_slot) sash_shm_free(&d->shm, w->slot);
     memset(w, 0, sizeof(*w));
     w->client_fd = -1;
@@ -218,6 +223,14 @@ static int spawn_client(struct daemon *d, struct window *w)
          * has taken the pointer, or when the user asks for it with
          * Ctrl+Alt+Shift+M. Guessing from "it is fullscreen" was worse than not
          * guessing. */
+    /* The first top-level to start carries the microphone. */
+    int carries_mic = 0;
+    if (!w->is_popup && d->mic_owner == 0) {
+        d->mic_owner = w->id;
+        carries_mic = 1;
+    }
+
+    {
         char *const argv[] = {
             exe,
             "--shm",       (char *)d->shm_path,
@@ -226,6 +239,9 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--window-id", id,
             "--sock",       d->unix_path,
             "--chrome-top", chrome,
+            /* Exactly one window carries the microphone, or the guest hears
+             * the same voice several times over. */
+            carries_mic ? "--mic" : "--no-mic",
             /* Direct control to begin with. Capture engages by itself when the
              * guest reports an app has taken the pointer, and Ctrl+Alt+Shift+M
              * forces it - but a captured pointer is locked in place, so while
@@ -237,6 +253,7 @@ static int spawn_client(struct daemon *d, struct window *w)
         execv(exe, argv);
         fprintf(stderr, "sashd: cannot exec %s: %s\n", exe, strerror(errno));
         _exit(127);
+    }
     }
 
     w->child = pid;
