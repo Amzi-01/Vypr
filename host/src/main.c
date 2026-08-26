@@ -84,7 +84,7 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->title     = "sash";
     o->sock_path = NULL;
     o->backend   = NULL;
-    o->capture   = 1;   /* pointer capture on unless told otherwise */
+    o->capture   = 0;
     o->chrome_top = 0;
     o->window_id = 0;
     o->slot      = 0;
@@ -232,18 +232,31 @@ static SDL_HitTestResult SDLCALL title_hit_test(SDL_Window *win,
                                                 const SDL_Point *pt, void *data)
 {
     const struct hit_ctx *ctx = data;
-    if (!ctx || ctx->captured || ctx->chrome_top == 0) return SDL_HITTEST_NORMAL;
+    if (!ctx) return SDL_HITTEST_NORMAL;
+
+    /*
+     * A window that draws its own chrome reports no title bar - FiveM's
+     * launcher and splash both do - and would otherwise have nothing to drag
+     * by at all. Give it a strip the size of an ordinary title bar, but only
+     * while the pointer is free: a captured game must not lose a band of
+     * clicks across its top.
+     */
+    uint32_t chrome = ctx->chrome_top;
+    if (chrome == 0) {
+        if (ctx->captured) return SDL_HITTEST_NORMAL;
+        chrome = 32;
+    }
 
     int w = 0, h = 0;
     SDL_GetWindowSize(win, &w, &h);
     if (h <= 0 || ctx->src_h == 0) return SDL_HITTEST_NORMAL;
 
     const float scale = (float)h / (float)ctx->src_h;
-    const float strip = ctx->chrome_top * scale;
+    const float strip = chrome * scale;
     if (pt->y >= strip) return SDL_HITTEST_NORMAL;
 
     /* Three caption buttons, each about 1.5x the caption height wide. */
-    const float buttons = ctx->chrome_top * 4.5f * scale;
+    const float buttons = chrome * 4.5f * scale;
     if (pt->x > w - buttons) return SDL_HITTEST_NORMAL;
 
     return SDL_HITTEST_DRAGGABLE;
@@ -440,6 +453,20 @@ int main(int argc, char **argv)
 
     struct pointer_accum pointer = {0};
 
+    /*
+     * Resizing is a negotiation, and both ends were talking at once.
+     *
+     * The host asked the guest to resize on every intermediate size as the
+     * window was dragged, and adopted each frame size that came back - so the
+     * user's drag, the guest's resize and the host's adoption all fought,
+     * which looks like the window juddering and snapping about.
+     *
+     * The request is now sent once the size has settled, and the frame size is
+     * not adopted while a resize is still in progress.
+     */
+    uint32_t resize_w = 0, resize_h = 0;
+    uint64_t resize_at = 0;
+
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
@@ -619,19 +646,25 @@ int main(int argc, char **argv)
                 if ((uint32_t)ev.window.data1 == v->src_w &&
                     (uint32_t)ev.window.data2 == v->src_h)
                     break;
-                /* Ask the guest window to match, so the stream is pixel-exact
-                 * rather than scaled. The guest may refuse - a fixed-size app
-                 * simply will not resize - and then scaling stands in. */
-                struct sash_msg_resize msg = {0};
-                msg.window_id = v->window_id;
-                msg.width  = (uint32_t)ev.window.data1;
-                msg.height = (uint32_t)ev.window.data2;
-                msg_send(daemon_fd, SASH_MSG_RESIZE, &msg, sizeof(msg));
+                /* Note it and wait for the drag to finish. */
+                resize_w  = (uint32_t)ev.window.data1;
+                resize_h  = (uint32_t)ev.window.data2;
+                resize_at = SDL_GetTicks();
                 break;
             }
             default:
                 break;
             }
+        }
+
+        /* Settled? Then ask the guest to match. */
+        if (resize_at && SDL_GetTicks() - resize_at > 200) {
+            struct sash_msg_resize rs = {0};
+            rs.window_id = views[0].window_id;
+            rs.width  = resize_w;
+            rs.height = resize_h;
+            msg_send(daemon_fd, SASH_MSG_RESIZE, &rs, sizeof(rs));
+            resize_at = 0;
         }
 
         hit.chrome_top = chrome_reported;
@@ -685,9 +718,10 @@ int main(int argc, char **argv)
                 if (f.width != v->src_w || f.height != v->src_h) {
                     v->src_w = f.width;
                     v->src_h = f.height;
-                    /* A popup is sized by the guest; only a top-level adopts
-                     * the frame size, since the user may have resized it. */
-                    if (!v->is_popup)
+                    /* A popup is sized by the guest. A top-level adopts the
+                     * frame size too, but not while the user is still dragging
+                     * its edge - that is what made resizing judder. */
+                    if (!v->is_popup && resize_at == 0)
                         SDL_SetWindowSize(v->win, (int)f.width, (int)f.height);
                 }
 

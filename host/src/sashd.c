@@ -195,7 +195,12 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--window-id", id,
             "--sock",       d->unix_path,
             "--chrome-top", chrome,
-            "--capture",
+            /* Direct control to begin with. Capture engages by itself when the
+             * guest reports an app has taken the pointer, and Ctrl+Alt+Shift+M
+             * forces it - but a captured pointer is locked in place, so while
+             * it is held the window cannot be dragged and the cursor is hidden.
+             * That is right for a game and wrong for everything before one. */
+            "--no-capture",
             NULL
         };
         execv(exe, argv);
