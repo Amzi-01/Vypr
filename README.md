@@ -1,0 +1,136 @@
+# sash
+
+Per-application native windows from a Windows VM, over shared memory.
+
+An app running in the guest appears as an ordinary window on the Linux desktop —
+its own entry in the taskbar, its own place in the stacking order — with no RDP
+and no video codec in the path.
+
+## Why not the obvious approaches
+
+**RDP RemoteApp** (what WinApps uses) hands over each window as a separate
+object, which is exactly the right shape. Its video path is built for documents:
+it is fine for a text editor and poor for anything that moves.
+
+**Sunshine/Moonlight** has an excellent encoder, but streams a whole display.
+Everything inside it arrives as one window with one identity, so it cannot make
+two guest apps into two host windows.
+
+**Looking Glass** proves the transport this project uses, but captures with DXGI
+Desktop Duplication, which returns the *composited desktop*. A window behind
+another simply is not present in that data, so windows cannot be cropped out of
+it afterwards.
+
+`Windows.Graphics.Capture` is the piece that makes per-window work: it captures a
+specific `HWND` from DWM's own per-window surfaces, and keeps producing frames
+when the window is occluded, minimised, or offscreen. The whole design rests on
+that property.
+
+## Design
+
+```
+guest (Windows, C++)                       host (Linux, C)
+┌───────────────────────────┐              ┌─────────────────────────────┐
+│ WGC capture per HWND      │── IVSHMEM ──▶│ sash-host, one per window   │
+│ publish under a seqlock   │   (pixels)   │ SDL3 present, native window │
+│ SendInput injection       │◀── TCP ──────│ input, window lifecycle     │
+└───────────────────────────┘  (control)   └─────────────────────────────┘
+```
+
+**Pixels go through IVSHMEM uncompressed.** The guest has a passthrough GPU, and
+the shared BAR is host RAM, so a frame costs one write over PCIe and one read —
+no encode, no decode, no network stack, and no codec latency at all.
+
+**Control goes over TCP** on the virtual bridge, where a round trip is tens of
+microseconds. One connection per session, not per window: window identity is an
+explicit `window_id` in every message, so a re-attaching stream can say which
+`HWND` it used to be.
+
+**The host owns allocation.** It carves slots and rings out of the region and
+tells the guest the offsets. Neither side needs a shared allocator and there are
+no cross-OS atomics in the allocation path.
+
+**One host process per window**, so a wedged stream costs one window rather than
+the session, and the compositor sees the separate top-levels it needs to.
+
+### Frame handoff
+
+Each slot is a ring of three buffers. The guest writes pixels into the next
+buffer, then publishes `{index, serial, width, height, stride}` under a seqlock:
+counter to odd, write the record, counter to even. A host that reads an odd
+counter, or a different one before and after, saw a torn record and retries.
+Two stores per frame, and no lock spanning the VM boundary.
+
+`tools/sash-testsrc.c` is the reference implementation of that publish path. If
+it and the guest agent ever disagree about ordering, the tool is right — the
+host is verified against it.
+
+## Measured
+
+Host presenting `sash-testsrc` on an RTX 3060, SDL3 `gpu` backend:
+
+| Source | Presented | Dropped | Upload | Present |
+|---|---|---|---|---|
+| 1920x1080 @ 60 | 60 fps | 0 | 3.0 ms | 13.7 ms (mostly vsync wait) |
+| 3840x2160 @ 60 | 55 fps | 5-6 | 15.9 ms | 2.5 ms |
+
+Renderer backend is worth roughly 2x at 4K and was the single largest factor
+found so far: SDL's default `opengl` backend presents synchronously at 21-24 ms,
+which misses vsync on its own and pins the stream to half refresh. `gpu` presents
+in ~2 ms and lets the upload overlap, so it is now the default.
+
+4K60 is not yet clean. The remaining cost is the 16 ms upload, which runs at
+~2 GB/s against 14.5 GB/s of measured memory bandwidth — the ceiling is SDL's
+`LockTexture`/`UnlockTexture` staging, not the transport. Closing it means
+uploading from the mapped region directly via a persistently mapped PBO, which
+requires dropping `SDL_Renderer` for direct EGL or Vulkan.
+
+## Status
+
+| Component | State |
+|---|---|
+| `include/sash_shm.h` — region layout | done |
+| `include/sash_proto.h` — control protocol v1 | defined, not yet spoken |
+| `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
+| `host/src/main.c` — present a slot as a native window | working |
+| `tools/sash-testsrc.c` — reference producer | working |
+| Control channel — host end | not started |
+| Guest agent — WGC capture, publish, input | not started |
+| IVSHMEM device on the VM | not added |
+| IVSHMEM driver in the guest | not installed |
+| Launcher / `.desktop` integration | not started |
+
+## Building
+
+```bash
+cd host
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Needs SDL3.
+
+## Running without the VM
+
+The host side is developed and proven with the guest powered off:
+
+```bash
+./build/sash-testsrc --shm /dev/shm/sash-test --size 1920x1080 --fps 60 &
+./build/sash-host --shm /dev/shm/sash-test --slot 0 --stats
+```
+
+## Known hard problems
+
+Inherited from the earlier prototype's notes, none of them solved yet:
+
+- **DPI.** A guest at 150% scaling reports a client-area size that does not match
+  the captured surface.
+- **Popups and menus.** Each is its own `HWND`, so each arrives as its own
+  stream and has to be positioned against its owner — `owner_id` exists in the
+  protocol for this, and nothing uses it yet.
+- **Z-order and focus.** The host WM owns stacking; the guest has its own idea.
+  Unreconciled, the two fight.
+- **Reconnect.** A dropped stream must re-attach to the same `HWND` rather than
+  opening a second window for it.
+- **Cursor.** Whether to composite the guest cursor into the frame or hand the
+  host a cursor shape. The protocol assumes the latter.

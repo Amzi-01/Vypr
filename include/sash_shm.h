@@ -1,0 +1,114 @@
+/*
+ * sash_shm.h - layout of the shared-memory region between the Windows guest
+ *              and the Linux host. Included verbatim by both sides, so it must
+ *              stay free of platform headers and free of anything C++-only.
+ *
+ * The region is an IVSHMEM BAR: the same physical pages appear as a PCI device
+ * to the guest and as a file under /dev/shm to the host. There is no kernel
+ * mediating access, which is the point - a frame costs one memcpy and no
+ * encode, no decode, and no network stack.
+ *
+ * Ownership rules, which the whole design leans on:
+ *
+ *   - The HOST owns allocation. It carves slots and rings out of the region and
+ *     tells the guest the offsets over the TCP control channel. Neither side
+ *     needs a shared allocator, and cross-OS atomic allocation is avoided
+ *     entirely.
+ *   - The GUEST owns frame contents. It is the only writer of pixel data and of
+ *     each slot's publish record.
+ *   - Nothing here is a security boundary. A hostile guest can scribble over
+ *     the whole region; it already has a passthrough GPU.
+ */
+#ifndef SASH_SHM_H
+#define SASH_SHM_H
+
+#include <stdint.h>
+
+#define SASH_SHM_MAGIC      0x48534153u  /* 'SASH' little-endian */
+#define SASH_SHM_VERSION    1u
+
+/* Slots are windows. Sixteen is far past what a person keeps open from one VM,
+ * and keeping it fixed lets the header be a plain struct at a known offset. */
+#define SASH_MAX_SLOTS      16u
+
+/* Ring depth per window. Three is the smallest depth where the producer can
+ * write while the consumer reads and still have a spare to publish into. */
+#define SASH_RING_FRAMES    3u
+
+/* Pixel formats. BGRA is what Windows.Graphics.Capture hands back, so it is
+ * the only one the first version speaks. */
+#define SASH_FMT_BGRA8      1u
+
+enum sash_slot_state {
+    SASH_SLOT_FREE   = 0,  /* host may allocate it */
+    SASH_SLOT_ARMED  = 1,  /* host allocated, guest has not published yet */
+    SASH_SLOT_LIVE   = 2,  /* guest is publishing frames */
+    SASH_SLOT_CLOSED = 3   /* guest window is gone; host reclaims */
+};
+
+/*
+ * Publish record. The guest writes pixels into ring buffer `index`, then
+ * publishes here.
+ *
+ * `seq` is a seqlock counter, not a frame number: the guest increments it to an
+ * odd value before touching the record, and to the next even value after. A
+ * host that reads an odd seq, or a different seq before and after, saw a torn
+ * record and drops that read. It costs two stores per frame and removes the
+ * need for any lock across the VM boundary.
+ */
+struct sash_publish {
+    volatile uint32_t seq;       /* even = stable, odd = being written */
+    uint32_t index;              /* which ring buffer holds the frame */
+    uint32_t serial;             /* increments once per published frame */
+    uint32_t width;              /* may change mid-stream when the window resizes */
+    uint32_t height;
+    uint32_t stride;             /* bytes per row; >= width * 4 */
+    uint64_t capture_qpc;        /* guest QueryPerformanceCounter at capture */
+    uint64_t capture_qpc_freq;   /* so the host can convert without asking */
+    uint32_t flags;
+    uint32_t _pad;
+};
+
+#define SASH_PUB_CURSOR_VISIBLE  (1u << 0)
+#define SASH_PUB_DAMAGE_FULL     (1u << 1)
+
+struct sash_slot {
+    volatile uint32_t state;     /* enum sash_slot_state */
+    uint32_t format;             /* SASH_FMT_* */
+    uint64_t window_id;          /* guest HWND, as an opaque identity */
+
+    /* Ring geometry, written by the host at allocation and read-only to the
+     * guest. `frame_stride` is the allocation pitch, which does not shrink when
+     * a window is resized smaller - that would mean reallocating mid-stream. */
+    uint64_t ring_offset;        /* byte offset from region base */
+    uint64_t frame_bytes;        /* bytes reserved per ring buffer */
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t frame_stride;
+    uint32_t _pad;
+
+    struct sash_publish pub;
+};
+
+struct sash_shm_header {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t region_bytes;
+    uint32_t slot_count;
+    uint32_t _pad;
+
+    /* Bumped by the host every time it re-carves the region, so a guest that
+     * reconnects can tell its cached offsets are stale. */
+    volatile uint32_t generation;
+    uint32_t _pad2;
+
+    struct sash_slot slots[SASH_MAX_SLOTS];
+};
+
+/* Pixel data starts after the header, rounded up to a page so that ring buffers
+ * are page-aligned and a memcpy out of one does not straddle needlessly. */
+#define SASH_DATA_ALIGN     4096u
+#define SASH_HEADER_BYTES   ((sizeof(struct sash_shm_header) + SASH_DATA_ALIGN - 1) \
+                             & ~(uint64_t)(SASH_DATA_ALIGN - 1))
+
+#endif /* SASH_SHM_H */
