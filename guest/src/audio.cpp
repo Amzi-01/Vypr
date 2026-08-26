@@ -40,6 +40,42 @@ static void to_float(const BYTE* src, const WAVEFORMATEX* wfx,
     }
 }
 
+/*
+ * Fold multichannel down to stereo before it goes anywhere.
+ *
+ * This guest's endpoint is 7.1, so the stream was 48 kHz by 8 channels of
+ * float - 1.5 MB/s, four times what stereo needs, sharing the control channel
+ * with input. Sending it all and letting the host mix it down means paying for
+ * six channels of bandwidth to throw them away at the other end.
+ *
+ * Standard coefficients: centre and the surrounds are attenuated into both
+ * sides rather than dropped, or dialogue - which lives in the centre channel -
+ * would go missing. LFE is left out; it is not reproducible on most desktop
+ * outputs and only eats headroom.
+ */
+static void downmix_stereo(const std::vector<float>& in, std::uint32_t frames,
+                           std::uint32_t ch, std::vector<float>& out) {
+    out.resize(static_cast<std::size_t>(frames) * 2);
+
+    for (std::uint32_t f = 0; f < frames; f++) {
+        const float* src = &in[static_cast<std::size_t>(f) * ch];
+        float l = src[0];
+        float r = src[1];
+
+        if (ch >= 3) { const float c = src[2] * 0.707f; l += c; r += c; }
+        if (ch >= 6) { l += src[4] * 0.5f; r += src[5] * 0.5f; }   /* back */
+        if (ch >= 8) { l += src[6] * 0.5f; r += src[7] * 0.5f; }   /* side */
+
+        if (l >  1.0f) l =  1.0f;
+        if (l < -1.0f) l = -1.0f;
+        if (r >  1.0f) r =  1.0f;
+        if (r < -1.0f) r = -1.0f;
+
+        out[static_cast<std::size_t>(f) * 2 + 0] = l;
+        out[static_cast<std::size_t>(f) * 2 + 1] = r;
+    }
+}
+
 void AudioCapture::Impl::run(Sink sink) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
 
@@ -76,15 +112,18 @@ void AudioCapture::Impl::run(Sink sink) {
     }
 
     /*
-     * 50ms, not 200.
+     * 100ms.
      *
-     * Everything the endpoint has buffered when a packet is finally read is
-     * audio that already happened, and it arrives late by exactly that much.
-     * The buffer only has to outlast a scheduling hiccup between polls, and
-     * polling is every couple of milliseconds - so a fifth of a second of slack
-     * bought nothing except a fifth of a second of delay.
+     * This was cut to 50ms to save latency and the audio came back broken up:
+     * the buffer has to outlast a scheduling hiccup, and under game load, with
+     * eight vCPUs busy, the capture thread does not always get to run when it
+     * would like. Overrunning the buffer loses samples outright, which is
+     * audible in a way that a little latency is not.
+     *
+     * Latency is not saved here anyway. What matters is how much is standing
+     * in the *host's* queue, which is dealt with there.
      */
-    const REFERENCE_TIME dur = 500000;
+    const REFERENCE_TIME dur = 1000000;
     if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
                                   dur, 0, wfx, nullptr)) ||
         FAILED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture)) ||
@@ -97,11 +136,11 @@ void AudioCapture::Impl::run(Sink sink) {
     std::fprintf(stderr, "sash: audio %lu Hz, %u channels, %u-bit\n",
                  wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample);
 
-    std::vector<float> samples;
+    std::vector<float> samples, stereo;
     while (!stop.load()) {
         UINT32 packet = 0;
         if (FAILED(capture->GetNextPacketSize(&packet))) break;
-        if (packet == 0) { Sleep(2); continue; }
+        if (packet == 0) { Sleep(5); continue; }
 
         while (packet > 0 && !stop.load()) {
             BYTE*  data  = nullptr;
@@ -117,8 +156,14 @@ void AudioCapture::Impl::run(Sink sink) {
                 } else {
                     to_float(data, wfx, frames, samples);
                 }
-                if (!samples.empty())
-                    sink(samples.data(), frames, wfx->nSamplesPerSec, wfx->nChannels);
+                if (!samples.empty()) {
+                    if (wfx->nChannels > 2) {
+                        downmix_stereo(samples, frames, wfx->nChannels, stereo);
+                        sink(stereo.data(), frames, wfx->nSamplesPerSec, 2);
+                    } else {
+                        sink(samples.data(), frames, wfx->nSamplesPerSec, wfx->nChannels);
+                    }
+                }
             }
 
             capture->ReleaseBuffer(frames);

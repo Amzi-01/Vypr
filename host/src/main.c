@@ -473,6 +473,8 @@ int main(int argc, char **argv)
     SDL_AudioStream *audio = NULL;
     uint32_t audio_rate = 0;
     uint16_t audio_channels = 0;
+    uint64_t audio_opened_at = 0;
+    uint64_t audio_logged_at = 0;
 
     struct pointer_accum pointer = {0};
 
@@ -768,6 +770,7 @@ int main(int argc, char **argv)
                                     SDL_ResumeAudioStreamDevice(audio);
                                     audio_rate = a->sample_rate;
                                     audio_channels = a->channels;
+                                    audio_opened_at = SDL_GetTicks();
                                     printf("sash: audio %u Hz, %u channels\n",
                                            a->sample_rate, a->channels);
                                     fflush(stdout);
@@ -778,27 +781,42 @@ int main(int argc, char **argv)
                             }
                             if (audio) {
                                 /*
-                                 * Never let the queue grow without bound.
+                                 * Whatever is queued is delay, and it is never
+                                 * recovered - so a backlog formed once is heard
+                                 * for the rest of the session.
                                  *
-                                 * Whatever is queued is delay, and queued audio
-                                 * is never recovered: if the guest produces even
-                                 * slightly faster than this device consumes, or
-                                 * a hitch puts a backlog in, that backlog stays
-                                 * for the rest of the session and everything is
-                                 * heard late by that much.
+                                 * Clearing the queue is a hard gap in the sound,
+                                 * so it must be rare. Trimming on a tight
+                                 * threshold made it constant, and turned a
+                                 * delay into a stutter: the cure was worse.
                                  *
-                                 * The cap is 50ms, chosen against the video
-                                 * path rather than in isolation: capture to
-                                 * present measures roughly 35-50ms, so letting
-                                 * audio sit further behind than that would put
-                                 * sound audibly after the picture even with the
-                                 * queue "healthy".
+                                 * The backlog is almost entirely handed over at
+                                 * the start, when the endpoint's buffer is
+                                 * drained in one go. So trim during the first
+                                 * couple of seconds, when a gap is inaudible
+                                 * against silence or a loading screen, and
+                                 * afterwards leave it alone unless something has
+                                 * gone genuinely wrong.
                                  */
-                                const int max_queued =
-                                    (int)(audio_rate * audio_channels * sizeof(float) / 20);
-                                if (SDL_GetAudioStreamQueued(audio) > max_queued)
+                                const int per_second =
+                                    (int)(audio_rate * audio_channels * sizeof(float));
+                                const bool settling =
+                                    SDL_GetTicks() - audio_opened_at < 2000;
+                                const int limit = settling ? per_second / 25   /* 40ms */
+                                                           : per_second / 2;   /* 500ms */
+                                if (SDL_GetAudioStreamQueued(audio) > limit)
                                     SDL_ClearAudioStream(audio);
                                 SDL_PutAudioStreamData(audio, payload + sizeof(*a), (int)want);
+
+                                /* Report the standing delay, so it can be tuned
+                                 * from a measurement rather than by ear. */
+                                if (SDL_GetTicks() - audio_logged_at > 5000) {
+                                    audio_logged_at = SDL_GetTicks();
+                                    printf("sash: audio queued %.0f ms\n",
+                                           SDL_GetAudioStreamQueued(audio) * 1000.0
+                                           / per_second);
+                                    fflush(stdout);
+                                }
                             }
                         }
                     } else if (head.type == SASH_MSG_CLIENT_STATE &&

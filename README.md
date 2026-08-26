@@ -178,6 +178,18 @@ playback stream on the first block that arrives, matching whatever rate and
 channel count the guest is actually producing rather than asking for a format
 and making somebody resample.
 
+Multichannel is folded to stereo **in the guest**. This guest's endpoint is
+7.1, so the stream was 48 kHz by 8 channels of float - 1.5 MB/s, four times what
+stereo needs, sharing the control channel with input. Sending it all and letting
+the host mix it down means paying for six channels of bandwidth in order to
+throw them away at the far end, and it was enough to make the audio break up.
+Centre and surrounds are attenuated into both sides rather than dropped, since
+dialogue lives in the centre channel.
+
+Queue depth is reported every few seconds, because queue depth *is* the delay
+and it is worth being able to read it rather than judge by ear. Measured 385-431
+ms before the downmix and 10-14 ms after.
+
 Audio does not go through the shared region. It is tiny beside video - a tenth
 of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
 reliability far more than it wants the last microsecond of latency, which is
