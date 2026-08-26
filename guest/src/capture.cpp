@@ -1,4 +1,5 @@
 #include "capture.hpp"
+#include "geometry.hpp"
 #include "publisher.hpp"
 
 #include <windows.h>
@@ -107,8 +108,8 @@ void WindowCapture::Impl::gdi_loop() {
     int     dib_w = 0, dib_h = 0;
 
     while (!gdi_stop.load()) {
-        RECT r{};
-        if (!IsWindow(gdi_hwnd) || !GetWindowRect(gdi_hwnd, &r)) break;
+        if (!IsWindow(gdi_hwnd)) break;
+        const RECT r = sash_capture_rect(gdi_hwnd);
 
         const int w = r.right - r.left;
         const int h = r.bottom - r.top;

@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include "geometry.hpp"
+
 #include <vector>
 
 namespace sash {
@@ -15,9 +17,13 @@ HWND to_hwnd(std::uint64_t id) {
 // SendInput's absolute coordinates are normalised across the whole virtual
 // desktop, not one monitor - getting this wrong lands the pointer on the wrong
 // screen in a multi-monitor guest.
+//
+// `cx`/`cy` are offsets inside the captured surface, which is the DWM extended
+// frame - the same rectangle the host is displaying. Treating them as client
+// coordinates would shift every click down by the title and menu bar.
 bool to_absolute(HWND hwnd, int cx, int cy, LONG* out_x, LONG* out_y) {
-    POINT pt{ cx, cy };
-    if (!ClientToScreen(hwnd, &pt)) return false;
+    const RECT cap = sash_capture_rect(hwnd);
+    POINT pt{ cap.left + cx, cap.top + cy };
 
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -157,13 +163,19 @@ void resize_window(const sash_msg_resize& msg) {
     HWND hwnd = to_hwnd(msg.window_id);
     if (!IsWindow(hwnd)) return;
 
-    // The host asks for a client-area size; the window needs the frame added.
-    RECT want{ 0, 0, static_cast<LONG>(msg.width), static_cast<LONG>(msg.height) };
-    const DWORD style   = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
-    const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
-    AdjustWindowRectEx(&want, style, FALSE, ex_style);
+    // The host asks in captured-surface terms, which is the DWM frame. The
+    // window itself is larger by the invisible resize border, so carry that
+    // difference across rather than resizing to the wrong thing.
+    RECT outer{};
+    GetWindowRect(hwnd, &outer);
+    const RECT cap = sash_capture_rect(hwnd);
 
-    SetWindowPos(hwnd, nullptr, 0, 0, want.right - want.left, want.bottom - want.top,
+    const LONG pad_w = (outer.right - outer.left) - (cap.right - cap.left);
+    const LONG pad_h = (outer.bottom - outer.top) - (cap.bottom - cap.top);
+
+    SetWindowPos(hwnd, nullptr, 0, 0,
+                 static_cast<int>(msg.width) + pad_w,
+                 static_cast<int>(msg.height) + pad_h,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 

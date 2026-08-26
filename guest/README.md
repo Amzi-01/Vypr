@@ -76,10 +76,15 @@ Input injection is verified too - typing into the host window arrives in the
 guest application, so the PS/2 set 1 scancode table and the AttachThreadInput
 focus handling both work.
 
+**All input coordinates are in captured-surface space**, which is the DWM
+extended frame - not the client rect, and not GetWindowRect. See
+`geometry.hpp`; getting this wrong silently offsets every click by the height
+of the title bar.
+
 ## Still unproven
 
-Cursor shapes, popups and menus, reconnect, DPI scaling, mouse buttons and
-wheel, and anything that moves fast enough to expose latency.
+Cursor shapes, reconnect, and anything that moves fast enough to expose
+latency.
 
 The IVSHMEM IOCTL numbers in `ivshmem.cpp` were checked against the installed
 driver (2025-03-06) by reading its PDB and image rather than by compiling: the

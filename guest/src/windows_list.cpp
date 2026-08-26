@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <dwmapi.h>
 
+#include "geometry.hpp"
+
 #include <cstdio>
 
 #pragma comment(lib, "dwmapi.lib")
@@ -84,9 +86,8 @@ bool is_presentable(HWND hwnd) {
     const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if (ex & WS_EX_NOREDIRECTIONBITMAP) return false;  // nothing for WGC to capture
 
-    RECT r{};
-    if (!GetClientRect(hwnd, &r)) return false;
-    if (r.right - r.left < 8 || r.bottom - r.top < 8) return false;
+    const RECT cap = sash_capture_rect(hwnd);
+    if (cap.right - cap.left < 8 || cap.bottom - cap.top < 8) return false;
 
     return true;
 }
@@ -152,10 +153,9 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     HWND hwnd = static_cast<HWND>(hwnd_raw);
     if (!IsWindow(hwnd) || !is_presentable(hwnd)) return false;
 
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    POINT origin{ 0, 0 };
-    ClientToScreen(hwnd, &origin);
+    // Geometry of the captured surface, so the host's idea of the window and
+    // the pixels it is showing describe the same rectangle.
+    const RECT cap = sash_capture_rect(hwnd);
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
@@ -169,10 +169,10 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     const bool popup = is_popup_surface(hwnd);
     d.owner_id  = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
         popup ? owner_of_popup(hwnd) : GetWindow(hwnd, GW_OWNER)));
-    d.x      = origin.x;
-    d.y      = origin.y;
-    d.width  = static_cast<std::uint32_t>(client.right - client.left);
-    d.height = static_cast<std::uint32_t>(client.bottom - client.top);
+    d.x      = cap.left;
+    d.y      = cap.top;
+    d.width  = static_cast<std::uint32_t>(cap.right - cap.left);
+    d.height = static_cast<std::uint32_t>(cap.bottom - cap.top);
     d.pid    = pid;
 
     // Per-window DPI, not the system's. A guest with mixed-DPI monitors reports
@@ -219,14 +219,30 @@ BOOL CALLBACK dump_one(HWND hwnd, LPARAM) {
     int cloaked = 0;
     DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
 
-    std::printf("hwnd=%p cls='%ls' title='%ls' %ldx%ld at %ld,%ld\n"
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    POINT corigin{0, 0};
+    ClientToScreen(hwnd, &corigin);
+
+    // What WGC actually captures is the DWM extended frame, not GetWindowRect -
+    // the latter includes the invisible resize border Windows 10 adds.
+    RECT fr{};
+    DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &fr, sizeof(fr));
+
+    std::printf("hwnd=%p cls='%ls' title='%ls'\n"
+                "    windowrect  %ldx%ld at %ld,%ld\n"
+                "    clientrect  %ldx%ld at %ld,%ld (screen origin)\n"
+                "    dwmframe    %ldx%ld at %ld,%ld\n"
                 "    style=0x%08llX ex=0x%08llX owner=%p cloaked=%d "
-                "popup=%d presentable=%d\n",
+                "popup=%d presentable=%d dpi=%u\n",
                 (void*)hwnd, cls, title,
                 r.right - r.left, r.bottom - r.top, r.left, r.top,
+                cr.right - cr.left, cr.bottom - cr.top, corigin.x, corigin.y,
+                fr.right - fr.left, fr.bottom - fr.top, fr.left, fr.top,
                 (unsigned long long)style, (unsigned long long)ex,
                 (void*)GetWindow(hwnd, GW_OWNER), cloaked,
-                is_popup_surface(hwnd) ? 1 : 0, is_presentable(hwnd) ? 1 : 0);
+                is_popup_surface(hwnd) ? 1 : 0, is_presentable(hwnd) ? 1 : 0,
+                GetDpiForWindow(hwnd));
     return TRUE;
 }
 }  // namespace

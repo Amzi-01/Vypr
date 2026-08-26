@@ -168,8 +168,15 @@ For the presenter alone, without the daemon:
 
 Inherited from the earlier prototype's notes, none of them solved yet:
 
-- **DPI.** A guest at 150% scaling reports a client-area size that does not match
-  the captured surface.
+- ~~**DPI / coordinate space.**~~ Done, and it was the cause of menu bar clicks
+  being ignored. Three rectangles describe a window and all three differ - at
+  150% scaling Notepad measured window 2085x1053 at 152,152, client 2063x967 at
+  163,227, and DWM extended frame 2065x1043 at 162,152. WGC captures the **DWM
+  extended frame**; reporting the client rect put the origin 75px too low, the
+  height of the title bar plus menu bar, so every click landed that far down and
+  menu bar clicks reached the text area instead. `geometry.hpp` now defines the
+  captured rectangle once and enumeration, input and the GDI fallback all use
+  it.
 - **Popups and menus.** Each is its own `HWND`, so each arrives as its own
   stream and has to be positioned against its owner — `owner_id` exists in the
   protocol for this, and nothing uses it yet.
