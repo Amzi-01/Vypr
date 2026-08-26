@@ -27,6 +27,8 @@ void resize_window(const sash_msg_resize& msg);
  * Suspended only while an app holds the pointer, and restored afterwards - it
  * is the user's Windows setting, not ours to keep.
  */
+void set_window_minimized(std::uint64_t window_id, bool minimized);
+
 void suspend_pointer_acceleration();
 void restore_pointer_acceleration();
 

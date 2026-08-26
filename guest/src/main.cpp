@@ -242,6 +242,11 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
                               bytes - static_cast<std::uint32_t>(sizeof(*m)));
         }
         break;
+    case SASH_MSG_WINDOW_STATE:
+        if (auto* m = as<sash_msg_window_state>(payload, bytes))
+            sash::set_window_minimized(m->window_id, m->minimized != 0);
+        break;
+
     case SASH_MSG_FOCUS:
         if (auto* m = as<sash_msg_window_id>(payload, bytes)) sash::focus_window(m->window_id);
         break;

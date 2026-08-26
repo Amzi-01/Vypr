@@ -46,6 +46,7 @@ enum sash_msg_type {
     SASH_MSG_FOCUS            = 71,  /* sash_msg_window_id */
     SASH_MSG_CLOSE            = 72,  /* sash_msg_window_id */
     SASH_MSG_PING             = 73,  /* sash_msg_ping */
+    SASH_MSG_WINDOW_STATE     = 74,  /* sash_msg_window_state */
 
     /* 128 and up are host-internal: they travel between sashd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
@@ -54,7 +55,8 @@ enum sash_msg_type {
     SASH_MSG_CLIENT_POPUP     = 129, /* sash_msg_client_popup */
     SASH_MSG_CLIENT_POPUP_END = 130, /* sash_msg_window_id */
     SASH_MSG_CLIENT_LOCK      = 131, /* sash_msg_pointer_lock */
-    SASH_MSG_CLIENT_GEOM      = 132  /* sash_msg_client_geom */
+    SASH_MSG_CLIENT_GEOM      = 132, /* sash_msg_client_geom */
+    SASH_MSG_CLIENT_STATE     = 133  /* sash_msg_window_state */
 };
 
 /*
@@ -221,6 +223,25 @@ struct sash_msg_pointer_lock {
  * switches between windowed and fullscreen - and a stale value means drags get
  * forwarded and move the window inside the VM instead.
  */
+/*
+ * Minimised or not, kept the same on both sides.
+ *
+ * The guest's own minimise button is part of the captured image, so clicking it
+ * minimises the window in the VM - and a minimised window stops producing
+ * frames, leaving a live host window showing a picture that never changes.
+ * Equally, minimising on the host without telling the guest leaves the guest
+ * window up and rendering for nothing.
+ *
+ * So the state travels in both directions, and each side applies it only when
+ * it differs from what it already has, which is what stops the two of them
+ * bouncing it back and forth forever.
+ */
+struct sash_msg_window_state {
+    uint64_t window_id;
+    uint32_t minimized;
+    uint32_t _pad;
+};
+
 struct sash_msg_client_geom {
     uint64_t window_id;
     uint32_t chrome_top;

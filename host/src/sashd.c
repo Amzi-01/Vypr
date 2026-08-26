@@ -68,6 +68,7 @@ struct window {
     int32_t  gx, gy;        /* guest screen position of the client area */
     uint32_t width, height;
     uint32_t chrome_top;
+    int      minimized;
     char     title[192];
 };
 
@@ -309,6 +310,19 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (!wanted) break;
 
         struct window *w = window_find(d, desc->window_id);
+
+        /* Mirror the guest's minimised state onto the host window, so a window
+         * that stops producing frames is not left on screen looking frozen. */
+        if (w && w->has_slot && w->client_fd >= 0) {
+            const int mini = (desc->flags & SASH_WIN_MINIMIZED) != 0;
+            if (mini != w->minimized) {
+                w->minimized = mini;
+                struct sash_msg_window_state st = {0};
+                st.window_id = w->id;
+                st.minimized = (uint32_t)mini;
+                msg_send(w->client_fd, SASH_MSG_CLIENT_STATE, &st, sizeof(st));
+            }
+        }
 
         /* Keep the client's notion of the title bar in step with the window. */
         if (w && w->has_slot && w->client_fd >= 0 &&

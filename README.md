@@ -170,6 +170,19 @@ input goes straight through to Windows. Decorating it with the compositor as
 well would mean two sets of chrome for one window, with the outer set operating
 on a picture of the inner one.
 
+### Minimise
+
+The guest's minimise button is part of the captured image, so clicking it
+minimises the window inside the VM - and a minimised window stops producing
+frames, which would leave a live host window showing a picture that never
+changes. Minimising only on the host is no better: the guest window stays up
+and renders for nothing.
+
+So the state travels both ways. The guest reporting itself minimised minimises
+the host window to the taskbar; restoring it from the taskbar restores the
+guest window. Each side applies a state only when it differs from the one it
+already has, which is what stops the two bouncing it back and forth.
+
 ### Dragging and the window buttons
 
 The guest's title bar is the only handle an undecorated window has, so a press

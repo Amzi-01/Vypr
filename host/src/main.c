@@ -480,6 +480,10 @@ int main(int argc, char **argv)
     uint32_t resize_w = 0, resize_h = 0;
     uint64_t resize_at = 0;
 
+    /* What the guest last told us, so a state we applied ourselves is not
+     * reported straight back to it as though the user had done it. */
+    bool guest_minimized = false;
+
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
@@ -643,6 +647,24 @@ int main(int argc, char **argv)
                 break;
             }
 
+            case SDL_EVENT_WINDOW_MINIMIZED:
+            case SDL_EVENT_WINDOW_RESTORED: {
+                if (daemon_fd < 0 || v->is_popup) break;
+                const bool mini = (ev.type == SDL_EVENT_WINDOW_MINIMIZED);
+                if (mini == guest_minimized) break;   /* we are only catching up */
+                guest_minimized = mini;
+
+                /* Minimising here should minimise the app in the VM too - it is
+                 * otherwise left rendering a window nobody can see. Restoring
+                 * has to bring it back, or the window returns showing whatever
+                 * frame it had when it stopped. */
+                struct sash_msg_window_state st = {0};
+                st.window_id = v->window_id;
+                st.minimized = mini ? 1u : 0u;
+                msg_send(daemon_fd, SASH_MSG_WINDOW_STATE, &st, sizeof(st));
+                break;
+            }
+
             case SDL_EVENT_WINDOW_FOCUS_GAINED: {
                 if (daemon_fd < 0 || v->is_popup) break;
                 struct sash_msg_window_id msg = { .window_id = v->window_id };
@@ -700,6 +722,19 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct sash_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == SASH_MSG_CLIENT_STATE &&
+                               head.bytes >= sizeof(struct sash_msg_window_state)) {
+                        const struct sash_msg_window_state *m = (const void *)payload;
+                        if (m->window_id == opt.window_id) {
+                            const bool mini = m->minimized != 0;
+                            const bool have =
+                                (SDL_GetWindowFlags(views[0].win) & SDL_WINDOW_MINIMIZED) != 0;
+                            guest_minimized = mini;
+                            /* Only when it differs, so this does not echo back
+                             * out as a user action. */
+                            if (mini && !have)       SDL_MinimizeWindow(views[0].win);
+                            else if (!mini && have)  SDL_RestoreWindow(views[0].win);
+                        }
                     } else if (head.type == SASH_MSG_CLIENT_GEOM &&
                                head.bytes >= sizeof(struct sash_msg_client_geom)) {
                         const struct sash_msg_client_geom *m = (const void *)payload;

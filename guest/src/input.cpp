@@ -13,6 +13,34 @@ namespace sash {
 
 namespace {
 
+/*
+ * The captured rectangle, cached.
+ *
+ * DwmGetWindowAttribute is a cross-process call, and looking it up on every
+ * pointer event means a thousand of them a second from a high-polling mouse -
+ * on the same CPU that is capturing frames and running the game. A window's
+ * geometry does not change between two mouse reports; a tenth of a second is
+ * far finer than any window move a person can make.
+ */
+RECT          g_cap_cache{};
+HWND          g_cap_hwnd = nullptr;
+ULONGLONG     g_cap_at = 0;
+
+RECT cached_capture_rect(HWND hwnd) {
+    const ULONGLONG now = GetTickCount64();
+    if (hwnd != g_cap_hwnd || now - g_cap_at > 100) {
+        g_cap_cache = sash_capture_rect(hwnd);
+        g_cap_hwnd  = hwnd;
+        g_cap_at    = now;
+    }
+    return g_cap_cache;
+}
+
+bool trace_input() {
+    static const bool on = std::getenv("SASH_TRACE") != nullptr;
+    return on;
+}
+
 HWND to_hwnd(std::uint64_t id) {
     return reinterpret_cast<HWND>(static_cast<std::uintptr_t>(id));
 }
@@ -64,35 +92,19 @@ void ensure_foreground(HWND hwnd) {
 int  g_saved_accel[3] = { 0, 0, 0 };
 bool g_accel_saved = false;
 
-/*
- * The captured rectangle, cached.
- *
- * DwmGetWindowAttribute is a cross-process call, and looking it up on every
- * pointer event means a thousand of them a second from a high-polling mouse -
- * on the same CPU that is capturing frames and running the game. A window's
- * geometry does not change between two mouse reports; a tenth of a second is
- * far finer than any window move a person can make.
- */
-RECT          g_cap_cache{};
-HWND          g_cap_hwnd = nullptr;
-ULONGLONG     g_cap_at = 0;
-
-RECT cached_capture_rect(HWND hwnd) {
-    const ULONGLONG now = GetTickCount64();
-    if (hwnd != g_cap_hwnd || now - g_cap_at > 100) {
-        g_cap_cache = sash_capture_rect(hwnd);
-        g_cap_hwnd  = hwnd;
-        g_cap_at    = now;
-    }
-    return g_cap_cache;
-}
-
-bool trace_input() {
-    static const bool on = std::getenv("SASH_TRACE") != nullptr;
-    return on;
-}
 
 }  // namespace
+
+void set_window_minimized(std::uint64_t window_id, bool minimized) {
+    HWND hwnd = to_hwnd(window_id);
+    if (!IsWindow(hwnd)) return;
+
+    // Only when it differs: applying a state the window is already in would
+    // report a change back to the host and start the two bouncing it around.
+    if (minimized == (IsIconic(hwnd) != FALSE)) return;
+
+    ShowWindow(hwnd, minimized ? SW_MINIMIZE : SW_RESTORE);
+}
 
 void suspend_pointer_acceleration() {
     if (g_accel_saved) return;
