@@ -25,7 +25,12 @@ public:
     AudioCapture(const AudioCapture&) = delete;
     AudioCapture& operator=(const AudioCapture&) = delete;
 
-    bool start(Sink sink);
+    // `pid` names the process whose audio matters. Capture is pinned to the
+    // endpoint that process is actually playing to, rather than following
+    // whatever Windows currently calls the default - which moves between
+    // devices, and when it moves to one the game is not using, the capture is
+    // of silence while everything still looks healthy. Zero means default.
+    bool start(Sink sink, unsigned long pid);
     void stop();
 
 private:

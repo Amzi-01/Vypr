@@ -61,6 +61,9 @@ private:
 
     std::atomic<bool> stop_{false};
 
+    unsigned long audio_pid_ = 0;
+    void start_audio(unsigned long pid);
+
     bool          lock_state_ = false;
     std::uint64_t lock_window_ = 0;
     int           lock_agree_ = 0;      // consecutive polls agreeing on a change
@@ -73,6 +76,34 @@ private:
  * enough: the cursor is hidden, or it has been confined to something smaller
  * than the whole virtual desktop.
  */
+/*
+ * Audio follows the app being streamed, not the default device.
+ *
+ * Windows moves the default playback endpoint between devices, and this guest
+ * has three. When it moves to one the game is not using, loopback captures
+ * silence and everything still looks healthy at both ends - so the capture is
+ * pinned to the endpoint the streamed process is actually playing to.
+ */
+void Agent::start_audio(unsigned long pid) {
+    if (pid == audio_pid_) return;
+    audio_pid_ = pid;
+
+    audio_.start([this](const float* samples, std::uint32_t frames,
+                        std::uint32_t rate, std::uint16_t channels) {
+        const std::uint32_t bytes = frames * channels * sizeof(float);
+        if (bytes == 0 || sizeof(sash_msg_audio) + bytes > SASH_MAX_MSG_BYTES) return;
+
+        std::vector<std::uint8_t> buf(sizeof(sash_msg_audio) + bytes);
+        sash_msg_audio hdr{};
+        hdr.sample_rate = rate;
+        hdr.channels    = channels;
+        hdr.frames      = frames;
+        std::memcpy(buf.data(), &hdr, sizeof(hdr));
+        std::memcpy(buf.data() + sizeof(hdr), samples, bytes);
+        control_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
+    }, pid);
+}
+
 void Agent::poll_pointer_lock() {
     CURSORINFO ci{};
     ci.cbSize = sizeof(ci);
@@ -205,6 +236,11 @@ void Agent::handle_attach(const sash_msg_attach& msg) {
     control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
     std::fprintf(stderr, "sash: streaming HWND %p into slot %u\n",
                  reinterpret_cast<void*>(hwnd), msg.slot);
+
+    /* Follow this window's process for audio. */
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid) start_audio(pid);
 }
 
 void Agent::handle_detach(std::uint64_t window_id) {
@@ -401,23 +437,6 @@ bool Agent::run(const char* host, std::uint16_t port) {
     hello.capabilities = SASH_CAP_RESIZE;
     control_.send(SASH_MSG_HELLO, &hello, sizeof(hello));
 
-    /* Audio is whatever the guest is playing. It starts once and runs for the
-     * session rather than per window - the capture is of the endpoint, not of
-     * any one app. */
-    audio_.start([this](const float* samples, std::uint32_t frames,
-                        std::uint32_t rate, std::uint16_t channels) {
-        const std::uint32_t bytes = frames * channels * sizeof(float);
-        if (bytes == 0 || sizeof(sash_msg_audio) + bytes > SASH_MAX_MSG_BYTES) return;
-
-        std::vector<std::uint8_t> buf(sizeof(sash_msg_audio) + bytes);
-        sash_msg_audio hdr{};
-        hdr.sample_rate = rate;
-        hdr.channels    = channels;
-        hdr.frames      = frames;
-        std::memcpy(buf.data(), &hdr, sizeof(hdr));
-        std::memcpy(buf.data() + sizeof(hdr), samples, bytes);
-        control_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
-    });
 
     std::thread watcher([this] { watch_windows(); });
 

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <audiopolicy.h>
 
 #include <atomic>
 #include <cstdio>
@@ -17,8 +18,72 @@ namespace sash {
 struct AudioCapture::Impl {
     std::thread       thread;
     std::atomic<bool> stop{false};
+    unsigned long     pid = 0;
     void run(Sink sink);
 };
+
+/*
+ * The endpoint a given process is playing to.
+ *
+ * Every render endpoint keeps a list of the sessions mixed into it, and each
+ * session knows its process. Walking them finds the device that actually
+ * carries the game, which is not necessarily the default - this guest has three
+ * playback devices and Windows moves the default between them.
+ *
+ * Returns null if the process has no active session anywhere, in which case the
+ * caller falls back to the default endpoint.
+ */
+static IMMDevice* device_for_process(IMMDeviceEnumerator* en, DWORD pid) {
+    if (pid == 0) return nullptr;
+
+    IMMDeviceCollection* devices = nullptr;
+    if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices)))
+        return nullptr;
+
+    UINT count = 0;
+    devices->GetCount(&count);
+
+    for (UINT i = 0; i < count; i++) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(devices->Item(i, &dev))) continue;
+
+        IAudioSessionManager2* mgr = nullptr;
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                    nullptr, (void**)&mgr))) {
+            IAudioSessionEnumerator* sessions = nullptr;
+            if (SUCCEEDED(mgr->GetSessionEnumerator(&sessions))) {
+                int n = 0;
+                sessions->GetCount(&n);
+                for (int sIdx = 0; sIdx < n; sIdx++) {
+                    IAudioSessionControl* ctrl = nullptr;
+                    if (FAILED(sessions->GetSession(sIdx, &ctrl))) continue;
+
+                    IAudioSessionControl2* ctrl2 = nullptr;
+                    if (SUCCEEDED(ctrl->QueryInterface(__uuidof(IAudioSessionControl2),
+                                                       (void**)&ctrl2))) {
+                        DWORD spid = 0;
+                        if (SUCCEEDED(ctrl2->GetProcessId(&spid)) && spid == pid) {
+                            ctrl2->Release();
+                            ctrl->Release();
+                            sessions->Release();
+                            mgr->Release();
+                            devices->Release();
+                            return dev;      /* caller releases */
+                        }
+                        ctrl2->Release();
+                    }
+                    ctrl->Release();
+                }
+                sessions->Release();
+            }
+            mgr->Release();
+        }
+        dev->Release();
+    }
+
+    devices->Release();
+    return nullptr;
+}
 
 /*
  * A loopback client hands back whatever the endpoint's mix format is, which is
@@ -99,10 +164,16 @@ void AudioCapture::Impl::run(Sink sink) {
         cleanup();
         return;
     }
-    if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
-        std::fprintf(stderr, "sash: no default playback device; audio disabled\n");
+    device = device_for_process(enumerator, static_cast<DWORD>(pid));
+    if (device) {
+        std::fprintf(stderr, "sash: audio pinned to the device process %lu plays to\n", pid);
+    } else if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+        std::fprintf(stderr, "sash: no playback device; audio disabled\n");
         cleanup();
         return;
+    } else if (pid) {
+        std::fprintf(stderr, "sash: process %lu has no audio session yet; "
+                             "using the default device\n", pid);
     }
     if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) ||
         FAILED(client->GetMixFormat(&wfx))) {
@@ -178,9 +249,10 @@ void AudioCapture::Impl::run(Sink sink) {
 AudioCapture::AudioCapture() : impl_(std::make_unique<Impl>()) {}
 AudioCapture::~AudioCapture() { stop(); }
 
-bool AudioCapture::start(Sink sink) {
+bool AudioCapture::start(Sink sink, unsigned long pid) {
     stop();
     impl_->stop = false;
+    impl_->pid = pid;
     impl_->thread = std::thread([this, sink] { impl_->run(sink); });
     return true;
 }

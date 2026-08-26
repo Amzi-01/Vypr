@@ -178,6 +178,15 @@ playback stream on the first block that arrives, matching whatever rate and
 channel count the guest is actually producing rather than asking for a format
 and making somebody resample.
 
+Capture is pinned to the endpoint the streamed process is actually playing to,
+found by walking each render endpoint's audio sessions for that process id -
+not to whatever Windows currently calls the default. This guest has three
+playback devices and the default moves between them; when it moves to one the
+game is not using, loopback captures silence while both ends still look
+perfectly healthy. If the process has no session yet - the launcher, before the
+game starts - it falls back to the default and re-pins when the game window
+attaches.
+
 Multichannel is folded to stereo **in the guest**. This endpoint is 7.1, so the
 stream was 48 kHz by 8 channels of float - about 1.5 MB/s, four times what
 stereo needs, down the same control channel as input. Audio the link cannot keep

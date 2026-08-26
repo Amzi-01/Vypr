@@ -473,6 +473,7 @@ int main(int argc, char **argv)
     SDL_AudioStream *audio = NULL;
     uint32_t audio_rate = 0;
     uint16_t audio_channels = 0;
+    uint64_t audio_logged_at = 0;
 
     struct pointer_accum pointer = {0};
 
@@ -732,6 +733,31 @@ int main(int argc, char **argv)
         hit.src_w      = views[0].src_w;
         hit.src_h      = views[0].src_h;
         hit.captured   = pointer_locked || capture_forced;
+
+        /*
+         * Audio latency is whatever is queued, and a queue is never worked off:
+         * a backlog formed once is heard for the rest of the session.
+         *
+         * Checked here, once a frame, rather than on arrival of every packet.
+         * Doing it per packet meant this ran inside the loop that drains the
+         * daemon socket, and that starved presentation badly enough to take the
+         * video down to a frame every twenty seconds.
+         *
+         * The threshold is deliberately loose. Clearing is an audible gap, so
+         * it should catch a real backlog and otherwise never fire.
+         */
+        if (audio && audio_rate && audio_channels) {
+            const int per_second = (int)(audio_rate * audio_channels * sizeof(float));
+            const int queued = SDL_GetAudioStreamQueued(audio);
+            if (queued > per_second / 4)            /* 250ms */
+                SDL_ClearAudioStream(audio);
+
+            if (opt.stats && SDL_GetTicks() - audio_logged_at > 5000) {
+                audio_logged_at = SDL_GetTicks();
+                printf("sash: audio queued %.0f ms\n", queued * 1000.0 / per_second);
+                fflush(stdout);
+            }
+        }
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
