@@ -61,10 +61,24 @@ struct WindowCapture::Impl {
     GraphicsCaptureSession        session{nullptr};
     Direct3D11CaptureFramePool::FrameArrived_revoker frame_token;
 
-    // Staging texture: the captured frame lives in VRAM and the shared region
-    // is host RAM, so it has to come back across PCIe. One DMA into staging,
-    // one memcpy out of it into the ring.
-    com_ptr<ID3D11Texture2D>      staging;
+    /*
+     * Two staging textures, not one.
+     *
+     * The captured frame lives in VRAM and the shared region is host RAM, so it
+     * has to come back across PCIe. Map(D3D11_MAP_READ) blocks until the GPU
+     * has finished the copy into that texture, so with a single staging texture
+     * the copy and the read can never overlap: issue copy, stall, memcpy,
+     * publish, repeat. Measured at ~40 ms a frame for 4K, which caps the stream
+     * around 25 fps however fast the game runs.
+     *
+     * Reading the texture written *last* frame means the GPU has had a whole
+     * frame to finish it, so the map does not stall. It costs one frame of
+     * pipeline latency and buys back most of the throughput.
+     */
+    com_ptr<ID3D11Texture2D>      staging[2];
+    int                           staging_at = 0;
+    bool                          staging_pending = false;
+    std::uint32_t                 pending_w = 0, pending_h = 0;
     std::uint32_t                 staging_w = 0, staging_h = 0;
 
     Publisher*                    pub = nullptr;
@@ -167,7 +181,7 @@ void WindowCapture::Impl::gdi_loop() {
 }
 
 bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
-    if (staging && staging_w == w && staging_h == h) return true;
+    if (staging[0] && staging_w == w && staging_h == h) return true;
 
     D3D11_TEXTURE2D_DESC d{};
     d.Width              = w;
@@ -181,13 +195,17 @@ bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
     d.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
     d.MiscFlags          = 0;
 
-    staging = nullptr;
-    if (FAILED(device->CreateTexture2D(&d, nullptr, staging.put()))) {
-        std::fprintf(stderr, "sash: staging texture %ux%u failed\n", w, h);
-        return false;
+    for (auto& tex : staging) {
+        tex = nullptr;
+        if (FAILED(device->CreateTexture2D(&d, nullptr, tex.put()))) {
+            std::fprintf(stderr, "sash: staging texture %ux%u failed\n", w, h);
+            return false;
+        }
     }
     staging_w = w;
     staging_h = h;
+    staging_at = 0;
+    staging_pending = false;   /* the size changed; nothing in flight is usable */
     return true;
 }
 
@@ -236,13 +254,35 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     D3D11_BOX box{};
     box.left = crop_x; box.top = crop_y; box.front = 0;
     box.right = crop_x + w; box.bottom = crop_y + h; box.back = 1;
-    context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, src.get(), 0, &box);
+
+    /* Start this frame's copy, then read the one started last frame - by now
+     * the GPU has finished it, so the map below does not stall. */
+    ID3D11Texture2D* writing = staging[staging_at].get();
+    context->CopySubresourceRegion(writing, 0, 0, 0, 0, src.get(), 0, &box);
+
+    const int read_index = 1 - staging_at;
+    staging_at = read_index;
+
+    if (!staging_pending) {
+        /* Nothing in flight yet - this is the first frame after a start or a
+         * resize, so there is nothing to publish until the next one. */
+        staging_pending = true;
+        pending_w = w;
+        pending_h = h;
+        return;
+    }
+
+    const std::uint32_t pub_w = pending_w, pub_h = pending_h;
+    pending_w = w;
+    pending_h = h;
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (FAILED(context->Map(staging[read_index].get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         dropped++;
         return;
     }
+    w = pub_w;
+    h = pub_h;
 
     std::uint32_t stride = 0;
     std::uint8_t* dst = pub->begin_frame(&stride);
@@ -257,7 +297,7 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
                             srcp + static_cast<std::size_t>(y) * mapped.RowPitch, row);
         }
     }
-    context->Unmap(staging.get(), 0);
+    context->Unmap(staging[read_index].get(), 0);
 
     if (dst) {
         // Stamp when DWM composed the frame, not when we finished copying it.
@@ -434,8 +474,10 @@ void WindowCapture::stop() {
     impl_->item = nullptr;
     std::lock_guard<std::mutex> guard(impl_->lock);
     impl_->pub = nullptr;
-    impl_->staging = nullptr;
+    impl_->staging[0] = nullptr;
+    impl_->staging[1] = nullptr;
     impl_->staging_w = impl_->staging_h = 0;
+    impl_->staging_pending = false;
 }
 
 bool WindowCapture::needs_bigger_ring() const { return impl_->too_big.load(); }
