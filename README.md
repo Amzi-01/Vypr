@@ -165,6 +165,22 @@ input goes straight through to Windows. Decorating it with the compositor as
 well would mean two sets of chrome for one window, with the outer set operating
 on a picture of the inner one.
 
+### Dragging and the window buttons
+
+The guest's title bar is the only handle an undecorated window has, so a press
+there is held rather than forwarded. If the pointer moves it becomes a drag and
+the *host* window moves on the Linux desktop; if it is released without moving
+it was a click on close, minimise or maximise, and is forwarded then - press and
+release together - so those buttons still act on the guest window.
+
+Forwarding the drag instead would move the window inside the guest, which is
+invisible from here: the captured image *is* the window, so it looks like
+nothing happened. The guest reports the height of its own title bar
+(`chrome_top`) because the host cannot otherwise know where that strip ends.
+
+Suppressed while the pointer is captured - a game in mouselook has no title bar
+to grab.
+
 ## Mouse capture
 
 A game that takes the pointer needs relative motion, not positions. It warps the
@@ -195,6 +211,12 @@ independently capable of ruining it:
   own sensitivity. The agent suspends it while an app holds the pointer and
   restores it afterwards, including on exit; it is the user's setting, not
   ours to keep.
+
+**Keep the guest cursor in the captured image.** Excluding it assumed the host
+would draw a cursor of its own in the right place; the result was a window with
+no pointer in it at all. Capturing it means what the user sees is where the
+guest actually believes the pointer is, which is the only version that can be
+trusted for clicking on things.
 
 **Re-centre the guest cursor.** Relative deltas accumulate into the cursor
 position, so without intervention the cursor walks to a screen edge and stops -

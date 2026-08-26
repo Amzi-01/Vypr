@@ -115,6 +115,13 @@ struct sash_msg_window {
     uint32_t dpi;                /* 96 = 100%; the host scales against this */
     uint32_t pid;
     uint32_t flags;
+
+    /* Height in captured pixels of the guest window's own title bar - the gap
+     * between the top of the captured frame and the top of the client area.
+     * The host presents undecorated, so this strip is the only thing the user
+     * has to drag the window by, and it has to know where it is. */
+    uint32_t chrome_top;
+
     uint32_t title_bytes;        /* utf8 title follows the struct */
 };
 

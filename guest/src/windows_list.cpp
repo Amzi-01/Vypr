@@ -176,6 +176,10 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     d.height = static_cast<std::uint32_t>(cap.bottom - cap.top);
     d.pid    = pid;
 
+    const RECT content = sash_content_rect(hwnd);
+    d.chrome_top = (content.top > cap.top)
+                 ? static_cast<std::uint32_t>(content.top - cap.top) : 0;
+
     // Per-window DPI, not the system's. A guest with mixed-DPI monitors reports
     // a different client-area size than the captured surface otherwise.
     d.dpi = GetDpiForWindow(hwnd);

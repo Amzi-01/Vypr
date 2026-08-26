@@ -30,6 +30,7 @@ struct options {
     const char *sock_path;   /* unix socket back to sashd; NULL = no input path */
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
+    uint32_t    chrome_top;  /* guest title-bar height, in guest pixels */
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
@@ -84,6 +85,7 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->sock_path = NULL;
     o->backend   = NULL;
     o->capture   = 0;
+    o->chrome_top = 0;
     o->window_id = 0;
     o->slot      = 0;
     o->stats     = 0;
@@ -94,6 +96,8 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) o->title = argv[++i];
         else if (!strcmp(argv[i], "--sock") && i + 1 < argc)  o->sock_path = argv[++i];
         else if (!strcmp(argv[i], "--present") && i + 1 < argc) o->backend = argv[++i];
+        else if (!strcmp(argv[i], "--chrome-top") && i + 1 < argc)
+            o->chrome_top = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--capture"))    o->capture = 1;
         else if (!strcmp(argv[i], "--no-capture")) o->capture = 0;
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
@@ -345,6 +349,24 @@ int main(int argc, char **argv)
      * that does not depend on guessing. */
     bool capture_forced = opt.capture != 0;
 
+    /*
+     * Dragging the guest's own title bar moves the window on *this* desktop.
+     *
+     * The host window is undecorated, so that strip is the only handle there
+     * is. Forwarding the drag would move the window inside the guest instead,
+     * which is invisible here - the captured image is the window, so it looks
+     * like nothing happened.
+     *
+     * A press in the strip is therefore held rather than sent: if the pointer
+     * moves, it becomes a window drag; if it is released without moving, it was
+     * a click on the close, minimise or maximise button and is forwarded then,
+     * press and release together, so those still work.
+     */
+    bool  title_press = false, title_dragging = false;
+    float press_gx = 0, press_gy = 0;
+    int   press_win_x = 0, press_win_y = 0;
+    int32_t press_guest_x = 0, press_guest_y = 0;
+
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
@@ -373,6 +395,62 @@ int main(int argc, char **argv)
             case SDL_EVENT_MOUSE_BUTTON_UP:
             case SDL_EVENT_MOUSE_WHEEL: {
                 if (daemon_fd < 0) break;
+
+                /* Title-bar handling, only for the top-level and only when the
+                 * pointer is not captured - a game has no title bar to grab. */
+                if (!v->is_popup && opt.chrome_top > 0 &&
+                    !(pointer_locked || capture_forced)) {
+                    SDL_GetWindowSize(v->win, &win_w, &win_h);
+                    const float scale_y = (v->src_h && win_h > 0)
+                                        ? (float)win_h / (float)v->src_h : 1.0f;
+                    const float strip = opt.chrome_top * scale_y;
+
+                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                        ev.button.button == SDL_BUTTON_LEFT &&
+                        ev.button.y < strip) {
+                        title_press    = true;
+                        title_dragging = false;
+                        SDL_GetGlobalMouseState(&press_gx, &press_gy);
+                        SDL_GetWindowPosition(v->win, &press_win_x, &press_win_y);
+                        to_guest_coords(win_w, win_h, v->src_w, v->src_h,
+                                        ev.button.x, ev.button.y,
+                                        &press_guest_x, &press_guest_y);
+                        break;                      /* held, not sent */
+                    }
+
+                    if (title_press && ev.type == SDL_EVENT_MOUSE_MOTION) {
+                        float gx, gy;
+                        SDL_GetGlobalMouseState(&gx, &gy);
+                        const float dx = gx - press_gx, dy = gy - press_gy;
+                        if (title_dragging || dx * dx + dy * dy > 16.0f) {
+                            title_dragging = true;
+                            SDL_SetWindowPosition(v->win,
+                                                  press_win_x + (int)dx,
+                                                  press_win_y + (int)dy);
+                        }
+                        break;
+                    }
+
+                    if (title_press && ev.type == SDL_EVENT_MOUSE_BUTTON_UP &&
+                        ev.button.button == SDL_BUTTON_LEFT) {
+                        const bool was_drag = title_dragging;
+                        title_press = title_dragging = false;
+                        if (!was_drag) {
+                            /* A click, not a drag: send it now so the guest's
+                             * own close/minimise/maximise buttons respond. */
+                            struct sash_msg_pointer down = {0};
+                            down.window_id = v->window_id;
+                            down.x = press_guest_x;
+                            down.y = press_guest_y;
+                            down.buttons = 1u;
+                            msg_send(daemon_fd, SASH_MSG_POINTER, &down, sizeof(down));
+                            struct sash_msg_pointer up = down;
+                            up.buttons = 0;
+                            msg_send(daemon_fd, SASH_MSG_POINTER, &up, sizeof(up));
+                        }
+                        break;
+                    }
+                }
 
                 float hx, hy;
                 const SDL_MouseButtonFlags held = SDL_GetMouseState(&hx, &hy);

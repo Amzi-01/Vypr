@@ -395,9 +395,14 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     // real QueryInterface and returns null.
     //
     // IsCursorCaptureEnabled is IGraphicsCaptureSession2 (Windows 10 2004+).
-    // The host draws its own cursor, so the guest's must not be in the pixels.
+    //
+    // Keep the guest cursor in the image. Excluding it assumed the host would
+    // draw a cursor of its own in the right place, and the result was a window
+    // with no pointer in it at all. Including it means what the user sees is
+    // where the guest actually thinks the pointer is, which is the only version
+    // that can be trusted for clicking on things.
     if (auto s2 = impl_->session.try_as<IGraphicsCaptureSession2>())
-        s2.IsCursorCaptureEnabled(false);
+        s2.IsCursorCaptureEnabled(true);
 
     // IsBorderRequired is IGraphicsCaptureSession3 - Windows 11 22000+ only.
     // On Windows 10 the yellow capture border stays; cosmetic, not fatal.

@@ -67,6 +67,7 @@ struct window {
     int      client_fd;
     int32_t  gx, gy;        /* guest screen position of the client area */
     uint32_t width, height;
+    uint32_t chrome_top;
     char     title[192];
 };
 
@@ -167,10 +168,11 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
 
 static int spawn_client(struct daemon *d, struct window *w)
 {
-    char exe[640], slot[16], id[32];
+    char exe[640], slot[16], id[32], chrome[16];
     snprintf(exe, sizeof(exe), "%s/sash-host", d->self_dir);
     snprintf(slot, sizeof(slot), "%u", w->slot);
     snprintf(id, sizeof(id), "%" PRIu64, w->id);
+    snprintf(chrome, sizeof(chrome), "%u", w->chrome_top);
 
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
@@ -191,7 +193,8 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--slot",      slot,
             "--title",     w->title[0] ? w->title : (char *)"sash",
             "--window-id", id,
-            "--sock",      d->unix_path,
+            "--sock",       d->unix_path,
+            "--chrome-top", chrome,
             "--no-capture",
             NULL
         };
@@ -227,6 +230,7 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     w->owner_id = desc->owner_id;
     w->is_popup = (desc->flags & SASH_WIN_POPUP) != 0 && desc->owner_id != 0;
     w->fullscreen = (desc->flags & SASH_WIN_FULLSCREEN) != 0;
+    w->chrome_top = desc->chrome_top;
 
     /* Headroom, so an ordinary resize does not force a re-attach. The bump
      * allocator never rewinds - reusing a freed range under a live writer is
