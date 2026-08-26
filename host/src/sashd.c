@@ -57,6 +57,7 @@
 
 struct window {
     uint64_t id;
+    int      fullscreen;    /* covers the guest desktop */
     uint64_t owner_id;      /* nonzero for popups */
     uint32_t slot;
     int      has_slot;
@@ -175,6 +176,9 @@ static int spawn_client(struct daemon *d, struct window *w)
     if (pid < 0) { perror("fork"); return -1; }
 
     if (pid == 0) {
+        /* A fullscreen app is a game often enough that starting it in direct
+         * pointer control, only to have the user reach for the toggle, is the
+         * wrong default. */
         char *const argv[] = {
             exe,
             "--shm",       (char *)d->shm_path,
@@ -182,6 +186,7 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--title",     w->title[0] ? w->title : (char *)"sash",
             "--window-id", id,
             "--sock",      d->unix_path,
+            w->fullscreen ? "--capture" : "--no-capture",
             NULL
         };
         execv(exe, argv);
@@ -215,6 +220,7 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     w->gy       = desc->y;
     w->owner_id = desc->owner_id;
     w->is_popup = (desc->flags & SASH_WIN_POPUP) != 0 && desc->owner_id != 0;
+    w->fullscreen = (desc->flags & SASH_WIN_FULLSCREEN) != 0;
 
     /* Headroom, so an ordinary resize does not force a re-attach. The bump
      * allocator never rewinds - reusing a freed range under a live writer is

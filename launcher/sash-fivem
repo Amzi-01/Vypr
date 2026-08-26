@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# Launch FiveM from the Windows guest as a window on this desktop.
+#
+# Brings up whatever is not already up - the VM, the session daemon, the guest
+# agent - and then starts the game. Safe to run when some or all of it is
+# already running; each step is skipped if it is not needed.
+set -uo pipefail
+
+VM=RDPWindows
+GUEST=192.168.122.58
+KEY="$HOME/.ssh/sash-guest"
+SASH="$HOME/sash/host/build"
+SHM=/dev/shm/sash
+MATCH="Cfx.re"
+export LIBVIRT_DEFAULT_URI=qemu:///system
+
+say() {
+    echo "sash-fivem: $*"
+    notify-send --app-name=FiveM --icon=sash-fivem "FiveM" "$*" 2>/dev/null || true
+}
+die() {
+    echo "sash-fivem: $*" >&2
+    notify-send --app-name=FiveM --icon=dialog-error -u critical "FiveM" "$*" 2>/dev/null || true
+    exit 1
+}
+
+guest() {
+    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+        -o ConnectTimeout=8 "Lucy@$GUEST" "$@"
+}
+
+# --- the VM ----------------------------------------------------------------
+state=$(virsh domstate "$VM" 2>/dev/null || echo missing)
+[ "$state" = "missing" ] && die "VM '$VM' does not exist."
+
+if [ "$state" != "running" ]; then
+    say "Starting the VM..."
+    virsh start "$VM" >/dev/null || die "could not start the VM"
+fi
+
+# Wait for the guest to answer, not merely for the domain to be 'running' -
+# a booting Windows is not yet able to do anything useful.
+for _ in $(seq 1 60); do
+    guest 'echo ok' >/dev/null 2>&1 && break
+    sleep 5
+done
+guest 'echo ok' >/dev/null 2>&1 || die "guest did not become reachable"
+
+# Windows needs a logged-in session: no desktop means nothing to capture, and
+# interactive scheduled tasks will not run.
+#
+# The output is captured before matching rather than piped: several of these
+# Windows commands exit non-zero even when they succeed - 'query user' returns
+# 1 with a user plainly listed - and under pipefail that exit status would
+# propagate through the pipe and be read as "no session".
+sessions=$(guest 'query user' 2>/dev/null || true)
+if ! grep -qi console <<<"$sessions"; then
+    die "nobody is logged in to Windows - auto-login should handle this, check the VM's screen"
+fi
+
+# --- the session daemon ----------------------------------------------------
+if ! pgrep -x sashd >/dev/null; then
+    say "Starting the sash session..."
+    [ -x "$SASH/sashd" ] || die "$SASH/sashd is missing - build it first"
+    nohup "$SASH/sashd" --shm "$SHM" --match "$MATCH" \
+        >"${XDG_RUNTIME_DIR:-/tmp}/sashd.log" 2>&1 &
+    sleep 2
+fi
+
+# --- the guest agent -------------------------------------------------------
+#
+# Never taskkill the agent: the IVSHMEM driver does not clean up after a
+# TerminateProcess and leaves an unkillable process holding the device, which
+# takes a guest reboot to clear. Ending the scheduled task lets it exit.
+agent_ps=$(guest 'tasklist /fi "imagename eq sash-agent.exe" /fo csv /nh' 2>/dev/null || true)
+if ! grep -q sash-agent <<<"$agent_ps"; then
+    say "Starting the guest agent..."
+    guest 'schtasks /end /tn sash-agent >nul 2>&1 & schtasks /run /tn sash-agent' >/dev/null 2>&1
+    sleep 6
+fi
+
+# --- the game --------------------------------------------------------------
+game_ps=$(guest 'tasklist' 2>/dev/null || true)
+if grep -qi 'FiveM_b.*GTAProcess' <<<"$game_ps"; then
+    say "FiveM is already running."
+else
+    say "Launching FiveM..."
+    guest 'schtasks /end /tn sash-fivem >nul 2>&1 & schtasks /run /tn sash-fivem' >/dev/null 2>&1
+fi
+
+# --- wait for the window ---------------------------------------------------
+for _ in $(seq 1 60); do
+    pgrep -x sash-host >/dev/null && { say "FiveM is on screen."; exit 0; }
+    sleep 5
+done
+
+die "the game did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/sashd.log"

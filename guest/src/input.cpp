@@ -169,8 +169,12 @@ void inject_pointer(const sash_msg_pointer& msg) {
         RECT cap = sash_capture_rect(hwnd);
         POINT cur{};
         if (!app_owns_cursor && GetCursorPos(&cur)) {
-            const LONG margin_x = (cap.right - cap.left) / 8;
-            const LONG margin_y = (cap.bottom - cap.top) / 8;
+            /* A few pixels, not an eighth of the screen. Warping from well
+             * inside the window is visible as the pointer teleporting to the
+             * middle while using a menu; the only thing that must be prevented
+             * is the cursor actually reaching an edge and sticking there. */
+            const LONG margin_x = 4;
+            const LONG margin_y = 4;
             if (cur.x < cap.left + margin_x || cur.x > cap.right - margin_x ||
                 cur.y < cap.top + margin_y || cur.y > cap.bottom - margin_y) {
                 SetCursorPos((cap.left + cap.right) / 2,

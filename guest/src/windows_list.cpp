@@ -153,8 +153,9 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     HWND hwnd = static_cast<HWND>(hwnd_raw);
     if (!IsWindow(hwnd) || !is_presentable(hwnd)) return false;
 
-    // Geometry of the captured surface, so the host's idea of the window and
-    // the pixels it is showing describe the same rectangle.
+    // The whole window including Windows' own title bar and border. The host
+    // presents it undecorated, so that title bar is the window's title bar -
+    // its buttons work because the input goes straight to Windows.
     const RECT cap = sash_capture_rect(hwnd);
 
     DWORD pid = 0;
@@ -184,6 +185,19 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     if (popup)                      d.flags |= SASH_WIN_POPUP;
     if (style & WS_THICKFRAME)      d.flags |= SASH_WIN_RESIZABLE;
     if (IsIconic(hwnd))             d.flags |= SASH_WIN_MINIMIZED;
+
+    // Covers the whole desktop: treat it as a fullscreen app, which the host
+    // uses to decide whether to start with the pointer captured.
+    //
+    // Measured on the window frame, not the reported content area - the latter
+    // has the title bar and border cropped off it, so a genuinely fullscreen
+    // window is always a little smaller than the desktop and would never match.
+    {
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if ((LONG)d.width >= vw - 2 && (LONG)d.height >= vh - 2)
+            d.flags |= SASH_WIN_FULLSCREEN;
+    }
 
     const int len = GetWindowTextLengthW(hwnd);
     if (len > 0) {

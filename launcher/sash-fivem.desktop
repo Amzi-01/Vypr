@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FiveM
+GenericName=GTA V Multiplayer
+Comment=Launch FiveM from the Windows VM as a native window
+Exec=/home/lucy/.local/bin/sash-fivem
+Icon=sash-fivem
+Terminal=false
+Categories=Game;
+StartupNotify=true

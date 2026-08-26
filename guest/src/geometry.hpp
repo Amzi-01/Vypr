@@ -29,3 +29,28 @@ inline RECT sash_capture_rect(HWND hwnd) {
     }
     return r;
 }
+
+/*
+ * The part worth showing: the app's client area in screen coordinates.
+ *
+ * The captured frame includes Windows' own title bar and border, which on a
+ * Linux desktop means a Windows title bar drawn inside a KDE one - two sets of
+ * decorations for one window, and the host's buttons do nothing to the guest.
+ * Cropping to the client area leaves the compositor to decorate it like any
+ * native window: its own title bar to drag, its own close/minimise/maximise.
+ *
+ * Falls back to the captured frame for windows with no separate client area,
+ * such as menus and fullscreen surfaces.
+ */
+inline RECT sash_content_rect(HWND hwnd) {
+    RECT client{};
+    POINT origin{ 0, 0 };
+    if (!GetClientRect(hwnd, &client) || !ClientToScreen(hwnd, &origin))
+        return sash_capture_rect(hwnd);
+
+    const LONG w = client.right - client.left;
+    const LONG h = client.bottom - client.top;
+    if (w < 8 || h < 8) return sash_capture_rect(hwnd);
+
+    return RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
+}

@@ -29,6 +29,7 @@ struct options {
     const char *title;
     const char *sock_path;   /* unix socket back to sashd; NULL = no input path */
     const char *backend;     /* "gpu" or "render" */
+    int         capture;     /* start with the pointer captured */
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
@@ -82,6 +83,7 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->title     = "sash";
     o->sock_path = NULL;
     o->backend   = NULL;
+    o->capture   = 0;
     o->window_id = 0;
     o->slot      = 0;
     o->stats     = 0;
@@ -92,6 +94,8 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) o->title = argv[++i];
         else if (!strcmp(argv[i], "--sock") && i + 1 < argc)  o->sock_path = argv[++i];
         else if (!strcmp(argv[i], "--present") && i + 1 < argc) o->backend = argv[++i];
+        else if (!strcmp(argv[i], "--capture"))    o->capture = 1;
+        else if (!strcmp(argv[i], "--no-capture")) o->capture = 0;
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
             o->window_id = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stats"))                 o->stats = 1;
@@ -201,6 +205,8 @@ static void set_capture(SDL_Window *win, bool want, bool announce)
     }
 }
 
+static bool capture_forced_initial(const struct options *o) { return o->capture != 0; }
+
 static struct view *view_for_sdl_id(struct view *views, int count, SDL_WindowID id)
 {
     for (int i = 0; i < count; i++)
@@ -304,7 +310,15 @@ int main(int argc, char **argv)
 
     views[0].window_id = opt.window_id;
     views[0].slot      = opt.slot;
-    views[0].win = SDL_CreateWindow(opt.title, win_w, win_h, SDL_WINDOW_RESIZABLE);
+    /*
+     * Borderless: the captured image already contains the guest window's own
+     * title bar and buttons, and a compositor decoration around it would be a
+     * second set of chrome for one window. Undecorated, what the user sees and
+     * clicks is Windows' own title bar - close, minimise and maximise reach the
+     * guest app because the input goes straight through.
+     */
+    views[0].win = SDL_CreateWindow(opt.title, win_w, win_h,
+                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
     if (!views[0].win) {
         fprintf(stderr, "sash: SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
@@ -316,6 +330,9 @@ int main(int argc, char **argv)
     if (opt.stats)
         printf("sash: present backend '%s'\n", presenter_name(views[0].pres));
 
+    if (capture_forced_initial(&opt))
+        set_capture(views[0].win, true, true);
+
     struct msg_reader daemon_rx = {0};
 
     /* Relative pointer mode, driven by the guest telling us an app has taken
@@ -326,7 +343,7 @@ int main(int argc, char **argv)
      * hidden or clipped - misses cases like a fullscreen game that leaves the
      * cursor nominally visible, so there has to be a way to say "capture"
      * that does not depend on guessing. */
-    bool capture_forced = false;
+    bool capture_forced = opt.capture != 0;
 
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
@@ -418,8 +435,9 @@ int main(int argc, char **argv)
                     running = 0;
                     break;
                 }
-                /* Ctrl+Shift+M toggles mouse capture, the same chord Moonlight
-                 * uses. It is deliberately a host-side hotkey: a game that has
+                /* Ctrl+Alt+Shift+M toggles between pointer capture and direct
+                 * control - the chord Moonlight uses for the same thing, so the
+                 * muscle memory carries over. Ctrl+Shift+M is accepted too. It is deliberately a host-side hotkey: a game that has
                  * grabbed the pointer must always be escapable, and the guest's
                  * own detection can miss a fullscreen app that leaves the
                  * cursor nominally visible. */
@@ -433,7 +451,11 @@ int main(int argc, char **argv)
                      * the guest is left holding them down. A stuck Ctrl in a
                      * game is its own kind of misery. */
                     if (daemon_fd >= 0) {
-                        static const uint32_t mods[] = { 0x1D, 0xE01D, 0x2A, 0x36 };
+                        static const uint32_t mods[] = {
+                            0x1D, 0xE01D,      /* ctrl */
+                            0x2A, 0x36,        /* shift */
+                            0x38, 0xE038       /* alt, for the Moonlight chord */
+                        };
                         for (size_t k = 0; k < sizeof(mods) / sizeof(mods[0]); k++) {
                             struct sash_msg_key up = {0};
                             up.window_id = v->window_id;

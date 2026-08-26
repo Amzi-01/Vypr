@@ -144,6 +144,27 @@ GPU-to-CPU readback inside the guest, and it swings by two orders of magnitude
 with GPU contention. Optimising the shared-memory path further would buy
 nothing; the readback is the thing to attack.
 
+## Launching
+
+`launcher/sash-fivem` brings up whatever is not already running - the VM, the
+session daemon, the guest agent - and then starts the game, skipping any step
+that is already done. `launcher/sash-fivem.desktop` puts it on the desktop with
+the game's own icon, extracted at 256x256 from the guest's executable.
+
+It waits for the guest to *answer*, not merely for the domain to report
+'running': a booting Windows cannot do anything useful yet. It also refuses
+early with a clear message if nobody is logged in, since without a desktop
+there is no DWM to capture and interactive scheduled tasks will not run.
+
+## Window decoration
+
+The host window is **borderless**, and the captured image includes the guest
+window's own title bar and buttons. That is the whole point: what you see and
+click is Windows' own chrome, and close, minimise and maximise work because the
+input goes straight through to Windows. Decorating it with the compositor as
+well would mean two sets of chrome for one window, with the outer set operating
+on a picture of the inner one.
+
 ## Mouse capture
 
 A game that takes the pointer needs relative motion, not positions. It warps the

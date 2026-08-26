@@ -82,6 +82,7 @@ struct WindowCapture::Impl {
     std::uint32_t pipeline_n = 0;
 
     // GDI fallback, for windows WGC will not capture at all.
+    HWND                          target_hwnd = nullptr;
     HWND                          gdi_hwnd = nullptr;
     std::thread                   gdi_thread;
     std::atomic<bool>             gdi_stop{false};
@@ -113,7 +114,7 @@ void WindowCapture::Impl::gdi_loop() {
 
     while (!gdi_stop.load()) {
         if (!IsWindow(gdi_hwnd)) break;
-        const RECT r = sash_capture_rect(gdi_hwnd);
+        const RECT r = sash_content_rect(gdi_hwnd);
 
         const int w = r.right - r.left;
         const int h = r.bottom - r.top;
@@ -198,9 +199,14 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     if (!frame) return;
 
     const auto size = frame.ContentSize();
-    const auto w = static_cast<std::uint32_t>(size.Width);
-    const auto h = static_cast<std::uint32_t>(size.Height);
+    auto w = static_cast<std::uint32_t>(size.Width);
+    auto h = static_cast<std::uint32_t>(size.Height);
     if (w == 0 || h == 0) return;
+
+    // The whole frame is sent, Windows title bar and all: the host window is
+    // undecorated, so that bar is the only chrome there is, and it works
+    // because input reaches Windows unchanged.
+    const std::uint32_t crop_x = 0, crop_y = 0;
 
     content_w = w;
     content_h = h;
@@ -228,8 +234,8 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     if (!ensure_staging(w, h)) { dropped++; return; }
 
     D3D11_BOX box{};
-    box.left = 0; box.top = 0; box.front = 0;
-    box.right = w; box.bottom = h; box.back = 1;
+    box.left = crop_x; box.top = crop_y; box.front = 0;
+    box.right = crop_x + w; box.bottom = crop_y + h; box.back = 1;
     context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, src.get(), 0, &box);
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -351,8 +357,9 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
                      "sash: WGC refused HWND %p class '%ls' (0x%08lX); using GDI\n",
                      hwnd_raw, cls, static_cast<unsigned long>(hr));
 
-        impl_->pub      = pub;
-        impl_->gdi_hwnd = hwnd;
+        impl_->pub         = pub;
+        impl_->target_hwnd = hwnd;
+        impl_->gdi_hwnd    = hwnd;
         impl_->gdi_stop = false;
         impl_->gdi_thread = std::thread([this] { impl_->gdi_loop(); });
         return true;
@@ -367,7 +374,8 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
         impl_->rt_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
 
     TRACE("frame pool ok");
-    impl_->pub = pub;
+    impl_->pub         = pub;
+    impl_->target_hwnd = hwnd;
     impl_->frame_token = impl_->pool.FrameArrived(auto_revoke,
         [this](const Direct3D11CaptureFramePool& sender, const auto&) {
             impl_->on_frame(sender);
@@ -407,6 +415,7 @@ void WindowCapture::stop() {
         impl_->gdi_thread.join();
     }
     impl_->gdi_hwnd = nullptr;
+    impl_->target_hwnd = nullptr;
 
     if (impl_->session) {
         impl_->frame_token.revoke();
