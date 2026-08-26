@@ -200,6 +200,14 @@ on its own, with the frame rate measured after: 60 and 51 fps, unaffected. So
 the collapse was one of the host-side changes, and those stay out until they can
 be tried the same way.
 
+When the queue runs deep the host drops what arrives until it drains, rather
+than emptying it. Clearing is a hard silence of however much was queued - a
+quarter of a second of nothing - and it fired on busy scenes, when the guest
+falls behind and a backlog builds. Busy scenes are loud ones, so the symptom
+was audio cutting out exactly when something loud happened. Dropping loses the
+same audio in ten-millisecond pieces spread across the drain, which is close to
+inaudible.
+
 Audio does not go through the shared region. It is tiny beside video - a tenth
 of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
 reliability far more than it wants the last microsecond of latency, which is

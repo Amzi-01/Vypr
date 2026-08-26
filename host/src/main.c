@@ -734,31 +734,6 @@ int main(int argc, char **argv)
         hit.src_h      = views[0].src_h;
         hit.captured   = pointer_locked || capture_forced;
 
-        /*
-         * Audio latency is whatever is queued, and a queue is never worked off:
-         * a backlog formed once is heard for the rest of the session.
-         *
-         * Checked here, once a frame, rather than on arrival of every packet.
-         * Doing it per packet meant this ran inside the loop that drains the
-         * daemon socket, and that starved presentation badly enough to take the
-         * video down to a frame every twenty seconds.
-         *
-         * The threshold is deliberately loose. Clearing is an audible gap, so
-         * it should catch a real backlog and otherwise never fire.
-         */
-        if (audio && audio_rate && audio_channels) {
-            const int per_second = (int)(audio_rate * audio_channels * sizeof(float));
-            const int queued = SDL_GetAudioStreamQueued(audio);
-            if (queued > per_second / 4)            /* 250ms */
-                SDL_ClearAudioStream(audio);
-
-            if (opt.stats && SDL_GetTicks() - audio_logged_at > 5000) {
-                audio_logged_at = SDL_GetTicks();
-                printf("sash: audio queued %.0f ms\n", queued * 1000.0 / per_second);
-                fflush(stdout);
-            }
-        }
-
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
         /* Popups arrive and vanish while we run, so the daemon link is read
@@ -802,8 +777,38 @@ int main(int argc, char **argv)
                                             SDL_GetError());
                                 }
                             }
-                            if (audio)
-                                SDL_PutAudioStreamData(audio, payload + sizeof(*a), (int)want);
+                            if (audio) {
+                                /*
+                                 * Hold the queue down by dropping what arrives
+                                 * while it is too deep, rather than emptying it.
+                                 *
+                                 * Clearing is a hard silence of however much was
+                                 * queued - a quarter of a second of nothing,
+                                 * which is what "the audio cuts out" sounds
+                                 * like. It fired on busy scenes, when the guest
+                                 * falls behind and a backlog builds, and busy
+                                 * scenes are loud ones.
+                                 *
+                                 * Dropping instead loses the same audio in
+                                 * ten-millisecond pieces spread over the time it
+                                 * takes to drain, which is close to inaudible,
+                                 * and the queue still comes down. Only the query
+                                 * runs per packet, which is a counter read.
+                                 */
+                                const int per_second =
+                                    (int)(audio_rate * audio_channels * sizeof(float));
+                                const int queued = SDL_GetAudioStreamQueued(audio);
+                                if (queued < per_second / 5)     /* under 200ms */
+                                    SDL_PutAudioStreamData(audio,
+                                                           payload + sizeof(*a), (int)want);
+
+                                if (opt.stats && SDL_GetTicks() - audio_logged_at > 5000) {
+                                    audio_logged_at = SDL_GetTicks();
+                                    printf("sash: audio queued %.0f ms\n",
+                                           queued * 1000.0 / per_second);
+                                    fflush(stdout);
+                                }
+                            }
                         }
                     } else if (head.type == SASH_MSG_CLIENT_STATE &&
                                head.bytes >= sizeof(struct sash_msg_window_state)) {
