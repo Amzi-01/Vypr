@@ -224,7 +224,7 @@ static void set_capture(SDL_Window *win, bool want, bool announce)
  */
 struct hit_ctx {
     uint32_t chrome_top;   /* guest pixels */
-    uint32_t src_h;        /* guest pixels, to scale into window pixels */
+    uint32_t src_w, src_h; /* guest pixels, to scale into window pixels */
     bool     captured;     /* a captured game has no title bar to grab */
 };
 
@@ -251,12 +251,25 @@ static SDL_HitTestResult SDLCALL title_hit_test(SDL_Window *win,
     SDL_GetWindowSize(win, &w, &h);
     if (h <= 0 || ctx->src_h == 0) return SDL_HITTEST_NORMAL;
 
-    const float scale = (float)h / (float)ctx->src_h;
-    const float strip = chrome * scale;
+    const float scale_y = (float)h / (float)ctx->src_h;
+    const float strip = chrome * scale_y;
     if (pt->y >= strip) return SDL_HITTEST_NORMAL;
 
-    /* Three caption buttons, each about 1.5x the caption height wide. */
-    const float buttons = chrome * 4.5f * scale;
+    /*
+     * Leave the caption buttons alone so their clicks are forwarded.
+     *
+     * Scaled horizontally, which is not the same thing as vertically: a window
+     * whose aspect differs from the guest's - which is any window the user has
+     * resized - would otherwise get a button zone of the wrong width, and
+     * clicks meant for close or minimise would be swallowed as a drag.
+     *
+     * Windows draws three buttons at roughly 1.5x the caption height each, and
+     * a little margin beyond costs nothing: past the buttons there is only
+     * title bar, which can still be dragged from the left.
+     */
+    if (ctx->src_w == 0) return SDL_HITTEST_DRAGGABLE;
+    const float scale_x = (float)w / (float)ctx->src_w;
+    const float buttons = chrome * 5.0f * scale_x;
     if (pt->x > w - buttons) return SDL_HITTEST_NORMAL;
 
     return SDL_HITTEST_DRAGGABLE;
@@ -448,7 +461,7 @@ int main(int argc, char **argv)
     uint32_t chrome_reported = opt.chrome_top;
 
     /* Kept current for the hit test, which decides what is title bar. */
-    struct hit_ctx hit = { opt.chrome_top, 0, false };
+    struct hit_ctx hit = { opt.chrome_top, 0, 0, false };
     SDL_SetWindowHitTest(views[0].win, title_hit_test, &hit);
 
     struct pointer_accum pointer = {0};
@@ -668,6 +681,7 @@ int main(int argc, char **argv)
         }
 
         hit.chrome_top = chrome_reported;
+        hit.src_w      = views[0].src_w;
         hit.src_h      = views[0].src_h;
         hit.captured   = pointer_locked || capture_forced;
 
