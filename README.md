@@ -115,9 +115,53 @@ frames is not the one that owns the control channel.
 60 fps presented, 0 dropped | upload 0.3 ms, present 16.3 ms | age avg 6.2 ms worst 14.3 ms
 ```
 
-That 6 ms is the whole transport - capture, PCIe, and the ring. It excludes the
-guest's own render-to-capture delay and the host's scanout, so glass to glass is
-that plus up to one refresh interval.
+**The offset comes from the lowest-latency exchange, not the most recent one.**
+The estimate assumes the guest read its counter halfway through the round trip,
+so the error it hides is up to half that trip. Round trips reach *seconds* when
+the guest is saturated by a game - measured 1039 ms and 2814 ms - which is
+exactly when a latency figure is wanted. A slow exchange is evidence of
+queueing, not of a changed offset, so the best sample from the last 60 seconds
+wins. That holds the error at ~0.15 ms under full game load, where taking the
+latest sample produced a 470 ms error and nonsense readings.
+
+### Where the time actually goes
+
+Frames are stamped with WGC's `SystemRelativeTime` - when DWM composed the
+frame - not with a counter read just before publishing. The latter excludes the
+guest's whole capture pipeline, which is where the time is, and flattered the
+figure to 0.7 ms.
+
+Measured on FiveM at 3840x2160, guest side only, needing no clock alignment:
+
+```
+capture->publish avg  0.65 ms  worst  23.21 ms
+capture->publish avg 45.53 ms  worst  96.96 ms
+```
+
+That is the finding: **the transport is not the bottleneck and never was.**
+Publish-to-host-acquire is under a millisecond. The cost is WGC capture plus the
+GPU-to-CPU readback inside the guest, and it swings by two orders of magnitude
+with GPU contention. Optimising the shared-memory path further would buy
+nothing; the readback is the thing to attack.
+
+## Mouse capture
+
+A game that takes the pointer needs relative motion, not positions. It warps the
+cursor to a fixed point every frame and reads the deltas, so an absolute
+position from the host lands as a large bogus delta on top of its own warp -
+the view spins and the pointer ends up in a corner.
+
+The guest reports when an app takes the pointer (cursor hidden, or clipped
+smaller than the virtual desktop) and the host switches to relative motion.
+**Ctrl+Shift+M** toggles it by hand, the same chord Moonlight uses, because the
+detection can miss a fullscreen app that leaves the cursor nominally visible -
+and because a game that grabs the mouse must always be escapable from the host
+side.
+
+Absolute positioning is also simply wrong in that situation: FiveM changed the
+guest display mode to 2560x1440 while its window stayed 3840x2160, and SendInput
+normalises absolute coordinates against the *virtual desktop*, so every point
+past 2560x1440 mapped out of range.
 
 ## Status
 

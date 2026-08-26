@@ -36,6 +36,23 @@
 #include "shm.h"
 
 #define MAX_WINDOWS ((int)SASH_MAX_SLOTS)
+
+/*
+ * Clock samples, kept so the offset can come from the *best* exchange rather
+ * than the most recent one.
+ *
+ * The round-trip estimate assumes the guest read its counter halfway through
+ * the trip, so the error it can hide is up to half the round trip. That is
+ * fine at 0.3 ms and worthless at 2.8 s - and round trips do reach seconds
+ * when the guest is saturated by a game, which is exactly when a latency
+ * figure is wanted. A slow exchange is not evidence of a changed offset, it is
+ * evidence of queueing, so it is discarded in favour of a faster one.
+ *
+ * Samples expire so that a very good but very old sample cannot outvote
+ * genuine drift forever.
+ */
+#define CLOCK_SAMPLES     24
+#define CLOCK_MAX_AGE_NS  (60ull * 1000000000ull)
 #define MAX_MATCH   8
 
 struct window {
@@ -71,6 +88,14 @@ struct daemon {
     const char *launch;
     int         clock_logged;
     uint64_t    last_ping_ns;
+
+    struct clock_sample {
+        uint64_t rtt_ns;
+        int64_t  offset_ns;
+        uint64_t at_ns;
+    } clock[CLOCK_SAMPLES];
+    int      clock_next;
+    uint64_t clock_best_rtt;
 
     char self_dir[512];
 };
@@ -352,14 +377,51 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         const uint64_t guest_ns = (uint64_t)((__int128)p->guest_qpc * 1000000000
                                              / p->guest_qpc_freq);
 
-        d->shm.hdr->guest_offset_ns = (int64_t)host_mid - (int64_t)guest_ns;
+        struct clock_sample *slot = &d->clock[d->clock_next];
+        slot->rtt_ns    = t3 - t1;
+        slot->offset_ns = (int64_t)host_mid - (int64_t)guest_ns;
+        slot->at_ns     = t3;
+        d->clock_next   = (d->clock_next + 1) % CLOCK_SAMPLES;
+
+        /* Best surviving sample wins, not the newest. */
+        const struct clock_sample *best = NULL;
+        for (int i = 0; i < CLOCK_SAMPLES; i++) {
+            const struct clock_sample *c = &d->clock[i];
+            if (c->at_ns == 0) continue;
+            if (t3 - c->at_ns > CLOCK_MAX_AGE_NS) continue;
+            if (!best || c->rtt_ns < best->rtt_ns) best = c;
+        }
+        if (!best) break;
+
+        d->shm.hdr->guest_offset_ns = best->offset_ns;
+        d->shm.hdr->offset_rtt_us   = (uint32_t)(best->rtt_ns / 1000);
         __atomic_store_n(&d->shm.hdr->offset_valid, 1u, __ATOMIC_RELEASE);
 
-        if (!d->clock_logged) {
-            fprintf(stderr, "sashd: clock aligned, round trip %.2f ms\n",
-                    (t3 - t1) / 1e6);
-            d->clock_logged = 1;
+        if (!d->clock_logged || best->rtt_ns != d->clock_best_rtt) {
+            fprintf(stderr, "sashd: clock offset from a %.2f ms round trip "
+                            "(this sample %.2f ms)\n",
+                    best->rtt_ns / 1e6, slot->rtt_ns / 1e6);
+            d->clock_logged  = 1;
+            d->clock_best_rtt = best->rtt_ns;
         }
+        break;
+    }
+
+    case SASH_MSG_POINTER_LOCK: {
+        if (bytes < sizeof(struct sash_msg_pointer_lock)) break;
+        const struct sash_msg_pointer_lock *m = (const void *)payload;
+
+        /* Goes to whichever client is presenting that window - a popup's input
+         * belongs to its owner's process. */
+        struct window *w = window_find(d, m->window_id);
+        if (w && w->is_popup && w->owner_id) {
+            struct window *owner = window_find(d, w->owner_id);
+            if (owner) w = owner;
+        }
+        if (w && w->client_fd >= 0)
+            msg_send(w->client_fd, SASH_MSG_CLIENT_LOCK, m, sizeof(*m));
+        fprintf(stderr, "sashd: guest %s the pointer\n",
+                m->locked ? "captured" : "released");
         break;
     }
 
@@ -550,10 +612,11 @@ int main(int argc, char **argv)
          * up as latency slowly wandering away from the truth. */
         if (d.agent_fd >= 0) {
             const uint64_t t = now_ns();
-            if (t - d.last_ping_ns > 5000000000ull) {
+            if (t - d.last_ping_ns > 2000000000ull) {
                 d.last_ping_ns = t;
                 struct sash_msg_ping ping = { .token = t };
-                msg_send(d.agent_fd, SASH_MSG_PING, &ping, sizeof(ping));
+                if (msg_send(d.agent_fd, SASH_MSG_PING, &ping, sizeof(ping)) < 0)
+                    fprintf(stderr, "sashd: ping send failed\n");
             }
         }
 

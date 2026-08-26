@@ -77,6 +77,10 @@ struct WindowCapture::Impl {
 
     std::uint64_t                 qpc_freq = 0;
 
+    double        pipeline_ms_total = 0;
+    double        pipeline_ms_worst = 0;
+    std::uint32_t pipeline_n = 0;
+
     // GDI fallback, for windows WGC will not capture at all.
     HWND                          gdi_hwnd = nullptr;
     std::thread                   gdi_thread;
@@ -250,11 +254,47 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     context->Unmap(staging.get(), 0);
 
     if (dst) {
-        LARGE_INTEGER qpc{};
-        QueryPerformanceCounter(&qpc);
-        pub->publish(w, h, stride, static_cast<std::uint64_t>(qpc.QuadPart),
-                     qpc_freq, SASH_PUB_DAMAGE_FULL);
+        // Stamp when DWM composed the frame, not when we finished copying it.
+        //
+        // QueryPerformanceCounter here would be taken *after* the GPU->CPU
+        // readback and the memcpy, so the resulting "age" would exclude the
+        // guest-side capture pipeline - which is precisely where the time goes.
+        // It measured 0.7 ms and meant nothing.
+        //
+        // SystemRelativeTime is in 100ns ticks on the same timebase as QPC, so
+        // the frequency is reported as 10 MHz to match.
+        std::uint64_t stamp;
+        std::uint64_t stamp_freq;
+        const auto composed = frame.SystemRelativeTime().count();
+        if (composed > 0) {
+            stamp      = static_cast<std::uint64_t>(composed);
+            stamp_freq = 10000000ull;
+        } else {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            stamp      = static_cast<std::uint64_t>(qpc.QuadPart);
+            stamp_freq = qpc_freq;
+        }
+        pub->publish(w, h, stride, stamp, stamp_freq, SASH_PUB_DAMAGE_FULL);
         captured++;
+
+        // Guest-side cost, measured entirely within one clock: from the time
+        // WGC says the frame was captured to the moment it is published. This
+        // needs no host/guest alignment, so it cannot be blamed on clock error.
+        if (composed > 0) {
+            LARGE_INTEGER at_publish{};
+            QueryPerformanceCounter(&at_publish);
+            const double ms = (static_cast<double>(at_publish.QuadPart) -
+                               static_cast<double>(composed)) * 1000.0 / qpc_freq;
+            pipeline_ms_total += ms;
+            if (ms > pipeline_ms_worst) pipeline_ms_worst = ms;
+            if (++pipeline_n >= 240) {
+                std::fprintf(stderr,
+                    "sash: capture->publish avg %.2f ms worst %.2f ms over %u frames\n",
+                    pipeline_ms_total / pipeline_n, pipeline_ms_worst, pipeline_n);
+                pipeline_ms_total = 0; pipeline_ms_worst = 0; pipeline_n = 0;
+            }
+        }
     } else {
         dropped++;
     }

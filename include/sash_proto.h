@@ -33,6 +33,7 @@ enum sash_msg_type {
     SASH_MSG_CURSOR           = 6,   /* sash_msg_cursor */
     SASH_MSG_LOG              = 7,   /* utf8 text */
     SASH_MSG_PONG             = 8,   /* sash_msg_pong */
+    SASH_MSG_POINTER_LOCK     = 9,   /* sash_msg_pointer_lock */
 
     /* host -> guest */
     SASH_MSG_ATTACH           = 64,  /* sash_msg_attach */
@@ -51,7 +52,8 @@ enum sash_msg_type {
      * framing means one reader implementation rather than two. */
     SASH_MSG_CLIENT_HELLO     = 128, /* sash_msg_window_id */
     SASH_MSG_CLIENT_POPUP     = 129, /* sash_msg_client_popup */
-    SASH_MSG_CLIENT_POPUP_END = 130  /* sash_msg_window_id */
+    SASH_MSG_CLIENT_POPUP_END = 130, /* sash_msg_window_id */
+    SASH_MSG_CLIENT_LOCK      = 131  /* sash_msg_pointer_lock */
 };
 
 /*
@@ -185,6 +187,23 @@ struct sash_msg_resize {
  * guest's reading was taken halfway between. Across a virtual bridge the round
  * trip is tens of microseconds, so the error is far below a frame.
  */
+/*
+ * The guest app has taken the pointer - it hid the cursor, or confined it with
+ * ClipCursor, or both. That is what a game does when it wants raw motion: it
+ * warps the cursor back to a fixed point every frame and reads the deltas.
+ *
+ * Absolute positioning fights that. Every absolute move the host sends becomes
+ * a large bogus delta on top of the game's own warping, which is why an
+ * uncorrected stream sends the view spinning and the pointer into a corner.
+ * While locked, the host switches to relative motion and stops saying where the
+ * pointer *is* at all.
+ */
+struct sash_msg_pointer_lock {
+    uint64_t window_id;
+    uint32_t locked;
+    uint32_t _pad;
+};
+
 struct sash_msg_ping {
     uint64_t token;              /* host monotonic ns, echoed back */
 };

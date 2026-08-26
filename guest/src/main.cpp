@@ -57,7 +57,55 @@ private:
     std::map<std::uint64_t, sash::WindowInfo>           known_;
 
     std::atomic<bool> stop_{false};
+
+    bool          lock_state_ = false;
+    std::uint64_t lock_window_ = 0;
+    void poll_pointer_lock();
 };
+
+/*
+ * Two independent signals that an app wants raw mouse input, either of which is
+ * enough: the cursor is hidden, or it has been confined to something smaller
+ * than the whole virtual desktop.
+ */
+void Agent::poll_pointer_lock() {
+    CURSORINFO ci{};
+    ci.cbSize = sizeof(ci);
+    const bool hidden = GetCursorInfo(&ci) && !(ci.flags & CURSOR_SHOWING);
+
+    RECT clip{};
+    bool clipped = false;
+    if (GetClipCursor(&clip)) {
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        clipped = (clip.right - clip.left) < vw || (clip.bottom - clip.top) < vh;
+    }
+
+    const HWND fg = GetForegroundWindow();
+    const auto fg_id = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(fg));
+
+    bool streaming_fg;
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        streaming_fg = streams_.find(fg_id) != streams_.end();
+    }
+
+    const bool locked = (hidden || clipped) && streaming_fg;
+
+    if (locked == lock_state_ && (!locked || fg_id == lock_window_)) return;
+
+    lock_state_  = locked;
+    lock_window_ = locked ? fg_id : lock_window_;
+
+    sash_msg_pointer_lock msg{};
+    msg.window_id = lock_window_;
+    msg.locked    = locked ? 1u : 0u;
+    control_.send(SASH_MSG_POINTER_LOCK, &msg, sizeof(msg));
+
+    std::fprintf(stderr, "sash: pointer %s for HWND %p\n",
+                 locked ? "locked" : "released",
+                 reinterpret_cast<void*>(static_cast<std::uintptr_t>(lock_window_)));
+}
 
 // Payload is attacker-adjacent only in the sense that a host bug should not
 // crash the agent; check the size before reinterpreting.
@@ -240,6 +288,8 @@ void Agent::watch_windows() {
                 control_.send_window(SASH_MSG_WINDOW_CHANGED, desc, it->second.title);
             }
         }
+
+        poll_pointer_lock();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }

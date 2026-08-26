@@ -38,11 +38,32 @@ bool to_absolute(HWND hwnd, int cx, int cy, LONG* out_x, LONG* out_y) {
 
 std::uint32_t g_buttons = 0;   // last known button state, to derive edges
 
+/*
+ * Input goes to whatever is in the foreground, not to whatever we aim at, so a
+ * window that quietly loses focus in the guest silently swallows everything.
+ * Observed with the Windows Search overlay taking focus: the game kept
+ * rendering while every keystroke went to the search box.
+ *
+ * Asserting focus only when the host window gains focus is not enough - nothing
+ * takes it back afterwards. Check per event instead; once it holds, the check
+ * is a single call and the assignment never runs.
+ */
+void ensure_foreground(HWND hwnd) {
+    if (!hwnd || GetForegroundWindow() == hwnd) return;
+
+    const DWORD self = GetCurrentThreadId();
+    const DWORD fore = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    if (fore && fore != self) AttachThreadInput(self, fore, TRUE);
+    SetForegroundWindow(hwnd);
+    if (fore && fore != self) AttachThreadInput(self, fore, FALSE);
+}
+
 }  // namespace
 
 void inject_pointer(const sash_msg_pointer& msg) {
     HWND hwnd = to_hwnd(msg.window_id);
     if (!IsWindow(hwnd)) return;
+    ensure_foreground(hwnd);
 
     std::vector<INPUT> batch;
 
@@ -102,6 +123,8 @@ void inject_pointer(const sash_msg_pointer& msg) {
 }
 
 void inject_key(const sash_msg_key& msg) {
+    ensure_foreground(to_hwnd(msg.window_id));
+
     INPUT in{};
     in.type = INPUT_KEYBOARD;
     in.ki.wScan = static_cast<WORD>(msg.scancode & 0xff);

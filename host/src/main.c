@@ -301,6 +301,17 @@ int main(int argc, char **argv)
         printf("sash: present backend '%s'\n", presenter_name(views[0].pres));
 
     struct msg_reader daemon_rx = {0};
+
+    /* Relative pointer mode, driven by the guest telling us an app has taken
+     * the pointer. `suspended` is the user's override: a captured pointer must
+     * always be escapable from the host side, whatever the guest thinks. */
+    bool pointer_locked = false;
+    /* Forced by the user with Ctrl+Alt. The guest's own detection - cursor
+     * hidden or clipped - misses cases like a fullscreen game that leaves the
+     * cursor nominally visible, so there has to be a way to say "capture"
+     * that does not depend on guessing. */
+    bool capture_forced = false;
+
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
@@ -337,7 +348,20 @@ int main(int argc, char **argv)
 
                 struct sash_msg_pointer msg = {0};
                 msg.window_id = v->window_id;
-                to_guest_coords(win_w, win_h, v->src_w, v->src_h, hx, hy, &msg.x, &msg.y);
+
+                if (pointer_locked || capture_forced) {
+                    /* Send motion, not position. The guest app is warping the
+                     * cursor itself; telling it where our pointer is would add
+                     * a bogus delta on top of its own warp every frame. */
+                    if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                        msg.x = (int32_t)ev.motion.xrel;
+                        msg.y = (int32_t)ev.motion.yrel;
+                    }
+                    msg.flags |= SASH_PTR_RELATIVE;
+                } else {
+                    to_guest_coords(win_w, win_h, v->src_w, v->src_h, hx, hy,
+                                    &msg.x, &msg.y);
+                }
 
                 if (held & SDL_BUTTON_LMASK) msg.buttons |= 1u << 0;
                 if (held & SDL_BUTTON_RMASK) msg.buttons |= 1u << 1;
@@ -361,6 +385,37 @@ int main(int argc, char **argv)
                 if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE &&
                     (ev.key.mod & SDL_KMOD_CTRL)) {
                     running = 0;
+                    break;
+                }
+                /* Ctrl+Shift+M toggles mouse capture, the same chord Moonlight
+                 * uses. It is deliberately a host-side hotkey: a game that has
+                 * grabbed the pointer must always be escapable, and the guest's
+                 * own detection can miss a fullscreen app that leaves the
+                 * cursor nominally visible. */
+                if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_M &&
+                    (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_SHIFT)) {
+                    capture_forced = !capture_forced;
+                    SDL_SetWindowRelativeMouseMode(views[0].win,
+                                                   pointer_locked || capture_forced);
+
+                    /* The Ctrl and Shift presses already went to the guest, and
+                     * the M never will - so release the modifiers explicitly or
+                     * the guest is left holding them down. A stuck Ctrl in a
+                     * game is its own kind of misery. */
+                    if (daemon_fd >= 0) {
+                        static const uint32_t mods[] = { 0x1D, 0xE01D, 0x2A, 0x36 };
+                        for (size_t k = 0; k < sizeof(mods) / sizeof(mods[0]); k++) {
+                            struct sash_msg_key up = {0};
+                            up.window_id = v->window_id;
+                            up.scancode  = mods[k];
+                            up.down      = 0;
+                            msg_send(daemon_fd, SASH_MSG_KEY, &up, sizeof(up));
+                        }
+                    }
+
+                    printf("sash: mouse capture %s (Ctrl+Shift+M toggles)\n",
+                           capture_forced ? "ON - relative motion" : "OFF - absolute");
+                    fflush(stdout);
                     break;
                 }
                 if (daemon_fd < 0) break;
@@ -421,6 +476,15 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct sash_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == SASH_MSG_CLIENT_LOCK &&
+                               head.bytes >= sizeof(struct sash_msg_pointer_lock)) {
+                        const struct sash_msg_pointer_lock *m = (const void *)payload;
+                        pointer_locked = m->locked != 0;
+                        SDL_SetWindowRelativeMouseMode(views[0].win,
+                                                       pointer_locked || capture_forced);
+                        if (opt.stats)
+                            printf("sash: pointer %s by guest\n",
+                                   pointer_locked ? "captured" : "released");
                     } else if (head.type == SASH_MSG_CLIENT_POPUP_END &&
                                head.bytes >= sizeof(struct sash_msg_window_id)) {
                         const struct sash_msg_window_id *m = (const void *)payload;
@@ -482,14 +546,17 @@ int main(int argc, char **argv)
             if (now - stats_at >= 1000) {
                 uint64_t ns_upload = 0, ns_present = 0;
                 presenter_take_timings(views[0].pres, &ns_upload, &ns_present);
+                /* Half the round trip is the most the offset can be wrong by,
+                 * so it is the honest error bar on every age below. */
+                const double err_ms = shm.hdr->offset_rtt_us / 2000.0;
                 printf("%" PRIu64 " fps presented, %" PRIu64 " dropped | "
                        "upload %.1f ms, present %.1f ms | age avg %.1f ms "
-                       "worst %.1f ms\n",
+                       "worst %.1f ms (+/- %.2f)\n",
                        presented, dropped,
                        presented ? ns_upload  / 1e6 / presented : 0.0,
                        presented ? ns_present / 1e6 / presented : 0.0,
                        age_samples ? age_total_ns / 1e6 / age_samples : 0.0,
-                       age_worst_ns / 1e6);
+                       age_worst_ns / 1e6, err_ms);
                 presented = dropped = 0;
                 age_total_ns = age_samples = age_worst_ns = 0;
                 stats_at = now;

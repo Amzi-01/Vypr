@@ -123,7 +123,11 @@ struct sash_shm_header {
      */
     int64_t  guest_offset_ns;
     uint32_t offset_valid;
-    uint32_t _pad3;
+
+    /* Round trip of the exchange this offset came from. The offset is only as
+     * trustworthy as that number is small, so consumers can state their own
+     * uncertainty instead of implying precision they do not have. */
+    uint32_t offset_rtt_us;
 
     struct sash_slot slots[SASH_MAX_SLOTS];
 };
