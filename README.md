@@ -190,8 +190,16 @@ is one - so a window without a Win32 title bar still gets a strip of its own,
 sized like an ordinary one. Otherwise those windows can only ever be dragged
 inside the VM.
 
-Suppressed while the pointer is captured - a game in mouselook has no title bar
-to grab.
+A window that really has a Win32 title bar keeps it as a drag handle **even
+while the pointer is captured**. Suppressing it there was the reason dragging
+kept moving the window inside the VM: the guest reports the pointer captured
+almost constantly during a game, and that skipped the handling entirely so
+every drag was forwarded. A fullscreen game reports no title bar, so it is
+unaffected either way.
+
+The fallback strip - for windows that draw their own chrome and report no title
+bar - applies only when the pointer is *not* captured, so a captured game never
+has a dead band across the top of it.
 
 ## Mouse capture
 

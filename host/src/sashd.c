@@ -195,7 +195,7 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--window-id", id,
             "--sock",       d->unix_path,
             "--chrome-top", chrome,
-            "--no-capture",
+            "--capture",
             NULL
         };
         execv(exe, argv);

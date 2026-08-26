@@ -84,7 +84,7 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->title     = "sash";
     o->sock_path = NULL;
     o->backend   = NULL;
-    o->capture   = 0;
+    o->capture   = 1;   /* pointer capture on unless told otherwise */
     o->chrome_top = 0;
     o->window_id = 0;
     o->slot      = 0;
@@ -372,7 +372,7 @@ int main(int argc, char **argv)
      * strip, sized like an ordinary one.
      */
     enum { DEFAULT_DRAG_STRIP = 32 };
-    uint32_t chrome_top = opt.chrome_top ? opt.chrome_top : DEFAULT_DRAG_STRIP;
+    uint32_t chrome_reported = opt.chrome_top;
     bool  title_press = false, title_dragging = false;
     float press_gx = 0, press_gy = 0;
     int   press_win_x = 0, press_win_y = 0;
@@ -407,10 +407,25 @@ int main(int argc, char **argv)
             case SDL_EVENT_MOUSE_WHEEL: {
                 if (daemon_fd < 0) break;
 
-                /* Title-bar handling, only for the top-level and only when the
-                 * pointer is not captured - a game has no title bar to grab. */
-                if (!v->is_popup && chrome_top > 0 &&
-                    !(pointer_locked || capture_forced)) {
+                /*
+                 * How much of the top is a drag handle.
+                 *
+                 * A window that really has a Win32 title bar keeps it as a drag
+                 * handle even while the pointer is captured - otherwise the
+                 * drag is forwarded and moves the window inside the VM, which
+                 * is invisible from here. A fullscreen game reports no title
+                 * bar, so it is unaffected.
+                 *
+                 * The fallback strip, for windows that draw their own chrome
+                 * and report nothing, applies only when the pointer is *not*
+                 * captured: a captured game must not have a dead band across
+                 * the top of it.
+                 */
+                uint32_t chrome_top = chrome_reported;
+                if (chrome_top == 0 && !(pointer_locked || capture_forced))
+                    chrome_top = DEFAULT_DRAG_STRIP;
+
+                if (!v->is_popup && chrome_top > 0) {
                     SDL_GetWindowSize(v->win, &win_w, &win_h);
                     const float scale_y = (v->src_h && win_h > 0)
                                         ? (float)win_h / (float)v->src_h : 1.0f;
@@ -626,8 +641,7 @@ int main(int argc, char **argv)
                                head.bytes >= sizeof(struct sash_msg_client_geom)) {
                         const struct sash_msg_client_geom *m = (const void *)payload;
                         if (m->window_id == opt.window_id)
-                            chrome_top = m->chrome_top ? m->chrome_top
-                                                       : DEFAULT_DRAG_STRIP;
+                            chrome_reported = m->chrome_top;
                     } else if (head.type == SASH_MSG_CLIENT_LOCK &&
                                head.bytes >= sizeof(struct sash_msg_pointer_lock)) {
                         const struct sash_msg_pointer_lock *m = (const void *)payload;
