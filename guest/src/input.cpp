@@ -117,10 +117,13 @@ void inject_pointer(const sash_msg_pointer& msg) {
             GetCursorPos(&cur);
             RECT clip{};
             GetClipCursor(&clip);
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            const bool showing = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING);
             std::fprintf(stderr,
                 "sash: pointer %u rel / %u abs, mean |dx|=%.1f |dy|=%.1f, "
-                "cursor now %ld,%ld, clip %ldx%ld at %ld,%ld\n",
-                rel, abs_, sum_x / n, sum_y / n, cur.x, cur.y,
+                "cursor %ld,%ld visible=%d, clip %ldx%ld at %ld,%ld\n",
+                rel, abs_, sum_x / n, sum_y / n, cur.x, cur.y, showing ? 1 : 0,
                 clip.right - clip.left, clip.bottom - clip.top, clip.left, clip.top);
             n = 0; sum_x = sum_y = 0; rel = abs_ = 0;
         }
@@ -129,6 +132,32 @@ void inject_pointer(const sash_msg_pointer& msg) {
     std::vector<INPUT> batch;
 
     if (msg.flags & SASH_PTR_RELATIVE) {
+        /*
+         * Keep the cursor away from the screen edges.
+         *
+         * Relative deltas accumulate into the cursor position, so without this
+         * the cursor walks to an edge and stops - after which every further
+         * delta in that direction is silently discarded and the view will not
+         * turn any further. Observed jammed at 3839,1863 on a 3840x2160
+         * screen, which is exactly what it looks like when a game "stops
+         * responding" to the mouse.
+         *
+         * A game that captures the mouse re-centres it itself every frame, so
+         * this is a no-op there. It matters precisely when the app does not,
+         * which is the case that was broken.
+         */
+        RECT cap = sash_capture_rect(hwnd);
+        POINT cur{};
+        if (GetCursorPos(&cur)) {
+            const LONG margin_x = (cap.right - cap.left) / 8;
+            const LONG margin_y = (cap.bottom - cap.top) / 8;
+            if (cur.x < cap.left + margin_x || cur.x > cap.right - margin_x ||
+                cur.y < cap.top + margin_y || cur.y > cap.bottom - margin_y) {
+                SetCursorPos((cap.left + cap.right) / 2,
+                             (cap.top + cap.bottom) / 2);
+            }
+        }
+
         INPUT in{};
         in.type = INPUT_MOUSE;
         in.mi.dx = msg.x;

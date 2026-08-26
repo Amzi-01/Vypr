@@ -175,6 +175,14 @@ independently capable of ruining it:
   restores it afterwards, including on exit; it is the user's setting, not
   ours to keep.
 
+**Re-centre the guest cursor.** Relative deltas accumulate into the cursor
+position, so without intervention the cursor walks to a screen edge and stops -
+and every further delta in that direction is discarded, which looks exactly
+like the game ignoring the mouse. Observed jammed at 3839,1863 on a 3840x2160
+screen while the host was still sending perfectly good deltas. A game that
+captures the mouse re-centres it itself, so this is a no-op there; it matters
+precisely in the case that was broken.
+
 Capture is also a request the compositor may refuse, so the result is checked -
 silently sending deltas after a refused grab looks exactly like broken input.
 
