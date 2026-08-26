@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "audio.hpp"
 #include "capture.hpp"
 #include "control.hpp"
 #include "input.hpp"
@@ -50,8 +51,9 @@ private:
     void handle_detach(std::uint64_t window_id);
     void watch_windows();
 
-    sash::Region  region_;
-    sash::Control control_;
+    sash::Region       region_;
+    sash::Control      control_;
+    sash::AudioCapture audio_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -399,6 +401,24 @@ bool Agent::run(const char* host, std::uint16_t port) {
     hello.capabilities = SASH_CAP_RESIZE;
     control_.send(SASH_MSG_HELLO, &hello, sizeof(hello));
 
+    /* Audio is whatever the guest is playing. It starts once and runs for the
+     * session rather than per window - the capture is of the endpoint, not of
+     * any one app. */
+    audio_.start([this](const float* samples, std::uint32_t frames,
+                        std::uint32_t rate, std::uint16_t channels) {
+        const std::uint32_t bytes = frames * channels * sizeof(float);
+        if (bytes == 0 || sizeof(sash_msg_audio) + bytes > SASH_MAX_MSG_BYTES) return;
+
+        std::vector<std::uint8_t> buf(sizeof(sash_msg_audio) + bytes);
+        sash_msg_audio hdr{};
+        hdr.sample_rate = rate;
+        hdr.channels    = channels;
+        hdr.frames      = frames;
+        std::memcpy(buf.data(), &hdr, sizeof(hdr));
+        std::memcpy(buf.data() + sizeof(hdr), samples, bytes);
+        control_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
+    });
+
     std::thread watcher([this] { watch_windows(); });
 
     control_.run([this](std::uint16_t t, const std::uint8_t* p, std::uint32_t n) {
@@ -406,6 +426,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
     });
 
     stop_ = true;
+    audio_.stop();
     watcher.join();
     sash::restore_pointer_acceleration();
 

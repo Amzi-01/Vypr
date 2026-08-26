@@ -170,6 +170,31 @@ input goes straight through to Windows. Decorating it with the compositor as
 well would mean two sets of chrome for one window, with the outer set operating
 on a picture of the inner one.
 
+## Audio
+
+The guest captures its default playback endpoint with WASAPI loopback and sends
+it down the control channel as interleaved 32-bit float. The host opens a
+playback stream on the first block that arrives, matching whatever rate and
+channel count the guest is actually producing rather than asking for a format
+and making somebody resample.
+
+Audio does not go through the shared region. It is tiny beside video - a tenth
+of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
+reliability far more than it wants the last microsecond of latency, which is
+what TCP already gives.
+
+It is the whole guest's output, not one app's. WASAPI can capture a single
+process tree (`AUDCLNT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Windows 10 20H1+),
+which would suit a per-window model better, and the interface is shaped so that
+can be swapped in - but this VM runs one app at a time and endpoint loopback is
+considerably simpler and harder to get wrong.
+
+### Fullscreen
+
+An app that goes fullscreen in the guest is now drawing a window that covers the
+guest's whole desktop, so the host window goes fullscreen with it. Showing that
+inside a small window is not what the user asked the app to do.
+
 ### Minimise
 
 The guest's minimise button is part of the captured image, so clicking it

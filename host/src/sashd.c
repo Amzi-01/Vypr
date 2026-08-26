@@ -69,6 +69,7 @@ struct window {
     uint32_t width, height;
     uint32_t chrome_top;
     int      minimized;
+    int      is_fullscreen;
     char     title[192];
 };
 
@@ -315,11 +316,14 @@ static void on_agent_message(struct daemon *d, uint16_t type,
          * that stops producing frames is not left on screen looking frozen. */
         if (w && w->has_slot && w->client_fd >= 0) {
             const int mini = (desc->flags & SASH_WIN_MINIMIZED) != 0;
-            if (mini != w->minimized) {
-                w->minimized = mini;
+            const int fs   = (desc->flags & SASH_WIN_FULLSCREEN) != 0;
+            if (mini != w->minimized || fs != w->is_fullscreen) {
+                w->minimized     = mini;
+                w->is_fullscreen = fs;
                 struct sash_msg_window_state st = {0};
-                st.window_id = w->id;
-                st.minimized = (uint32_t)mini;
+                st.window_id  = w->id;
+                st.minimized  = (uint32_t)mini;
+                st.fullscreen = (uint32_t)fs;
                 msg_send(w->client_fd, SASH_MSG_CLIENT_STATE, &st, sizeof(st));
             }
         }
@@ -468,6 +472,20 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             msg_send(w->client_fd, SASH_MSG_CLIENT_LOCK, m, sizeof(*m));
         fprintf(stderr, "sashd: guest %s the pointer\n",
                 m->locked ? "captured" : "released");
+        break;
+    }
+
+    case SASH_MSG_AUDIO: {
+        /* One endpoint's worth of audio, so it goes to one window - the first
+         * top-level with a client. Handing it to every client would play the
+         * same sound several times over. */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window *w = &d->windows[i];
+            if (w->id && !w->is_popup && w->client_fd >= 0) {
+                msg_send(w->client_fd, SASH_MSG_CLIENT_AUDIO, payload, bytes);
+                break;
+            }
+        }
         break;
     }
 

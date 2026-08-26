@@ -33,6 +33,7 @@ enum sash_msg_type {
     SASH_MSG_CURSOR           = 6,   /* sash_msg_cursor */
     SASH_MSG_LOG              = 7,   /* utf8 text */
     SASH_MSG_PONG             = 8,   /* sash_msg_pong */
+    SASH_MSG_AUDIO            = 10,  /* sash_msg_audio + interleaved float */
     SASH_MSG_POINTER_LOCK     = 9,   /* sash_msg_pointer_lock */
 
     /* host -> guest */
@@ -56,7 +57,8 @@ enum sash_msg_type {
     SASH_MSG_CLIENT_POPUP_END = 130, /* sash_msg_window_id */
     SASH_MSG_CLIENT_LOCK      = 131, /* sash_msg_pointer_lock */
     SASH_MSG_CLIENT_GEOM      = 132, /* sash_msg_client_geom */
-    SASH_MSG_CLIENT_STATE     = 133  /* sash_msg_window_state */
+    SASH_MSG_CLIENT_STATE     = 133, /* sash_msg_window_state */
+    SASH_MSG_CLIENT_AUDIO     = 134  /* sash_msg_audio + interleaved float */
 };
 
 /*
@@ -239,13 +241,29 @@ struct sash_msg_pointer_lock {
 struct sash_msg_window_state {
     uint64_t window_id;
     uint32_t minimized;
-    uint32_t _pad;
+    uint32_t fullscreen;   /* the guest window covers the guest desktop */
 };
 
 struct sash_msg_client_geom {
     uint64_t window_id;
     uint32_t chrome_top;
     uint32_t _pad;
+};
+
+/*
+ * A block of what the guest is playing, as interleaved 32-bit float.
+ *
+ * Audio goes over the control channel rather than the shared region. It is
+ * tiny next to video - a tenth of a second of 48 kHz stereo is under 40 KB -
+ * and it needs ordering and reliability far more than it needs the last
+ * microsecond of latency, which is what TCP already provides.
+ */
+struct sash_msg_audio {
+    uint32_t sample_rate;
+    uint16_t channels;
+    uint16_t _pad;
+    uint32_t frames;
+    uint32_t _pad2;
 };
 
 struct sash_msg_ping {

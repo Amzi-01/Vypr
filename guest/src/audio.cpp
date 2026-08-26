@@ -1,0 +1,142 @@
+#include "audio.hpp"
+
+#include <windows.h>
+#include <audioclient.h>
+#include <mmdeviceapi.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+#pragma comment(lib, "ole32.lib")
+
+namespace sash {
+
+struct AudioCapture::Impl {
+    std::thread       thread;
+    std::atomic<bool> stop{false};
+    void run(Sink sink);
+};
+
+/*
+ * A loopback client hands back whatever the endpoint's mix format is, which is
+ * usually 32-bit float but is not promised to be. Converting here keeps the
+ * wire format to one thing and the host side free of format handling.
+ */
+static void to_float(const BYTE* src, const WAVEFORMATEX* wfx,
+                     std::uint32_t frames, std::vector<float>& out) {
+    const std::uint32_t ch = wfx->nChannels;
+    out.resize(static_cast<std::size_t>(frames) * ch);
+
+    if (wfx->wBitsPerSample == 32) {
+        std::memcpy(out.data(), src, out.size() * sizeof(float));
+    } else if (wfx->wBitsPerSample == 16) {
+        const auto* p = reinterpret_cast<const std::int16_t*>(src);
+        for (std::size_t i = 0; i < out.size(); i++) out[i] = p[i] / 32768.0f;
+    } else {
+        out.clear();
+    }
+}
+
+void AudioCapture::Impl::run(Sink sink) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice*           device     = nullptr;
+    IAudioClient*        client     = nullptr;
+    IAudioCaptureClient* capture    = nullptr;
+    WAVEFORMATEX*        wfx        = nullptr;
+
+    auto cleanup = [&] {
+        if (capture)    capture->Release();
+        if (client)     client->Release();
+        if (device)     device->Release();
+        if (enumerator) enumerator->Release();
+        if (wfx)        CoTaskMemFree(wfx);
+        CoUninitialize();
+    };
+
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), (void**)&enumerator))) {
+        std::fprintf(stderr, "sash: no audio device enumerator\n");
+        cleanup();
+        return;
+    }
+    if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+        std::fprintf(stderr, "sash: no default playback device; audio disabled\n");
+        cleanup();
+        return;
+    }
+    if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) ||
+        FAILED(client->GetMixFormat(&wfx))) {
+        cleanup();
+        return;
+    }
+
+    // 200ms of slack. Loopback is read on a timer rather than an event, so the
+    // buffer only has to outlast a scheduling hiccup.
+    const REFERENCE_TIME dur = 2000000;
+    if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                  dur, 0, wfx, nullptr)) ||
+        FAILED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture)) ||
+        FAILED(client->Start())) {
+        std::fprintf(stderr, "sash: could not start loopback capture\n");
+        cleanup();
+        return;
+    }
+
+    std::fprintf(stderr, "sash: audio %lu Hz, %u channels, %u-bit\n",
+                 wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample);
+
+    std::vector<float> samples;
+    while (!stop.load()) {
+        UINT32 packet = 0;
+        if (FAILED(capture->GetNextPacketSize(&packet))) break;
+        if (packet == 0) { Sleep(5); continue; }
+
+        while (packet > 0 && !stop.load()) {
+            BYTE*  data  = nullptr;
+            UINT32 frames = 0;
+            DWORD  flags = 0;
+            if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+
+            if (frames > 0) {
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                    // Silence is reported without data; send it anyway so the
+                    // host's stream keeps its timing rather than running dry.
+                    samples.assign(static_cast<std::size_t>(frames) * wfx->nChannels, 0.0f);
+                } else {
+                    to_float(data, wfx, frames, samples);
+                }
+                if (!samples.empty())
+                    sink(samples.data(), frames, wfx->nSamplesPerSec, wfx->nChannels);
+            }
+
+            capture->ReleaseBuffer(frames);
+            if (FAILED(capture->GetNextPacketSize(&packet))) { packet = 0; break; }
+        }
+    }
+
+    client->Stop();
+    cleanup();
+}
+
+AudioCapture::AudioCapture() : impl_(std::make_unique<Impl>()) {}
+AudioCapture::~AudioCapture() { stop(); }
+
+bool AudioCapture::start(Sink sink) {
+    stop();
+    impl_->stop = false;
+    impl_->thread = std::thread([this, sink] { impl_->run(sink); });
+    return true;
+}
+
+void AudioCapture::stop() {
+    if (!impl_->thread.joinable()) return;
+    impl_->stop = true;
+    impl_->thread.join();
+}
+
+}  // namespace sash

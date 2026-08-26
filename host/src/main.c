@@ -405,7 +405,7 @@ int main(int argc, char **argv)
 
     const int daemon_fd = connect_daemon(opt.sock_path, opt.window_id);
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         fprintf(stderr, "sash: SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -463,6 +463,16 @@ int main(int argc, char **argv)
     /* Kept current for the hit test, which decides what is title bar. */
     struct hit_ctx hit = { opt.chrome_top, 0, 0, false };
     SDL_SetWindowHitTest(views[0].win, title_hit_test, &hit);
+
+    /*
+     * Audio, opened on the first block that arrives rather than up front: the
+     * guest's mix format is whatever its endpoint happens to use, and asking
+     * for a rate the guest is not producing would mean resampling for no
+     * reason. SDL converts if the device disagrees.
+     */
+    SDL_AudioStream *audio = NULL;
+    uint32_t audio_rate = 0;
+    uint16_t audio_channels = 0;
 
     struct pointer_accum pointer = {0};
 
@@ -722,6 +732,37 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct sash_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == SASH_MSG_CLIENT_AUDIO &&
+                               head.bytes >= sizeof(struct sash_msg_audio)) {
+                        const struct sash_msg_audio *a = (const void *)payload;
+                        const uint32_t want = a->frames * a->channels * sizeof(float);
+                        if (a->channels && a->sample_rate &&
+                            head.bytes >= sizeof(*a) + want) {
+                            if (!audio || audio_rate != a->sample_rate ||
+                                audio_channels != a->channels) {
+                                if (audio) SDL_DestroyAudioStream(audio);
+                                SDL_AudioSpec spec = {
+                                    .format   = SDL_AUDIO_F32,
+                                    .channels = (int)a->channels,
+                                    .freq     = (int)a->sample_rate,
+                                };
+                                audio = SDL_OpenAudioDeviceStream(
+                                    SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+                                if (audio) {
+                                    SDL_ResumeAudioStreamDevice(audio);
+                                    audio_rate = a->sample_rate;
+                                    audio_channels = a->channels;
+                                    printf("sash: audio %u Hz, %u channels\n",
+                                           a->sample_rate, a->channels);
+                                    fflush(stdout);
+                                } else {
+                                    fprintf(stderr, "sash: audio device: %s\n",
+                                            SDL_GetError());
+                                }
+                            }
+                            if (audio)
+                                SDL_PutAudioStreamData(audio, payload + sizeof(*a), (int)want);
+                        }
                     } else if (head.type == SASH_MSG_CLIENT_STATE &&
                                head.bytes >= sizeof(struct sash_msg_window_state)) {
                         const struct sash_msg_window_state *m = (const void *)payload;
@@ -734,6 +775,17 @@ int main(int argc, char **argv)
                              * out as a user action. */
                             if (mini && !have)       SDL_MinimizeWindow(views[0].win);
                             else if (!mini && have)  SDL_RestoreWindow(views[0].win);
+
+                            /* An app that goes fullscreen in the guest should
+                             * go fullscreen here: the window it is drawing now
+                             * covers the guest's whole desktop, and showing
+                             * that inside a small window is not what the user
+                             * asked the app to do. */
+                            const bool want_fs = m->fullscreen != 0;
+                            const bool is_fs =
+                                (SDL_GetWindowFlags(views[0].win) & SDL_WINDOW_FULLSCREEN) != 0;
+                            if (want_fs != is_fs)
+                                SDL_SetWindowFullscreen(views[0].win, want_fs);
                         }
                     } else if (head.type == SASH_MSG_CLIENT_GEOM &&
                                head.bytes >= sizeof(struct sash_msg_client_geom)) {
@@ -833,6 +885,7 @@ int main(int argc, char **argv)
         if (views[i].pres) presenter_destroy(views[i].pres);
         if (views[i].win)  SDL_DestroyWindow(views[i].win);
     }
+    if (audio) SDL_DestroyAudioStream(audio);
     msg_reader_free(&daemon_rx);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
