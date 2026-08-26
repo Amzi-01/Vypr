@@ -75,9 +75,16 @@ void AudioCapture::Impl::run(Sink sink) {
         return;
     }
 
-    // 200ms of slack. Loopback is read on a timer rather than an event, so the
-    // buffer only has to outlast a scheduling hiccup.
-    const REFERENCE_TIME dur = 2000000;
+    /*
+     * 50ms, not 200.
+     *
+     * Everything the endpoint has buffered when a packet is finally read is
+     * audio that already happened, and it arrives late by exactly that much.
+     * The buffer only has to outlast a scheduling hiccup between polls, and
+     * polling is every couple of milliseconds - so a fifth of a second of slack
+     * bought nothing except a fifth of a second of delay.
+     */
+    const REFERENCE_TIME dur = 500000;
     if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
                                   dur, 0, wfx, nullptr)) ||
         FAILED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture)) ||
@@ -94,7 +101,7 @@ void AudioCapture::Impl::run(Sink sink) {
     while (!stop.load()) {
         UINT32 packet = 0;
         if (FAILED(capture->GetNextPacketSize(&packet))) break;
-        if (packet == 0) { Sleep(5); continue; }
+        if (packet == 0) { Sleep(2); continue; }
 
         while (packet > 0 && !stop.load()) {
             BYTE*  data  = nullptr;

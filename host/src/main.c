@@ -760,8 +760,30 @@ int main(int argc, char **argv)
                                             SDL_GetError());
                                 }
                             }
-                            if (audio)
+                            if (audio) {
+                                /*
+                                 * Never let the queue grow without bound.
+                                 *
+                                 * Whatever is queued is delay, and queued audio
+                                 * is never recovered: if the guest produces even
+                                 * slightly faster than this device consumes, or
+                                 * a hitch puts a backlog in, that backlog stays
+                                 * for the rest of the session and everything is
+                                 * heard late by that much.
+                                 *
+                                 * The cap is 50ms, chosen against the video
+                                 * path rather than in isolation: capture to
+                                 * present measures roughly 35-50ms, so letting
+                                 * audio sit further behind than that would put
+                                 * sound audibly after the picture even with the
+                                 * queue "healthy".
+                                 */
+                                const int max_queued =
+                                    (int)(audio_rate * audio_channels * sizeof(float) / 20);
+                                if (SDL_GetAudioStreamQueued(audio) > max_queued)
+                                    SDL_ClearAudioStream(audio);
                                 SDL_PutAudioStreamData(audio, payload + sizeof(*a), (int)want);
+                            }
                         }
                     } else if (head.type == SASH_MSG_CLIENT_STATE &&
                                head.bytes >= sizeof(struct sash_msg_window_state)) {
