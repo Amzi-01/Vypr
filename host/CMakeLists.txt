@@ -7,7 +7,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 find_package(SDL3 REQUIRED CONFIG)
 
-add_executable(sash-host src/main.c src/shm.c src/msg.c)
+add_executable(sash-host src/main.c src/shm.c src/msg.c src/present.c src/present_gpu.c src/present_render.c)
 target_include_directories(sash-host PRIVATE src ../include)
 target_link_libraries(sash-host PRIVATE SDL3::SDL3)
 

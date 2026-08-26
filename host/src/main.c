@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "msg.h"
+#include "present.h"
 #include "shm.h"
 
 #include <sys/socket.h>
@@ -25,6 +26,7 @@ struct options {
     const char *shm_path;
     const char *title;
     const char *sock_path;   /* unix socket back to sashd; NULL = no input path */
+    const char *backend;     /* "gpu" or "render" */
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
@@ -33,7 +35,7 @@ struct options {
 static void usage(void)
 {
     fputs("usage: sash-host --shm PATH --slot N [--title NAME] [--stats]\n"
-          "                 [--sock PATH --window-id ID]\n"
+          "                 [--sock PATH --window-id ID] [--present gpu|render]\n"
           "\nRun standalone it presents a slot. sashd additionally passes --sock\n"
           "and --window-id, which is what turns input back on.\n", stderr);
 }
@@ -71,6 +73,7 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->shm_path  = "/dev/shm/sash";
     o->title     = "sash";
     o->sock_path = NULL;
+    o->backend   = NULL;
     o->window_id = 0;
     o->slot      = 0;
     o->stats     = 0;
@@ -80,6 +83,7 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--slot") && i + 1 < argc)  o->slot = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) o->title = argv[++i];
         else if (!strcmp(argv[i], "--sock") && i + 1 < argc)  o->sock_path = argv[++i];
+        else if (!strcmp(argv[i], "--present") && i + 1 < argc) o->backend = argv[++i];
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
             o->window_id = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stats"))                 o->stats = 1;
@@ -195,36 +199,15 @@ int main(int argc, char **argv)
     SDL_Window *win = SDL_CreateWindow(opt.title, win_w, win_h, SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "sash: SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
-    /* Backend choice is worth 2x at 4K. The default 'opengl' backend presents
-     * synchronously - measured 21-24 ms per present, which alone misses vsync
-     * and pins the stream to half refresh. The 'gpu' backend presents in ~2 ms
-     * and lets the upload overlap. Env still wins, for debugging. */
-    if (!SDL_getenv("SDL_RENDER_DRIVER"))
-        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "gpu");
+    struct presenter *pres = presenter_create(win, opt.backend);
+    if (!pres) { fprintf(stderr, "sash: no usable present backend\n"); return 1; }
 
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
-    if (!ren) { fprintf(stderr, "sash: SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
-    SDL_SetRenderVSync(ren, 1);
+    if (opt.stats)
+        printf("sash: present backend '%s'\n", presenter_name(pres));
 
-    if (opt.stats) {
-        const char *name = SDL_GetRendererName(ren);
-        printf("sash: renderer '%s'\n", name ? name : "?");
-    }
-
-    /* A pool, not a single texture. Uploading into the texture the GPU is still
-     * reading from forces the driver to stall until that draw retires, which at
-     * 4K costs more than a frame and shows up as exactly half refresh rate.
-     * Rotating means the upload always targets a texture the GPU has finished
-     * with. */
-    enum { TEX_POOL = 3 };
-    SDL_Texture *tex[TEX_POOL] = { NULL, NULL, NULL };
-    int tex_at = 0;
+    /* Source geometry, kept here for input mapping and window sizing;
+     * the presenter owns the GPU-side resources. */
     uint32_t tex_w = 0, tex_h = 0;
-
-    /* Frame-time accounting, split at the two places the time can go: getting
-     * the frame into a texture, and getting that texture on screen. Present
-     * includes the vsync wait, so it is expected to dominate when healthy. */
-    uint64_t ns_upload = 0, ns_present = 0;
 
     uint32_t last_serial = 0;
     uint64_t presented = 0, dropped = 0;
@@ -329,83 +312,43 @@ int main(int argc, char **argv)
         int rc = sash_shm_acquire(&shm, opt.slot, last_serial, &f);
 
         if (rc == 0) {
-            if (!tex[0] || f.width != tex_w || f.height != tex_h) {
-                int failed = 0;
-                for (int t = 0; t < TEX_POOL; t++) {
-                    if (tex[t]) SDL_DestroyTexture(tex[t]);
-                    tex[t] = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                                               SDL_TEXTUREACCESS_STREAMING,
-                                               (int)f.width, (int)f.height);
-                    if (!tex[t]) {
-                        fprintf(stderr, "sash: SDL_CreateTexture: %s\n", SDL_GetError());
-                        failed = 1;
-                        break;
-                    }
-                    SDL_SetTextureScaleMode(tex[t], SDL_SCALEMODE_LINEAR);
-                }
-                if (failed) break;
+            if (f.width != tex_w || f.height != tex_h) {
                 tex_w = f.width;
                 tex_h = f.height;
-                tex_at = 0;
                 SDL_SetWindowSize(win, (int)f.width, (int)f.height);
             }
-            SDL_Texture *upload = tex[tex_at];
-            tex_at = (tex_at + 1) % TEX_POOL;
 
-            /* Count gaps in the serial: the guest published frames we never
-             * showed, which is the number that says whether the host is
-             * keeping up. */
+            /* Count gaps in the serial: frames the guest published that we
+             * never showed, which is what says whether the host keeps up. */
             if (last_serial && f.serial > last_serial + 1)
                 dropped += f.serial - last_serial - 1;
             last_serial = f.serial;
 
-            uint64_t t_up = SDL_GetTicksNS();
-            void *dst = NULL;
-            int   dst_pitch = 0;
-            if (SDL_LockTexture(upload, NULL, &dst, &dst_pitch)) {
-                if ((uint32_t)dst_pitch == f.stride) {
-                    memcpy(dst, f.pixels, (size_t)f.stride * f.height);
-                } else {
-                    size_t row = (size_t)f.width * 4;
-                    for (uint32_t y = 0; y < f.height; y++)
-                        memcpy((uint8_t *)dst + (size_t)y * dst_pitch,
-                               f.pixels + (size_t)y * f.stride, row);
-                }
-                SDL_UnlockTexture(upload);
-            }
-            ns_upload += SDL_GetTicksNS() - t_up;
+            presenter_upload(pres, &f);
             presented++;
         } else if (rc == -1 && sash_slot_state(&shm, opt.slot) == SASH_SLOT_CLOSED) {
             running = 0;
         }
 
-        uint64_t t_pr = SDL_GetTicksNS();
-        SDL_RenderClear(ren);
-        /* Draw the most recently uploaded texture, which is the one before the
-         * cursor now points at. */
-        SDL_Texture *show = tex[(tex_at + TEX_POOL - 1) % TEX_POOL];
-        if (show) SDL_RenderTexture(ren, show, NULL, NULL);
-        SDL_RenderPresent(ren);
-        ns_present += SDL_GetTicksNS() - t_pr;
+        presenter_present(pres);
 
         if (opt.stats) {
             uint64_t now = SDL_GetTicks();
             if (now - stats_at >= 1000) {
+                uint64_t ns_upload = 0, ns_present = 0;
+                presenter_take_timings(pres, &ns_upload, &ns_present);
                 printf("%" PRIu64 " fps presented, %" PRIu64 " dropped | "
                        "upload %.1f ms/frame, present %.1f ms/frame\n",
                        presented, dropped,
                        presented ? ns_upload  / 1e6 / presented : 0.0,
                        presented ? ns_present / 1e6 / presented : 0.0);
                 presented = dropped = 0;
-                ns_upload = ns_present = 0;
                 stats_at = now;
             }
         }
     }
 
-    for (int t = 0; t < TEX_POOL; t++)
-        if (tex[t]) SDL_DestroyTexture(tex[t]);
-    SDL_DestroyRenderer(ren);
+    presenter_destroy(pres);
     SDL_DestroyWindow(win);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);

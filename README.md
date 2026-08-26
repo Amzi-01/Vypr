@@ -93,6 +93,8 @@ requires dropping `SDL_Renderer` for direct EGL or Vulkan.
 | `include/sash_proto.h` — control protocol v1 | defined, not yet spoken |
 | `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
 | `host/src/main.c` — present a slot as a native window | working |
+| `host/src/present_gpu.c` — SDL_GPU upload path | working, 4x faster at 4K |
+| `host/src/present_render.c` — SDL_Renderer path | kept for comparison |
 | `tools/sash-testsrc.c` — reference producer | working |
 | Guest agent — publish path (`guest/src/publisher.cpp`) | **verified on Linux**, 1080p60, 0 drops |
 | Guest agent — WGC capture, IVSHMEM mapping, input | written, unbuilt (no toolchain in guest yet) |
