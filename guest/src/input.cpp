@@ -146,9 +146,29 @@ void inject_pointer(const sash_msg_pointer& msg) {
          * this is a no-op there. It matters precisely when the app does not,
          * which is the case that was broken.
          */
+        /*
+         * Only when the app is NOT managing the cursor itself.
+         *
+         * An app that confines the cursor - ClipCursor to something smaller
+         * than the virtual desktop - is doing warp-based mouselook: it re-
+         * centres every frame and reads the delta from centre. Warping as well
+         * injects a jump it cannot distinguish from real movement, and the view
+         * snaps to a corner. That is a worse failure than the edge-jamming this
+         * was meant to fix, and it only ever applies to apps that leave the
+         * cursor alone.
+         */
+        RECT clip{};
+        bool app_owns_cursor = false;
+        if (GetClipCursor(&clip)) {
+            const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            app_owns_cursor = (clip.right - clip.left) < vw ||
+                              (clip.bottom - clip.top) < vh;
+        }
+
         RECT cap = sash_capture_rect(hwnd);
         POINT cur{};
-        if (GetCursorPos(&cur)) {
+        if (!app_owns_cursor && GetCursorPos(&cur)) {
             const LONG margin_x = (cap.right - cap.left) / 8;
             const LONG margin_y = (cap.bottom - cap.top) / 8;
             if (cur.x < cap.left + margin_x || cur.x > cap.right - margin_x ||
