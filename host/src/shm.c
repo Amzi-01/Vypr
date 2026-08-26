@@ -104,11 +104,34 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     uint64_t frame_bytes = align_up(stride * max_h, SASH_DATA_ALIGN);
     uint64_t need        = frame_bytes * SASH_RING_FRAMES;
 
-    if (s->alloc_cursor + need > s->bytes) {
+    /* Reuse a range a closed window gave back before taking new ground.
+     * Without this the region is consumed at roughly 114 MiB per 4K window and
+     * a long session simply runs out - four windows opened and closed is enough
+     * to exhaust 512 MiB, after which nothing can be streamed at all. */
+    uint64_t offset = 0;
+    int reused = -1;
+    for (int f = 0; f < s->freed_count; f++) {
+        if (s->freed[f].bytes >= need) { reused = f; break; }
+    }
+
+    if (reused >= 0) {
+        offset = s->freed[reused].offset;
+        if (s->freed[reused].bytes > need) {
+            /* Keep the remainder rather than losing it. */
+            s->freed[reused].offset += need;
+            s->freed[reused].bytes  -= need;
+        } else {
+            s->freed[reused] = s->freed[--s->freed_count];
+        }
+    } else if (s->alloc_cursor + need <= s->bytes) {
+        offset = s->alloc_cursor;
+        s->alloc_cursor += need;
+    } else {
         fprintf(stderr,
-                "sash: need %.1f MiB for %ux%u but only %.1f MiB of region left\n",
+                "sash: need %.1f MiB for %ux%u but only %.1f MiB unused and no "
+                "freed range big enough (%d free)\n",
                 need / 1048576.0, max_w, max_h,
-                (s->bytes - s->alloc_cursor) / 1048576.0);
+                (s->bytes - s->alloc_cursor) / 1048576.0, s->freed_count);
         return -1;
     }
 
@@ -119,14 +142,12 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     slot->epoch        = epoch;
     slot->format       = SASH_FMT_BGRA8;
     slot->window_id    = window_id;
-    slot->ring_offset  = s->alloc_cursor;
+    slot->ring_offset  = offset;
     slot->frame_bytes  = frame_bytes;
     slot->max_width    = max_w;
     slot->max_height   = max_h;
     slot->frame_stride = (uint32_t)stride;
     RELEASE(&slot->state, (uint32_t)SASH_SLOT_ARMED);
-
-    s->alloc_cursor += need;
 
     memset(out, 0, sizeof(*out));
     out->window_id    = window_id;
@@ -144,11 +165,44 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
 void sash_shm_free(struct sash_shm *s, uint32_t slot)
 {
     if (slot >= SASH_MAX_SLOTS) return;
-    /* The bump cursor is deliberately not rewound. Reusing a freed range while
-     * a guest thread might still be mid-write into it is the one way to get
-     * pixels from one window appearing in another. Fragmentation is the
-     * cheaper problem; a session re-format reclaims everything. */
-    RELEASE(&s->hdr->slots[slot].state, (uint32_t)SASH_SLOT_FREE);
+    struct sash_slot *sl = &s->hdr->slots[slot];
+
+    /*
+     * Bump the epoch before anything else.
+     *
+     * This is what makes returning the memory safe. A publisher in the guest
+     * binds to the epoch it saw and stops the moment it no longer matches, so
+     * once this store lands nothing can still be writing into that range - and
+     * the range can be handed to another window without one window's pixels
+     * turning up in another's ring.
+     */
+    RELEASE(&sl->epoch, sl->epoch + 1);
+    RELEASE(&sl->state, (uint32_t)SASH_SLOT_FREE);
+
+    const uint64_t bytes = sl->frame_bytes * SASH_RING_FRAMES;
+    if (bytes == 0) return;
+
+    /* Give the range back. Adjacent ranges are merged where they meet, so a
+     * window closed and reopened at the same size does not slowly shred the
+     * region into pieces too small to use. */
+    const uint64_t offset = sl->ring_offset;
+    for (int f = 0; f < s->freed_count; f++) {
+        if (s->freed[f].offset + s->freed[f].bytes == offset) {
+            s->freed[f].bytes += bytes;
+            return;
+        }
+        if (offset + bytes == s->freed[f].offset) {
+            s->freed[f].offset = offset;
+            s->freed[f].bytes += bytes;
+            return;
+        }
+    }
+
+    if (s->freed_count < SASH_MAX_FREE_RANGES) {
+        s->freed[s->freed_count].offset = offset;
+        s->freed[s->freed_count].bytes  = bytes;
+        s->freed_count++;
+    }
 }
 
 uint32_t sash_slot_state(struct sash_shm *s, uint32_t slot)

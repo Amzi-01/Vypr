@@ -6,12 +6,23 @@
 #include "sash_shm.h"
 #include "sash_proto.h"
 
+/* A range returned to the pool when a window went away. */
+struct sash_free_range {
+    uint64_t offset;
+    uint64_t bytes;
+};
+
+#define SASH_MAX_FREE_RANGES 64
+
 struct sash_shm {
     int       fd;
     void     *base;
     size_t    bytes;
     struct sash_shm_header *hdr;
     uint64_t  alloc_cursor;   /* bump allocator position, host-private */
+
+    struct sash_free_range freed[SASH_MAX_FREE_RANGES];
+    int                    freed_count;
 };
 
 /* A borrowed view of the newest frame. Valid until the next acquire on the same
