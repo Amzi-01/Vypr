@@ -61,6 +61,7 @@ private:
     bool          lock_state_ = false;
     std::uint64_t lock_window_ = 0;
     int           lock_agree_ = 0;      // consecutive polls agreeing on a change
+    int           reoffer_ticks_ = 0;
     void poll_pointer_lock();
 };
 
@@ -306,6 +307,26 @@ void Agent::watch_windows() {
         }
 
         poll_pointer_lock();
+
+        /*
+         * Re-offer windows nobody is streaming.
+         *
+         * Announcing only on first sight means a window is offered exactly
+         * once. If the host end goes away afterwards - its window closed, the
+         * client crashed - the guest window is still sitting there and will
+         * never be mentioned again, so it can never come back without
+         * restarting everything.
+         *
+         * Sent as CHANGED rather than ADDED: the host treats them the same for
+         * attaching, and only logs ADDED, so this does not fill the log.
+         */
+        if (++reoffer_ticks_ >= 20) {          // ~5s
+            reoffer_ticks_ = 0;
+            std::lock_guard<std::mutex> guard(lock_);
+            for (auto& [id, info] : known_)
+                if (streams_.find(id) == streams_.end())
+                    control_.send_window(SASH_MSG_WINDOW_CHANGED, info.desc, info.title);
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }

@@ -266,7 +266,12 @@ Inherited from the earlier prototype's notes, none of them solved yet:
   protocol for this, and nothing uses it yet.
 - **Z-order and focus.** The host WM owns stacking; the guest has its own idea.
   Unreconciled, the two fight.
-- **Reconnect.** A dropped stream must re-attach to the same `HWND` rather than
-  opening a second window for it.
+- ~~**Reconnect.**~~ Partly done. The guest re-offers any window nothing is
+  streaming every five seconds, so a host window that closes or a client that
+  dies comes back by itself - verified by killing the client and watching it
+  return in ~6s. Announcing only on first sight meant a window was offered
+  exactly once, and a guest window that outlived its host end could never
+  return without restarting the session. Re-attaching *the same* stream after a
+  dropped agent connection is still not handled.
 - **Cursor.** Whether to composite the guest cursor into the frame or hand the
   host a cursor shape. The protocol assumes the latter.
