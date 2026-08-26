@@ -90,6 +90,18 @@ struct daemon {
     int         match_count;
     int         match_all;
     const char *launch;
+
+    /*
+     * Windows the user closed.
+     *
+     * The guest re-offers any window nothing is streaming, so an app that
+     * ignores WM_CLOSE - which games routinely do - would have its window
+     * reappear a few seconds after being closed. Remembering the dismissal
+     * keeps it shut until the guest window genuinely goes away.
+     */
+    uint64_t    dismissed[MAX_WINDOWS];
+    int         dismissed_count;
+
     int         clock_logged;
     uint64_t    last_ping_ns;
 
@@ -134,6 +146,23 @@ static struct window *window_alloc(struct daemon *d, uint64_t id)
         }
     }
     return NULL;
+}
+
+static int is_dismissed(const struct daemon *d, uint64_t id)
+{
+    for (int i = 0; i < d->dismissed_count; i++)
+        if (d->dismissed[i] == id) return 1;
+    return 0;
+}
+
+static void forget_dismissed(struct daemon *d, uint64_t id)
+{
+    for (int i = 0; i < d->dismissed_count; i++) {
+        if (d->dismissed[i] == id) {
+            d->dismissed[i] = d->dismissed[--d->dismissed_count];
+            return;
+        }
+    }
 }
 
 static int title_matches(struct daemon *d, const char *title)
@@ -309,6 +338,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             wanted = owner && owner->has_slot && owner->client_fd >= 0;
         }
         if (!wanted) break;
+        if (is_dismissed(d, desc->window_id)) break;
 
         struct window *w = window_find(d, desc->window_id);
 
@@ -357,6 +387,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
     case SASH_MSG_WINDOW_REMOVED: {
         if (bytes < sizeof(struct sash_msg_window_id)) break;
         const struct sash_msg_window_id *m = (const void *)payload;
+        forget_dismissed(d, m->window_id);
         struct window *w = window_find(d, m->window_id);
         if (w) {
             if (w->is_popup) {
@@ -511,6 +542,13 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         w->client_fd = fd;
         *owner = w;
         return;
+    }
+
+    if (type == SASH_MSG_CLOSE && bytes >= sizeof(struct sash_msg_window_id)) {
+        const struct sash_msg_window_id *m = (const void *)payload;
+        if (!is_dismissed(d, m->window_id) && d->dismissed_count < MAX_WINDOWS)
+            d->dismissed[d->dismissed_count++] = m->window_id;
+        fprintf(stderr, "sashd: closing guest window on request\n");
     }
 
     /* Everything else is input, and goes straight through. sashd does not

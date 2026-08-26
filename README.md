@@ -195,6 +195,21 @@ An app that goes fullscreen in the guest is now drawing a window that covers the
 guest's whole desktop, so the host window goes fullscreen with it. Showing that
 inside a small window is not what the user asked the app to do.
 
+### Closing
+
+Closing the host window closes the app in the guest. The compositor sends a
+close request for the window itself - from its close button, the taskbar's
+context menu, or a shortcut - and that arrives as
+`SDL_EVENT_WINDOW_CLOSE_REQUESTED`, not `SDL_EVENT_QUIT`. Handling only the
+latter meant Close on the taskbar shut the host window while the app carried on
+running in the VM, invisible.
+
+The daemon also remembers which windows were closed. The guest re-offers any
+window nothing is streaming, so an app that ignores `WM_CLOSE` - which games
+routinely do - would otherwise have its window reappear a few seconds after
+being closed. The dismissal is forgotten once the guest window genuinely goes
+away, so the same app can be started again.
+
 ### Minimise
 
 The guest's minimise button is part of the captured image, so clicking it

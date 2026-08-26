@@ -510,13 +510,29 @@ int main(int argc, char **argv)
             if (!v) v = &views[0];
 
             switch (ev.type) {
-            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            case SDL_EVENT_QUIT: {
+                /*
+                 * Closing the window here closes the app in the guest.
+                 *
+                 * The compositor sends a close request for the window itself -
+                 * from its close button, the taskbar's context menu, or a
+                 * keyboard shortcut - and it arrives as CLOSE_REQUESTED rather
+                 * than QUIT. Handling only QUIT meant the taskbar's Close shut
+                 * the host window while the app carried on running in the VM,
+                 * invisible.
+                 *
+                 * A popup closes on its own; only a top-level ends the session.
+                 */
+                const uint64_t id = (ev.type == SDL_EVENT_QUIT)
+                                  ? opt.window_id : v->window_id;
                 if (daemon_fd >= 0) {
-                    struct sash_msg_window_id msg = { .window_id = opt.window_id };
+                    struct sash_msg_window_id msg = { .window_id = id };
                     msg_send(daemon_fd, SASH_MSG_CLOSE, &msg, sizeof(msg));
                 }
-                running = 0;
+                if (ev.type == SDL_EVENT_QUIT || !v->is_popup) running = 0;
                 break;
+            }
             case SDL_EVENT_MOUSE_MOTION:
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
             case SDL_EVENT_MOUSE_BUTTON_UP:
