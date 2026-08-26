@@ -99,6 +99,26 @@ slot 0 state   : LIVE      frame size : 2860x1536  stride 12544
 serial         : 1947 -> 2067   (60.0 fps)
 ```
 
+## Latency
+
+The guest stamps each frame with QueryPerformanceCounter, which means nothing
+in host time on its own. The daemon aligns the two clocks over the control
+channel - ping, guest counter, pong - and assumes the guest read its counter
+halfway through the round trip. Measured round trip across the virtual bridge
+is **0.30 ms**, so that assumption is wrong by at most ~0.15 ms, far below a
+frame. The offset lands in the shared region because the process presenting
+frames is not the one that owns the control channel.
+
+`--stats` then reports frame age: guest capture to host acquire, in host time.
+
+```
+60 fps presented, 0 dropped | upload 0.3 ms, present 16.3 ms | age avg 6.2 ms worst 14.3 ms
+```
+
+That 6 ms is the whole transport - capture, PCIe, and the ring. It excludes the
+guest's own render-to-capture delay and the host's scanout, so glass to glass is
+that plus up to one refresh interval.
+
 ## Status
 
 | Component | State |

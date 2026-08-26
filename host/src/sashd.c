@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,9 +69,18 @@ struct daemon {
     int         match_count;
     int         match_all;
     const char *launch;
+    int         clock_logged;
+    uint64_t    last_ping_ns;
 
     char self_dir[512];
 };
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -217,6 +227,11 @@ static void on_agent_message(struct daemon *d, uint16_t type,
                     h->version, SASH_PROTO_VERSION);
         if (d->launch)
             msg_send(d->agent_fd, SASH_MSG_LAUNCH, d->launch, (uint32_t)strlen(d->launch));
+
+        /* Line the clocks up straight away, so the first frames can already be
+         * given an age. */
+        struct sash_msg_ping ping = { .token = now_ns() };
+        msg_send(d->agent_fd, SASH_MSG_PING, &ping, sizeof(ping));
         break;
     }
 
@@ -320,6 +335,31 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         }
 
         spawn_client(d, w);
+        break;
+    }
+
+    case SASH_MSG_PONG: {
+        if (bytes < sizeof(struct sash_msg_pong)) break;
+        const struct sash_msg_pong *p = (const void *)payload;
+        if (p->guest_qpc_freq == 0) break;
+
+        const uint64_t t3 = now_ns();
+        const uint64_t t1 = p->token;
+        if (t3 < t1) break;
+
+        /* Assume the guest read its counter halfway through the round trip. */
+        const uint64_t host_mid = t1 + (t3 - t1) / 2;
+        const uint64_t guest_ns = (uint64_t)((__int128)p->guest_qpc * 1000000000
+                                             / p->guest_qpc_freq);
+
+        d->shm.hdr->guest_offset_ns = (int64_t)host_mid - (int64_t)guest_ns;
+        __atomic_store_n(&d->shm.hdr->offset_valid, 1u, __ATOMIC_RELEASE);
+
+        if (!d->clock_logged) {
+            fprintf(stderr, "sashd: clock aligned, round trip %.2f ms\n",
+                    (t3 - t1) / 1e6);
+            d->clock_logged = 1;
+        }
         break;
     }
 
@@ -504,6 +544,17 @@ int main(int argc, char **argv)
             if (errno == EINTR) continue;
             perror("poll");
             break;
+        }
+
+        /* Re-align periodically: the two clocks drift, and a stale offset shows
+         * up as latency slowly wandering away from the truth. */
+        if (d.agent_fd >= 0) {
+            const uint64_t t = now_ns();
+            if (t - d.last_ping_ns > 5000000000ull) {
+                d.last_ping_ns = t;
+                struct sash_msg_ping ping = { .token = t };
+                msg_send(d.agent_fd, SASH_MSG_PING, &ping, sizeof(ping));
+            }
         }
 
         /* Reap window clients the user closed. */

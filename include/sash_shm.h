@@ -112,6 +112,19 @@ struct sash_shm_header {
     volatile uint32_t generation;
     uint32_t _pad2;
 
+    /*
+     * Nanoseconds to add to a guest QPC reading, converted to ns, to express it
+     * in the host's monotonic clock. Written by the daemon once the control
+     * channel has measured it; `offset_valid` stays zero until then.
+     *
+     * It lives here rather than in the control protocol because the process
+     * that needs it - the one presenting frames - is not the one that owns the
+     * control channel.
+     */
+    int64_t  guest_offset_ns;
+    uint32_t offset_valid;
+    uint32_t _pad3;
+
     struct sash_slot slots[SASH_MAX_SLOTS];
 };
 

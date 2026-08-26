@@ -153,6 +153,20 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     case SASH_MSG_RESIZE:
         if (auto* m = as<sash_msg_resize>(payload, bytes)) sash::resize_window(*m);
         break;
+    case SASH_MSG_PING: {
+        if (auto* m = as<sash_msg_ping>(payload, bytes)) {
+            LARGE_INTEGER qpc{}, freq{};
+            QueryPerformanceCounter(&qpc);
+            QueryPerformanceFrequency(&freq);
+            sash_msg_pong pong{};
+            pong.token          = m->token;
+            pong.guest_qpc      = static_cast<std::uint64_t>(qpc.QuadPart);
+            pong.guest_qpc_freq = static_cast<std::uint64_t>(freq.QuadPart);
+            control_.send(SASH_MSG_PONG, &pong, sizeof(pong));
+        }
+        break;
+    }
+
     case SASH_MSG_LAUNCH: {
         std::wstring cmd;
         {

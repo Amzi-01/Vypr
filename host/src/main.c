@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 
 #include <errno.h>
+#include <time.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -301,6 +302,9 @@ int main(int argc, char **argv)
 
     struct msg_reader daemon_rx = {0};
     uint64_t presented = 0, dropped = 0;
+    /* Frame age: guest capture to host acquire, in host time. Needs the clock
+     * offset the daemon negotiates, so it stays zero until that lands. */
+    uint64_t age_total_ns = 0, age_samples = 0, age_worst_ns = 0;
     uint64_t stats_at = SDL_GetTicks();
 
     int running = 1;
@@ -445,6 +449,24 @@ int main(int argc, char **argv)
                     dropped += f.serial - v->last_serial - 1;
                 v->last_serial = f.serial;
 
+                if (i == 0 && f.capture_qpc_freq &&
+                    __atomic_load_n(&shm.hdr->offset_valid, __ATOMIC_ACQUIRE)) {
+                    const uint64_t guest_ns =
+                        (uint64_t)((__int128)f.capture_qpc * 1000000000 /
+                                   f.capture_qpc_freq);
+                    const int64_t captured_host_ns =
+                        (int64_t)guest_ns + shm.hdr->guest_offset_ns;
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    const int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+                    const int64_t age = now - captured_host_ns;
+                    if (age >= 0 && age < 1000000000) {
+                        age_total_ns += (uint64_t)age;
+                        if ((uint64_t)age > age_worst_ns) age_worst_ns = (uint64_t)age;
+                        age_samples++;
+                    }
+                }
+
                 presenter_upload(v->pres, &f);
                 if (i == 0) presented++;
             } else if (rc == -1 && !v->is_popup &&
@@ -461,11 +483,15 @@ int main(int argc, char **argv)
                 uint64_t ns_upload = 0, ns_present = 0;
                 presenter_take_timings(views[0].pres, &ns_upload, &ns_present);
                 printf("%" PRIu64 " fps presented, %" PRIu64 " dropped | "
-                       "upload %.1f ms/frame, present %.1f ms/frame\n",
+                       "upload %.1f ms, present %.1f ms | age avg %.1f ms "
+                       "worst %.1f ms\n",
                        presented, dropped,
                        presented ? ns_upload  / 1e6 / presented : 0.0,
-                       presented ? ns_present / 1e6 / presented : 0.0);
+                       presented ? ns_present / 1e6 / presented : 0.0,
+                       age_samples ? age_total_ns / 1e6 / age_samples : 0.0,
+                       age_worst_ns / 1e6);
                 presented = dropped = 0;
+                age_total_ns = age_samples = age_worst_ns = 0;
                 stats_at = now;
             }
         }

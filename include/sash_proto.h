@@ -32,6 +32,7 @@ enum sash_msg_type {
     SASH_MSG_ATTACH_RESULT    = 5,   /* sash_msg_attach_result */
     SASH_MSG_CURSOR           = 6,   /* sash_msg_cursor */
     SASH_MSG_LOG              = 7,   /* utf8 text */
+    SASH_MSG_PONG             = 8,   /* sash_msg_pong */
 
     /* host -> guest */
     SASH_MSG_ATTACH           = 64,  /* sash_msg_attach */
@@ -43,6 +44,7 @@ enum sash_msg_type {
     SASH_MSG_RESIZE           = 70,  /* sash_msg_resize */
     SASH_MSG_FOCUS            = 71,  /* sash_msg_window_id */
     SASH_MSG_CLOSE            = 72,  /* sash_msg_window_id */
+    SASH_MSG_PING             = 73,  /* sash_msg_ping */
 
     /* 128 and up are host-internal: they travel between sashd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
@@ -171,6 +173,26 @@ struct sash_msg_key {
 struct sash_msg_resize {
     uint64_t window_id;
     uint32_t width, height;
+};
+
+/*
+ * Clock alignment, so a frame's guest capture timestamp can be compared against
+ * host time and turned into a latency figure.
+ *
+ * The guest stamps frames with QueryPerformanceCounter, which has no defined
+ * relationship to the host's clock. This is the usual round-trip estimate: the
+ * host notes when it sent the ping and when the pong came back, and assumes the
+ * guest's reading was taken halfway between. Across a virtual bridge the round
+ * trip is tens of microseconds, so the error is far below a frame.
+ */
+struct sash_msg_ping {
+    uint64_t token;              /* host monotonic ns, echoed back */
+};
+
+struct sash_msg_pong {
+    uint64_t token;
+    uint64_t guest_qpc;
+    uint64_t guest_qpc_freq;
 };
 
 struct sash_msg_cursor {
