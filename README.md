@@ -219,6 +219,25 @@ game - it is not fixable at the level sash currently operates, and every
 plausible-looking fix above it (relative mode, acceleration, re-centring) is
 treating a symptom.
 
+### Input costs frames if you let it
+
+A high-polling-rate mouse reports about a thousand times a second. Sent one
+message per report, that was a thousand messages a second across the link and a
+thousand `SendInput` calls in the guest - each one also looking up the window
+geometry through `DwmGetWindowAttribute`, a cross-process call - on the same CPU
+that is capturing frames and running the game. The stream turned choppy the
+moment the window took focus and went smooth again as soon as it lost it, which
+is the tell.
+
+Motion is now gathered up and sent once a frame. Nothing is lost: relative
+deltas sum exactly, and for absolute positioning only the latest report was ever
+going to matter. Buttons and wheel notches still go immediately, since a click
+that waits for the next frame is a click that feels late. The captured rectangle
+is cached for a tenth of a second rather than fetched per event.
+
+Measured 22-29 fps published before, 60 after - the guest display's refresh rate
+and therefore the ceiling.
+
 ## Mouse capture
 
 A game that takes the pointer needs relative motion, not positions. It warps the

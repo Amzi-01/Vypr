@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace sash {
@@ -24,7 +25,7 @@ HWND to_hwnd(std::uint64_t id) {
 // frame - the same rectangle the host is displaying. Treating them as client
 // coordinates would shift every click down by the title and menu bar.
 bool to_absolute(HWND hwnd, int cx, int cy, LONG* out_x, LONG* out_y) {
-    const RECT cap = sash_capture_rect(hwnd);
+    const RECT cap = cached_capture_rect(hwnd);
     POINT pt{ cap.left + cx, cap.top + cy };
 
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -62,6 +63,34 @@ void ensure_foreground(HWND hwnd) {
 
 int  g_saved_accel[3] = { 0, 0, 0 };
 bool g_accel_saved = false;
+
+/*
+ * The captured rectangle, cached.
+ *
+ * DwmGetWindowAttribute is a cross-process call, and looking it up on every
+ * pointer event means a thousand of them a second from a high-polling mouse -
+ * on the same CPU that is capturing frames and running the game. A window's
+ * geometry does not change between two mouse reports; a tenth of a second is
+ * far finer than any window move a person can make.
+ */
+RECT          g_cap_cache{};
+HWND          g_cap_hwnd = nullptr;
+ULONGLONG     g_cap_at = 0;
+
+RECT cached_capture_rect(HWND hwnd) {
+    const ULONGLONG now = GetTickCount64();
+    if (hwnd != g_cap_hwnd || now - g_cap_at > 100) {
+        g_cap_cache = sash_capture_rect(hwnd);
+        g_cap_hwnd  = hwnd;
+        g_cap_at    = now;
+    }
+    return g_cap_cache;
+}
+
+bool trace_input() {
+    static const bool on = std::getenv("SASH_TRACE") != nullptr;
+    return on;
+}
 
 }  // namespace
 
@@ -102,10 +131,10 @@ void inject_pointer(const sash_msg_pointer& msg) {
      */
     if (msg.buttons & ~g_buttons) ensure_foreground(hwnd);
 
-    // Periodic summary of what is actually being injected: mode, typical
-    // magnitude, and where the guest cursor ended up. Enough to tell "the host
-    // is sending nonsense" apart from "the game is ignoring good input".
-    {
+    // Periodic summary of what is being injected. Off unless SASH_TRACE is
+    // set: it costs GetCursorPos and GetClipCursor on every single event, which
+    // is thousands of calls a second while the mouse is moving.
+    if (trace_input()) {
         static unsigned n = 0;
         static double sum_x = 0, sum_y = 0;
         static unsigned rel = 0, abs_ = 0;

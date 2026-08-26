@@ -209,6 +209,47 @@ static void set_capture(SDL_Window *win, bool want, bool announce)
     }
 }
 
+/*
+ * Pointer motion, gathered up and sent once a frame.
+ *
+ * A high-polling-rate mouse reports around a thousand times a second. Sending
+ * each one meant a thousand messages a second across the link and a thousand
+ * SendInput calls in the guest, on the same CPU that is capturing frames and
+ * running the game - which is why the stream turned choppy the moment the
+ * window took focus and went smooth again as soon as it lost it.
+ *
+ * Nothing is lost by combining them: relative deltas sum exactly, and for
+ * absolute positioning only the latest one was ever going to matter. Buttons
+ * and the wheel are sent the moment they happen, since a click that waits for
+ * the next frame is a click that feels late.
+ */
+struct pointer_accum {
+    bool     pending;
+    int32_t  x, y;
+    uint32_t buttons;
+    int32_t  wheel, hwheel;
+    uint32_t flags;
+};
+
+static void pointer_flush(int fd, uint64_t window_id, struct pointer_accum *a)
+{
+    if (!a->pending || fd < 0) return;
+
+    struct sash_msg_pointer msg = {0};
+    msg.window_id = window_id;
+    msg.x       = a->x;
+    msg.y       = a->y;
+    msg.buttons = a->buttons;
+    msg.wheel   = a->wheel;
+    msg.hwheel  = a->hwheel;
+    msg.flags   = a->flags;
+    msg_send(fd, SASH_MSG_POINTER, &msg, sizeof(msg));
+
+    a->pending = false;
+    a->wheel = a->hwheel = 0;
+    if (a->flags & SASH_PTR_RELATIVE) { a->x = 0; a->y = 0; }
+}
+
 static bool capture_forced_initial(const struct options *o) { return o->capture != 0; }
 
 static struct view *view_for_sdl_id(struct view *views, int count, SDL_WindowID id)
@@ -378,6 +419,8 @@ int main(int argc, char **argv)
     int   press_win_x = 0, press_win_y = 0;
     int32_t press_guest_x = 0, press_guest_y = 0;
 
+    struct pointer_accum pointer = {0};
+
     uint64_t presented = 0, dropped = 0;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
@@ -526,7 +569,23 @@ int main(int argc, char **argv)
                     msg.hwheel = (int32_t)(ev.wheel.x * 120.0f);
                 }
 
-                msg_send(daemon_fd, SASH_MSG_POINTER, &msg, sizeof(msg));
+                if (msg.flags & SASH_PTR_RELATIVE) {
+                    pointer.x += msg.x;          /* deltas sum exactly */
+                    pointer.y += msg.y;
+                } else {
+                    pointer.x = msg.x;           /* only the latest matters */
+                    pointer.y = msg.y;
+                }
+                pointer.buttons = msg.buttons;
+                pointer.wheel  += msg.wheel;
+                pointer.hwheel += msg.hwheel;
+                pointer.flags   = msg.flags;
+                pointer.pending = true;
+
+                /* A click or a wheel notch goes now; motion can wait for the
+                 * frame. */
+                if (ev.type != SDL_EVENT_MOUSE_MOTION)
+                    pointer_flush(daemon_fd, v->window_id, &pointer);
                 break;
             }
 
@@ -623,6 +682,8 @@ int main(int argc, char **argv)
                 break;
             }
         }
+
+        pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
         /* Popups arrive and vanish while we run, so the daemon link is read
          * every frame rather than only at startup. */
