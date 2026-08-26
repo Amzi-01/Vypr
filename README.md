@@ -151,6 +151,11 @@ session daemon, the guest agent - and then starts the game, skipping any step
 that is already done. `launcher/sash-fivem.desktop` puts it on the desktop with
 the game's own icon, extracted at 256x256 from the guest's executable.
 
+It matches every window the game puts up - the FiveM splash, the Rockstar
+launcher, the sign-in dialog - not only the main game window, so the whole
+startup sequence is visible rather than a blank wait followed by a game. Each
+appears and closes in turn as its own host window.
+
 It waits for the guest to *answer*, not merely for the domain to report
 'running': a booting Windows cannot do anything useful yet. It also refuses
 early with a clear message if nobody is logged in, since without a desktop

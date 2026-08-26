@@ -12,7 +12,11 @@ GUEST=192.168.122.58
 KEY="$HOME/.ssh/sash-guest"
 SASH="$HOME/sash/host/build"
 SHM=/dev/shm/sash
-MATCH="Cfx.re"
+# Every window the game puts up, not only the main one: the launcher and its
+# splash appear first and are worth seeing. This was narrowed to the game window
+# alone while the launcher and game were stealing focus from each other; that
+# was fixed by only letting clicks change focus, so both can stream again.
+MATCHES=(FiveM Cfx Rockstar "Social Club")
 export LIBVIRT_DEFAULT_URI=qemu:///system
 
 say() {
@@ -63,7 +67,9 @@ fi
 if ! pgrep -x sashd >/dev/null; then
     say "Starting the sash session..."
     [ -x "$SASH/sashd" ] || die "$SASH/sashd is missing - build it first"
-    nohup "$SASH/sashd" --shm "$SHM" --match "$MATCH" \
+    match_args=()
+    for m in "${MATCHES[@]}"; do match_args+=(--match "$m"); done
+    nohup "$SASH/sashd" --shm "$SHM" "${match_args[@]}" \
         >"${XDG_RUNTIME_DIR:-/tmp}/sashd.log" 2>&1 &
     sleep 2
 fi
