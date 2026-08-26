@@ -113,21 +113,3 @@ Replace `SendInput` with injection through a signed virtual relative HID
 device, as ViGEmBus and HidHide do - both use free Microsoft attestation
 signing. That removes the dependency on Parsec and the whole class of
 raw-input problems with it. See Apollo issue #1479.
-
-## 7. VB-Audio Virtual Cable, for the microphone
-
-```
-https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip
-```
-
-Windows applications can only choose a microphone that exists as a device, and
-this guest had no capture endpoint whatsoever. The cable supplies one: sash
-writes the host's microphone into `CABLE Input` and applications record from
-`CABLE Output`.
-
-Installed with `VBCABLE_Setup_x64.exe -i`, elevated. The driver installation
-raises a Windows Security prompt on the guest's own screen which has to be
-accepted there.
-
-Since it is the only recording device present, it is also the default, so
-applications find it without being pointed at it.

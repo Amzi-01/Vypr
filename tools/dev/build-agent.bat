@@ -7,8 +7,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /bigobj ^
    /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
    /I C:\sash\guest\src /I C:\sash\include ^
    /Fe:sash-agent.exe ^
-   ..\src\main.cpp ..\src\audio.cpp ..\src\micplay.cpp ..\src\capture.cpp ^
-   ..\src\control.cpp ^
+   ..\src\main.cpp ..\src\audio.cpp ..\src\capture.cpp ..\src\control.cpp ^
    ..\src\input.cpp ^
    ..\src\ivshmem.cpp ..\src\publisher.cpp ..\src\windows_list.cpp ^
    /link d3d11.lib dxgi.lib windowsapp.lib setupapi.lib ws2_32.lib dwmapi.lib user32.lib gdi32.lib ole32.lib

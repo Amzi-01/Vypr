@@ -25,7 +25,6 @@
 #include <vector>
 
 #include "audio.hpp"
-#include "micplay.hpp"
 #include "capture.hpp"
 #include "control.hpp"
 #include "input.hpp"
@@ -55,8 +54,6 @@ private:
     sash::Region       region_;
     sash::Control      control_;
     sash::AudioCapture audio_;
-    sash::MicPlayback  mic_;
-    bool               mic_started_ = false;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -283,23 +280,6 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
                               bytes - static_cast<std::uint32_t>(sizeof(*m)));
         }
         break;
-    case SASH_MSG_MIC: {
-        if (bytes < sizeof(sash_msg_audio)) break;
-        const auto* a = reinterpret_cast<const sash_msg_audio*>(payload);
-        const std::uint32_t want = a->frames * a->channels * sizeof(float);
-        if (!a->channels || !a->sample_rate || bytes < sizeof(*a) + want) break;
-
-        /* Opened on the first packet: if nobody ever speaks there is no reason
-         * to have taken the cable. */
-        if (!mic_started_) {
-            mic_started_ = true;
-            mic_.start();
-        }
-        mic_.submit(reinterpret_cast<const float*>(payload + sizeof(*a)),
-                    a->frames, a->sample_rate, a->channels);
-        break;
-    }
-
     case SASH_MSG_WINDOW_STATE:
         if (auto* m = as<sash_msg_window_state>(payload, bytes))
             sash::set_window_minimized(m->window_id, m->minimized != 0);
@@ -465,7 +445,6 @@ bool Agent::run(const char* host, std::uint16_t port) {
     });
 
     stop_ = true;
-    mic_.stop();
     audio_.stop();
     watcher.join();
     sash::restore_pointer_acceleration();

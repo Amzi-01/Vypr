@@ -31,7 +31,6 @@ struct options {
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
     uint32_t    chrome_top;  /* guest title-bar height, in guest pixels */
-    int         mic;         /* this window carries the microphone */
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
@@ -87,7 +86,6 @@ static int parse_args(int argc, char **argv, struct options *o)
     o->backend   = NULL;
     o->capture   = 0;
     o->chrome_top = 0;
-    o->mic        = 0;
     o->window_id = 0;
     o->slot      = 0;
     o->stats     = 0;
@@ -100,8 +98,6 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--present") && i + 1 < argc) o->backend = argv[++i];
         else if (!strcmp(argv[i], "--chrome-top") && i + 1 < argc)
             o->chrome_top = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--mic"))        o->mic = 1;
-        else if (!strcmp(argv[i], "--no-mic"))     o->mic = 0;
         else if (!strcmp(argv[i], "--capture"))    o->capture = 1;
         else if (!strcmp(argv[i], "--no-capture")) o->capture = 0;
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
@@ -479,29 +475,6 @@ int main(int argc, char **argv)
     uint16_t audio_channels = 0;
     uint64_t audio_logged_at = 0;
 
-    /*
-     * The microphone, captured here and sent to the guest.
-     *
-     * Requested at 48 kHz stereo float: SDL converts from whatever the device
-     * actually is, and matching the far end avoids a second conversion in the
-     * guest. Pulled once a frame alongside everything else - a separate thread
-     * would only add a hand-off and its own queue, and queues are what cost
-     * latency.
-     */
-    SDL_AudioStream *mic = NULL;
-    if (opt.mic) {
-        SDL_AudioSpec mspec = { .format = SDL_AUDIO_F32, .channels = 2, .freq = 48000 };
-        mic = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING,
-                                        &mspec, NULL, NULL);
-        if (mic) {
-            SDL_ResumeAudioStreamDevice(mic);
-            printf("sash: microphone open, 48000 Hz stereo\n");
-            fflush(stdout);
-        } else {
-            fprintf(stderr, "sash: no microphone: %s\n", SDL_GetError());
-        }
-    }
-
     struct pointer_accum pointer = {0};
 
     /*
@@ -761,22 +734,6 @@ int main(int argc, char **argv)
         hit.src_h      = views[0].src_h;
         hit.captured   = pointer_locked || capture_forced;
 
-        /* Ship whatever the microphone has produced since the last frame. */
-        if (mic && daemon_fd >= 0) {
-            static uint8_t mic_buf[sizeof(struct sash_msg_audio) + 16384];
-            int got;
-            while ((got = SDL_GetAudioStreamData(mic,
-                        mic_buf + sizeof(struct sash_msg_audio),
-                        (int)(sizeof(mic_buf) - sizeof(struct sash_msg_audio)))) > 0) {
-                struct sash_msg_audio hdr = {0};
-                hdr.sample_rate = 48000;
-                hdr.channels    = 2;
-                hdr.frames      = (uint32_t)got / (2 * sizeof(float));
-                memcpy(mic_buf, &hdr, sizeof(hdr));
-                msg_send(daemon_fd, SASH_MSG_MIC, mic_buf, sizeof(hdr) + (uint32_t)got);
-            }
-        }
-
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
         /* Popups arrive and vanish while we run, so the daemon link is read
@@ -800,8 +757,7 @@ int main(int argc, char **argv)
                             head.bytes >= sizeof(*a) + want) {
                             if (!audio || audio_rate != a->sample_rate ||
                                 audio_channels != a->channels) {
-                                if (mic) SDL_DestroyAudioStream(mic);
-    if (audio) SDL_DestroyAudioStream(audio);
+                                if (audio) SDL_DestroyAudioStream(audio);
                                 SDL_AudioSpec spec = {
                                     .format   = SDL_AUDIO_F32,
                                     .channels = (int)a->channels,
@@ -976,7 +932,6 @@ int main(int argc, char **argv)
         if (views[i].pres) presenter_destroy(views[i].pres);
         if (views[i].win)  SDL_DestroyWindow(views[i].win);
     }
-    if (mic) SDL_DestroyAudioStream(mic);
     if (audio) SDL_DestroyAudioStream(audio);
     msg_reader_free(&daemon_rx);
     SDL_Quit();

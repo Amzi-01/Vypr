@@ -16,7 +16,6 @@ endif()
 add_executable(sash-agent
     src/main.cpp
     src/audio.cpp
-    src/micplay.cpp
     src/capture.cpp
     src/control.cpp
     src/input.cpp
