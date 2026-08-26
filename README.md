@@ -98,7 +98,9 @@ requires dropping `SDL_Renderer` for direct EGL or Vulkan.
 | Guest agent — WGC capture, IVSHMEM mapping, input | written, unbuilt (no toolchain in guest yet) |
 | IVSHMEM device on the VM | added — 512 MB, PCI 08:02, host stack verified against it |
 | IVSHMEM driver in the guest | installing |
-| Control channel — host end | not started |
+| `host/src/sashd.c` — session daemon | working, verified end to end |
+| `host/src/msg.c` — framing, shared by both host processes | done |
+| Input path — pointer, keys, focus, resize, close | working, verified |
 | Launcher / `.desktop` integration | not started |
 
 ## Building
@@ -111,9 +113,32 @@ cmake --build build
 
 Needs SDL3.
 
+## Running
+
+```bash
+./build/sashd --match Notepad --launch 'C:\\Windows\\System32\\notepad.exe'
+```
+
+`sashd` formats the region, waits for the agent, and spawns one `sash-host` per
+matching guest window. `--all` streams every window, which is the way to see what
+the guest is actually offering.
+
 ## Running without the VM
 
-The host side is developed and proven with the guest powered off:
+The whole system runs with the guest powered off, daemon included:
+
+```bash
+truncate -s 256M /dev/shm/sash-test
+./build/sashd --shm /dev/shm/sash-test --match "test window" --port 47899 &
+./build/sash-testagent --connect 127.0.0.1 --port 47899 --shm /dev/shm/sash-test
+```
+
+`sash-testagent` speaks the real control protocol and links the real
+`publisher.cpp`, so this covers slot allocation, attach, client spawning, the
+frame handoff and the input return path. Verified: window appears, streams at
+60fps, and pointer/focus/resize events arrive at the agent in guest coordinates.
+
+For the presenter alone, without the daemon:
 
 ```bash
 ./build/sash-testsrc --shm /dev/shm/sash-test --size 1920x1080 --fps 60 &

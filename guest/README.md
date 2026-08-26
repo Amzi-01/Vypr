@@ -52,7 +52,8 @@ and run against the real host client by `tools/sash-testagent.cpp`, at 1080p60
 with zero drops. What that leaves unproven is capture, the IVSHMEM mapping, and
 input - not the seqlock ordering or ring arithmetic.
 
-The IVSHMEM IOCTL numbers in `ivshmem.cpp` are the Looking Glass driver's ABI,
-transcribed rather than compiled against. If mapping fails with
-`ERROR_INVALID_FUNCTION`, check them against the `ivshmem.h` shipped with the
-installed driver before suspecting the device.
+The IVSHMEM IOCTL numbers in `ivshmem.cpp` were checked against the installed
+driver (2025-03-06) by reading its PDB and image rather than by compiling: the
+symbol order gives function codes 0x800-0x803 and the interface GUID is present
+in the `.sys`. Re-check if the driver is updated; a changed IOCTL number fails
+as `ERROR_INVALID_FUNCTION`.

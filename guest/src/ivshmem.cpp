@@ -18,9 +18,12 @@ namespace {
 // ABI of the Looking Glass IVSHMEM driver. These constants are the driver's
 // public contract, not ours.
 //
-// If mapping fails with ERROR_INVALID_FUNCTION, check these against the
-// `ivshmem.h` shipped with the installed driver version before assuming the
-// device is at fault - a changed IOCTL number fails exactly this way.
+// Verified against the installed driver (build dated 2025-03-06): its PDB names
+// ioctl_request_peerid, ioctl_request_size, ioctl_request_mmap and
+// ioctl_release_mmap in that order, giving function codes 0x800-0x803, and the
+// interface GUID below appears in the .sys image. The struct fields match the
+// PDB's peerID / size / vectors / cacheMode. Re-check if the driver is ever
+// updated - a changed IOCTL number fails as ERROR_INVALID_FUNCTION.
 DEFINE_GUID(GUID_DEVINTERFACE_IVSHMEM,
             0xdf576976, 0x569d, 0x4672, 0x95, 0xa0, 0xf5, 0x7e, 0x4e, 0xa0, 0xb2, 0x10);
 

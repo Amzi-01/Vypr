@@ -42,7 +42,12 @@ enum sash_msg_type {
     SASH_MSG_TEXT             = 69,  /* sash_msg_window_id + utf8 */
     SASH_MSG_RESIZE           = 70,  /* sash_msg_resize */
     SASH_MSG_FOCUS            = 71,  /* sash_msg_window_id */
-    SASH_MSG_CLOSE            = 72   /* sash_msg_window_id */
+    SASH_MSG_CLOSE            = 72,  /* sash_msg_window_id */
+
+    /* 128 and up are host-internal: they travel between sashd and the per-window
+     * clients over a unix socket and are never sent to the guest. Sharing the
+     * framing means one reader implementation rather than two. */
+    SASH_MSG_CLIENT_HELLO     = 128  /* sash_msg_window_id */
 };
 
 /* Every message begins with this. `bytes` counts the payload only. */
