@@ -54,3 +54,31 @@ the domain, and WinFsp installed in the guest.
 GPU's own outputs. DWM needs a live display to composite, and WGC captures from
 DWM's surfaces — with no display attached there is nothing to capture. Either a
 monitor input on the 5050 or a dummy plug has to be present.
+
+## 5. Remove the USB tablet
+
+```xml
+<input type='tablet' bus='usb'/>
+```
+
+If the domain has one, take it out. It is an **absolute** pointing device, and a
+game reading raw input in the guest treats its absolute coordinates as relative
+motion and throws the view into a corner - classically the top left, which is
+(0,0) in absolute space. Red Hat bug 852841 is this exact symptom: "Mouse jumps
+to edges / corners when using an absolute input device (ie virtual machine usb
+tablet)".
+
+No amount of care on the host side fixes this, because the device is present in
+the guest regardless of who is sending input. It is why the same VM misbehaves
+under other streaming solutions too.
+
+It can be removed without stopping the guest:
+
+```bash
+virsh detach-device RDPWindows tablet.xml --live --config
+```
+
+Leaving only `<input type='mouse' bus='ps2'/>`, a relative device. The cost is
+that the SPICE console pointer now needs to be grabbed rather than tracking the
+host pointer, which does not matter when the guest is driven through sash or
+Looking Glass.

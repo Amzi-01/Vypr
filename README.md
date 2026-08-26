@@ -186,6 +186,12 @@ precisely in the case that was broken.
 Capture is also a request the compositor may refuse, so the result is checked -
 silently sending deltas after a refused grab looks exactly like broken input.
 
+**The VM must not present a USB tablet.** An absolute pointing device makes a
+raw-input game read absolute coordinates as motion and slam the view into a
+corner, whoever is sending the input - see `docs/vm-setup.md`. This is worth
+checking first when a game's mouse misbehaves, because nothing on the host side
+can compensate for it.
+
 Absolute positioning is also simply wrong in that situation: FiveM changed the
 guest display mode to 2560x1440 while its window stayed 3840x2160, and SendInput
 normalises absolute coordinates against the *virtual desktop*, so every point
