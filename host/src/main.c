@@ -185,6 +185,22 @@ struct view {
     bool              is_popup;
 };
 
+/* Relative capture is a request to the compositor, not a guarantee - it can be
+ * refused, and silently sending deltas afterwards looks like broken input. */
+static void set_capture(SDL_Window *win, bool want, bool announce)
+{
+    if (!SDL_SetWindowRelativeMouseMode(win, want)) {
+        fprintf(stderr, "sash: relative mouse mode %s refused: %s\n",
+                want ? "on" : "off", SDL_GetError());
+        return;
+    }
+    if (announce) {
+        printf("sash: mouse capture %s\n",
+               want ? "ON - relative motion" : "OFF - absolute");
+        fflush(stdout);
+    }
+}
+
 static struct view *view_for_sdl_id(struct view *views, int count, SDL_WindowID id)
 {
     for (int i = 0; i < count; i++)
@@ -352,10 +368,25 @@ int main(int argc, char **argv)
                 if (pointer_locked || capture_forced) {
                     /* Send motion, not position. The guest app is warping the
                      * cursor itself; telling it where our pointer is would add
-                     * a bogus delta on top of its own warp every frame. */
+                     * a bogus delta on top of its own warp every frame.
+                     *
+                     * Deltas are in host window pixels, and the window is
+                     * rarely the size of the guest surface - a 4K stream shown
+                     * in a 1080p window would otherwise move the guest pointer
+                     * at half speed. */
                     if (ev.type == SDL_EVENT_MOUSE_MOTION) {
-                        msg.x = (int32_t)ev.motion.xrel;
-                        msg.y = (int32_t)ev.motion.yrel;
+                        float sx = 1.0f, sy = 1.0f;
+                        if (win_w > 0 && win_h > 0 && v->src_w && v->src_h) {
+                            sx = (float)v->src_w / (float)win_w;
+                            sy = (float)v->src_h / (float)win_h;
+                        }
+                        msg.x = (int32_t)(ev.motion.xrel * sx);
+                        msg.y = (int32_t)(ev.motion.yrel * sy);
+                        /* Never round a real movement away to nothing. */
+                        if (msg.x == 0 && ev.motion.xrel != 0.0f)
+                            msg.x = ev.motion.xrel > 0 ? 1 : -1;
+                        if (msg.y == 0 && ev.motion.yrel != 0.0f)
+                            msg.y = ev.motion.yrel > 0 ? 1 : -1;
                     }
                     msg.flags |= SASH_PTR_RELATIVE;
                 } else {
@@ -395,8 +426,7 @@ int main(int argc, char **argv)
                 if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_M &&
                     (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_SHIFT)) {
                     capture_forced = !capture_forced;
-                    SDL_SetWindowRelativeMouseMode(views[0].win,
-                                                   pointer_locked || capture_forced);
+                    set_capture(views[0].win, pointer_locked || capture_forced, true);
 
                     /* The Ctrl and Shift presses already went to the guest, and
                      * the M never will - so release the modifiers explicitly or
@@ -413,9 +443,6 @@ int main(int argc, char **argv)
                         }
                     }
 
-                    printf("sash: mouse capture %s (Ctrl+Shift+M toggles)\n",
-                           capture_forced ? "ON - relative motion" : "OFF - absolute");
-                    fflush(stdout);
                     break;
                 }
                 if (daemon_fd < 0) break;
@@ -480,11 +507,11 @@ int main(int argc, char **argv)
                                head.bytes >= sizeof(struct sash_msg_pointer_lock)) {
                         const struct sash_msg_pointer_lock *m = (const void *)payload;
                         pointer_locked = m->locked != 0;
-                        SDL_SetWindowRelativeMouseMode(views[0].win,
-                                                       pointer_locked || capture_forced);
-                        if (opt.stats)
-                            printf("sash: pointer %s by guest\n",
-                                   pointer_locked ? "captured" : "released");
+                        set_capture(views[0].win, pointer_locked || capture_forced, false);
+                        printf("sash: guest %s the pointer%s\n",
+                               pointer_locked ? "captured" : "released",
+                               capture_forced ? " (manual capture still on)" : "");
+                        fflush(stdout);
                     } else if (head.type == SASH_MSG_CLIENT_POPUP_END &&
                                head.bytes >= sizeof(struct sash_msg_window_id)) {
                         const struct sash_msg_window_id *m = (const void *)payload;

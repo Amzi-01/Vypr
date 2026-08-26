@@ -4,6 +4,7 @@
 
 #include "geometry.hpp"
 
+#include <cstdio>
 #include <vector>
 
 namespace sash {
@@ -58,7 +59,31 @@ void ensure_foreground(HWND hwnd) {
     if (fore && fore != self) AttachThreadInput(self, fore, FALSE);
 }
 
+int  g_saved_accel[3] = { 0, 0, 0 };
+bool g_accel_saved = false;
+
 }  // namespace
+
+void suspend_pointer_acceleration() {
+    if (g_accel_saved) return;
+    if (!SystemParametersInfoW(SPI_GETMOUSE, 0, g_saved_accel, 0)) return;
+
+    // {threshold1, threshold2, acceleration}; all zero is a linear response.
+    if (g_saved_accel[2] == 0) return;   // already linear, nothing to restore
+
+    g_accel_saved = true;
+    int linear[3] = { 0, 0, 0 };
+    SystemParametersInfoW(SPI_SETMOUSE, 0, linear, SPIF_SENDCHANGE);
+    std::fprintf(stderr, "sash: pointer acceleration suspended (was %d/%d/%d)\n",
+                 g_saved_accel[0], g_saved_accel[1], g_saved_accel[2]);
+}
+
+void restore_pointer_acceleration() {
+    if (!g_accel_saved) return;
+    SystemParametersInfoW(SPI_SETMOUSE, 0, g_saved_accel, SPIF_SENDCHANGE);
+    g_accel_saved = false;
+    std::fprintf(stderr, "sash: pointer acceleration restored\n");
+}
 
 void inject_pointer(const sash_msg_pointer& msg) {
     HWND hwnd = to_hwnd(msg.window_id);

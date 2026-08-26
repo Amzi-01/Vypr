@@ -18,4 +18,16 @@ void focus_window(std::uint64_t window_id);
 void close_window(std::uint64_t window_id);
 void resize_window(const sash_msg_resize& msg);
 
+/*
+ * Windows applies a pointer-acceleration curve to injected relative motion, so
+ * the guest does not receive the deltas the host sent: small movements are
+ * compressed and fast ones amplified, on top of whatever sensitivity the game
+ * applies. Nothing aiming a camera wants that.
+ *
+ * Suspended only while an app holds the pointer, and restored afterwards - it
+ * is the user's Windows setting, not ours to keep.
+ */
+void suspend_pointer_acceleration();
+void restore_pointer_acceleration();
+
 }  // namespace sash

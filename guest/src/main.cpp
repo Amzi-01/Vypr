@@ -60,6 +60,7 @@ private:
 
     bool          lock_state_ = false;
     std::uint64_t lock_window_ = 0;
+    int           lock_agree_ = 0;      // consecutive polls agreeing on a change
     void poll_pointer_lock();
 };
 
@@ -92,10 +93,25 @@ void Agent::poll_pointer_lock() {
 
     const bool locked = (hidden || clipped) && streaming_fg;
 
-    if (locked == lock_state_ && (!locked || fg_id == lock_window_)) return;
+    if (locked == lock_state_ && (!locked || fg_id == lock_window_)) {
+        lock_agree_ = 0;
+        return;
+    }
+
+    /*
+     * Debounce. A game toggles cursor visibility constantly - showing it for a
+     * menu, hiding it again a frame later - and reporting every flicker makes
+     * the host flip pointer modes several times a second, which feels exactly
+     * like broken input. Only a state that survives consecutive polls counts.
+     */
+    if (++lock_agree_ < 3) return;
+    lock_agree_ = 0;
 
     lock_state_  = locked;
     lock_window_ = locked ? fg_id : lock_window_;
+
+    if (locked) sash::suspend_pointer_acceleration();
+    else        sash::restore_pointer_acceleration();
 
     sash_msg_pointer_lock msg{};
     msg.window_id = lock_window_;
@@ -332,6 +348,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
     stop_ = true;
     watcher.join();
+    sash::restore_pointer_acceleration();
 
     for (auto& [id, s] : streams_) {
         s->capture.stop();

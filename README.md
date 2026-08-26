@@ -158,6 +158,26 @@ detection can miss a fullscreen app that leaves the cursor nominally visible -
 and because a game that grabs the mouse must always be escapable from the host
 side.
 
+Three things had to be right before capture felt correct, and each was
+independently capable of ruining it:
+
+- **Debounce the lock.** A game toggles cursor visibility constantly, so
+  reporting every flicker flipped the pointer mode several times a second.
+  Only a state that survives three consecutive polls counts.
+- **Scale the deltas.** They arrive in host window pixels; the guest surface is
+  usually a different size. A 4K stream in a 1080p window moved the guest
+  pointer at half speed. Rounding is floored at one pixel so a small real
+  movement is never rounded away to nothing.
+- **Suspend pointer acceleration.** Windows applies a ballistics curve to
+  injected relative motion, so the guest does not receive the deltas the host
+  sent - small movements compressed, fast ones amplified, on top of the game's
+  own sensitivity. The agent suspends it while an app holds the pointer and
+  restores it afterwards, including on exit; it is the user's setting, not
+  ours to keep.
+
+Capture is also a request the compositor may refuse, so the result is checked -
+silently sending deltas after a refused grab looks exactly like broken input.
+
 Absolute positioning is also simply wrong in that situation: FiveM changed the
 guest display mode to 2560x1440 while its window stayed 3840x2160, and SendInput
 normalises absolute coordinates against the *virtual desktop*, so every point
