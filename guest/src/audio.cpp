@@ -145,6 +145,17 @@ void AudioCapture::Impl::run(Sink sink) {
                 } else {
                     to_float(data, wfx, frames, samples);
                 }
+                // Distinguish "nothing is playing" from "capturing but not
+                // delivering" - they look identical from the far end.
+                {
+                    static unsigned packets = 0;
+                    static unsigned long long total = 0;
+                    total += frames;
+                    if (++packets % 1000 == 0)
+                        std::fprintf(stderr, "sash: audio %u packets, %llu frames\n",
+                                     packets, total);
+                }
+
                 if (!samples.empty()) {
                     if (wfx->nChannels > 2) {
                         downmix_stereo(samples, frames, wfx->nChannels, stereo);
