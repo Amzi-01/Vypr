@@ -7,7 +7,7 @@
 
 struct present_ops {
     const char *name;
-    void       *(*create)(SDL_Window *win);
+    void       *(*create)(SDL_Window *win, void *share_impl);
     void        (*destroy)(void *impl);
     const char *(*driver)(void *impl);
     bool        (*upload)(void *impl, const struct sash_frame_view *f);

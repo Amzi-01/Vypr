@@ -18,6 +18,7 @@
 #include "present.h"
 #include "shm.h"
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -65,6 +66,12 @@ static int connect_daemon(const char *path, uint64_t window_id)
         close(fd);
         return -1;
     }
+
+    /* Non-blocking: this socket is polled from inside the render loop, and a
+     * blocking read would stall presentation waiting for a popup message that
+     * may never arrive. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
 }
 
@@ -160,6 +167,31 @@ static uint32_t sdl_scancode_to_ps2(SDL_Scancode sc)
     return map[sc];
 }
 
+/*
+ * One presented window. The process owns a top-level plus whatever popups its
+ * guest window spawns: a popup surface must be parented to its owner, and only
+ * the process holding the owner's surface can do that.
+ */
+enum { MAX_VIEWS = 12 };
+
+struct view {
+    uint64_t          window_id;
+    uint32_t          slot;
+    SDL_Window       *win;
+    struct presenter *pres;
+    uint32_t          src_w, src_h;
+    uint32_t          last_serial;
+    bool              is_popup;
+};
+
+static struct view *view_for_sdl_id(struct view *views, int count, SDL_WindowID id)
+{
+    for (int i = 0; i < count; i++)
+        if (views[i].win && SDL_GetWindowID(views[i].win) == id)
+            return &views[i];
+    return NULL;
+}
+
 /* Host window pixel -> guest client-area pixel. The host window is freely
  * resizable while the guest client area is whatever the guest app decided, so
  * every pointer event has to be converted before it means anything over there. */
@@ -173,6 +205,60 @@ static void to_guest_coords(int win_w, int win_h, uint32_t src_w, uint32_t src_h
     if (*gy < 0) *gy = 0;
     if (*gx >= (int32_t)src_w) *gx = (int32_t)src_w - 1;
     if (*gy >= (int32_t)src_h) *gy = (int32_t)src_h - 1;
+}
+
+/* A popup the daemon handed us: a real popup surface anchored to the owner's
+ * window, so the compositor treats it as a menu rather than a floating
+ * top-level - it stacks correctly and does not take focus. */
+static bool view_open_popup(struct view *views, int *count, struct sash_shm *shm,
+                            const struct sash_msg_client_popup *msg,
+                            const char *backend)
+{
+    if (*count >= MAX_VIEWS) return false;
+    for (int i = 0; i < *count; i++)
+        if (views[i].window_id == msg->window_id) return true;   /* already open */
+
+    struct view *owner = NULL;
+    for (int i = 0; i < *count; i++)
+        if (views[i].window_id == msg->owner_id) { owner = &views[i]; break; }
+    if (!owner || !owner->win) return false;
+
+    struct view *v = &views[*count];
+    memset(v, 0, sizeof(*v));
+    v->window_id = msg->window_id;
+    v->slot      = msg->slot;
+    v->is_popup  = true;
+
+    v->win = SDL_CreatePopupWindow(owner->win, msg->dx, msg->dy,
+                                   (int)msg->width, (int)msg->height,
+                                   SDL_WINDOW_POPUP_MENU);
+    if (!v->win) {
+        fprintf(stderr, "sash: SDL_CreatePopupWindow: %s\n", SDL_GetError());
+        return false;
+    }
+
+    v->pres = presenter_create(v->win, backend, owner->pres);
+    if (!v->pres) {
+        SDL_DestroyWindow(v->win);
+        v->win = NULL;
+        return false;
+    }
+
+    (*count)++;
+    return true;
+}
+
+static void view_close(struct view *views, int *count, uint64_t window_id)
+{
+    for (int i = 0; i < *count; i++) {
+        if (views[i].window_id != window_id) continue;
+        if (views[i].pres) presenter_destroy(views[i].pres);
+        if (views[i].win)  SDL_DestroyWindow(views[i].win);
+        /* Compact, so the main view stays at index 0. */
+        for (int j = i; j + 1 < *count; j++) views[j] = views[j + 1];
+        (*count)--;
+        return;
+    }
 }
 
 int main(int argc, char **argv)
@@ -196,20 +282,24 @@ int main(int argc, char **argv)
     int win_w = (int)(slot->max_width  ? slot->max_width  : 1280);
     int win_h = (int)(slot->max_height ? slot->max_height : 720);
 
-    SDL_Window *win = SDL_CreateWindow(opt.title, win_w, win_h, SDL_WINDOW_RESIZABLE);
-    if (!win) { fprintf(stderr, "sash: SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    struct view views[MAX_VIEWS] = {0};
+    int view_count = 1;
 
-    struct presenter *pres = presenter_create(win, opt.backend);
-    if (!pres) { fprintf(stderr, "sash: no usable present backend\n"); return 1; }
+    views[0].window_id = opt.window_id;
+    views[0].slot      = opt.slot;
+    views[0].win = SDL_CreateWindow(opt.title, win_w, win_h, SDL_WINDOW_RESIZABLE);
+    if (!views[0].win) {
+        fprintf(stderr, "sash: SDL_CreateWindow: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    views[0].pres = presenter_create(views[0].win, opt.backend, NULL);
+    if (!views[0].pres) { fprintf(stderr, "sash: no usable present backend\n"); return 1; }
 
     if (opt.stats)
-        printf("sash: present backend '%s'\n", presenter_name(pres));
+        printf("sash: present backend '%s'\n", presenter_name(views[0].pres));
 
-    /* Source geometry, kept here for input mapping and window sizing;
-     * the presenter owns the GPU-side resources. */
-    uint32_t tex_w = 0, tex_h = 0;
-
-    uint32_t last_serial = 0;
+    struct msg_reader daemon_rx = {0};
     uint64_t presented = 0, dropped = 0;
     uint64_t stats_at = SDL_GetTicks();
 
@@ -217,6 +307,11 @@ int main(int argc, char **argv)
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* Input is reported against the guest window the event landed on,
+             * so a click on a menu reaches the menu rather than its owner. */
+            struct view *v = view_for_sdl_id(views, view_count, ev.window.windowID);
+            if (!v) v = &views[0];
+
             switch (ev.type) {
             case SDL_EVENT_QUIT:
                 if (daemon_fd >= 0) {
@@ -234,11 +329,11 @@ int main(int argc, char **argv)
                 float hx, hy;
                 const SDL_MouseButtonFlags held = SDL_GetMouseState(&hx, &hy);
 
-                SDL_GetWindowSize(win, &win_w, &win_h);
+                SDL_GetWindowSize(v->win, &win_w, &win_h);
 
                 struct sash_msg_pointer msg = {0};
-                msg.window_id = opt.window_id;
-                to_guest_coords(win_w, win_h, tex_w, tex_h, hx, hy, &msg.x, &msg.y);
+                msg.window_id = v->window_id;
+                to_guest_coords(win_w, win_h, v->src_w, v->src_h, hx, hy, &msg.x, &msg.y);
 
                 if (held & SDL_BUTTON_LMASK) msg.buttons |= 1u << 0;
                 if (held & SDL_BUTTON_RMASK) msg.buttons |= 1u << 1;
@@ -267,7 +362,7 @@ int main(int argc, char **argv)
                 if (daemon_fd < 0) break;
 
                 struct sash_msg_key msg = {0};
-                msg.window_id = opt.window_id;
+                msg.window_id = v->window_id;
                 /* SDL scancodes are USB HID usage ids; the guest wants PS/2
                  * set 1, which is what SendInput takes. */
                 msg.scancode  = sdl_scancode_to_ps2(ev.key.scancode);
@@ -279,8 +374,8 @@ int main(int argc, char **argv)
             }
 
             case SDL_EVENT_WINDOW_FOCUS_GAINED: {
-                if (daemon_fd < 0) break;
-                struct sash_msg_window_id msg = { .window_id = opt.window_id };
+                if (daemon_fd < 0 || v->is_popup) break;
+                struct sash_msg_window_id msg = { .window_id = v->window_id };
                 msg_send(daemon_fd, SASH_MSG_FOCUS, &msg, sizeof(msg));
                 break;
             }
@@ -290,14 +385,15 @@ int main(int argc, char **argv)
                 /* Adopting the frame size raises this event too. Asking the
                  * guest to become the size it already is achieves nothing and
                  * oscillates against a guest that rounds differently. */
-                if ((uint32_t)ev.window.data1 == tex_w &&
-                    (uint32_t)ev.window.data2 == tex_h)
+                if (v->is_popup) break;   /* the guest owns a popup's size */
+                if ((uint32_t)ev.window.data1 == v->src_w &&
+                    (uint32_t)ev.window.data2 == v->src_h)
                     break;
                 /* Ask the guest window to match, so the stream is pixel-exact
                  * rather than scaled. The guest may refuse - a fixed-size app
                  * simply will not resize - and then scaling stands in. */
                 struct sash_msg_resize msg = {0};
-                msg.window_id = opt.window_id;
+                msg.window_id = v->window_id;
                 msg.width  = (uint32_t)ev.window.data1;
                 msg.height = (uint32_t)ev.window.data2;
                 msg_send(daemon_fd, SASH_MSG_RESIZE, &msg, sizeof(msg));
@@ -308,35 +404,62 @@ int main(int argc, char **argv)
             }
         }
 
-        struct sash_frame_view f;
-        int rc = sash_shm_acquire(&shm, opt.slot, last_serial, &f);
-
-        if (rc == 0) {
-            if (f.width != tex_w || f.height != tex_h) {
-                tex_w = f.width;
-                tex_h = f.height;
-                SDL_SetWindowSize(win, (int)f.width, (int)f.height);
+        /* Popups arrive and vanish while we run, so the daemon link is read
+         * every frame rather than only at startup. */
+        if (daemon_fd >= 0) {
+            int rc = msg_reader_fill(&daemon_rx, daemon_fd);
+            if (rc > 0) {
+                struct sash_msg_head head;
+                const uint8_t *payload;
+                while (msg_reader_next(&daemon_rx, &head, &payload) == 1) {
+                    if (head.type == SASH_MSG_CLIENT_POPUP &&
+                        head.bytes >= sizeof(struct sash_msg_client_popup)) {
+                        view_open_popup(views, &view_count, &shm,
+                                        (const struct sash_msg_client_popup *)payload,
+                                        opt.backend);
+                    } else if (head.type == SASH_MSG_CLIENT_POPUP_END &&
+                               head.bytes >= sizeof(struct sash_msg_window_id)) {
+                        const struct sash_msg_window_id *m = (const void *)payload;
+                        view_close(views, &view_count, m->window_id);
+                    }
+                }
             }
-
-            /* Count gaps in the serial: frames the guest published that we
-             * never showed, which is what says whether the host keeps up. */
-            if (last_serial && f.serial > last_serial + 1)
-                dropped += f.serial - last_serial - 1;
-            last_serial = f.serial;
-
-            presenter_upload(pres, &f);
-            presented++;
-        } else if (rc == -1 && sash_slot_state(&shm, opt.slot) == SASH_SLOT_CLOSED) {
-            running = 0;
         }
 
-        presenter_present(pres);
+        for (int i = 0; i < view_count; i++) {
+            struct view *v = &views[i];
+            struct sash_frame_view f;
+
+            int rc = sash_shm_acquire(&shm, v->slot, v->last_serial, &f);
+            if (rc == 0) {
+                if (f.width != v->src_w || f.height != v->src_h) {
+                    v->src_w = f.width;
+                    v->src_h = f.height;
+                    /* A popup is sized by the guest; only a top-level adopts
+                     * the frame size, since the user may have resized it. */
+                    if (!v->is_popup)
+                        SDL_SetWindowSize(v->win, (int)f.width, (int)f.height);
+                }
+
+                if (v->last_serial && f.serial > v->last_serial + 1)
+                    dropped += f.serial - v->last_serial - 1;
+                v->last_serial = f.serial;
+
+                presenter_upload(v->pres, &f);
+                if (i == 0) presented++;
+            } else if (rc == -1 && !v->is_popup &&
+                       sash_slot_state(&shm, v->slot) == SASH_SLOT_CLOSED) {
+                running = 0;
+            }
+
+            presenter_present(v->pres);
+        }
 
         if (opt.stats) {
             uint64_t now = SDL_GetTicks();
             if (now - stats_at >= 1000) {
                 uint64_t ns_upload = 0, ns_present = 0;
-                presenter_take_timings(pres, &ns_upload, &ns_present);
+                presenter_take_timings(views[0].pres, &ns_upload, &ns_present);
                 printf("%" PRIu64 " fps presented, %" PRIu64 " dropped | "
                        "upload %.1f ms/frame, present %.1f ms/frame\n",
                        presented, dropped,
@@ -348,8 +471,11 @@ int main(int argc, char **argv)
         }
     }
 
-    presenter_destroy(pres);
-    SDL_DestroyWindow(win);
+    for (int i = view_count - 1; i >= 0; i--) {
+        if (views[i].pres) presenter_destroy(views[i].pres);
+        if (views[i].win)  SDL_DestroyWindow(views[i].win);
+    }
+    msg_reader_free(&daemon_rx);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
     sash_shm_close(&shm);

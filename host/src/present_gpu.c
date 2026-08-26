@@ -25,6 +25,7 @@
 struct gpu_state {
     SDL_Window            *win;
     SDL_GPUDevice         *dev;
+    bool                   owns_device;   /* false when borrowed from a sibling */
     SDL_GPUTexture        *tex;
     SDL_GPUTransferBuffer *xfer;
 
@@ -43,16 +44,23 @@ static const char *gpu_driver(void *impl)
     return drv ? drv : "gpu";
 }
 
-static void *gpu_create(SDL_Window *win)
+static void *gpu_create(SDL_Window *win, void *share_impl)
 {
     struct gpu_state *p = SDL_calloc(1, sizeof(*p));
     if (!p) return NULL;
 
     p->win = win;
-    p->dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV |
-                                 SDL_GPU_SHADERFORMAT_DXIL  |
-                                 SDL_GPU_SHADERFORMAT_MSL,
-                                 false, NULL);
+
+    if (share_impl) {
+        p->dev = ((struct gpu_state *)share_impl)->dev;
+        p->owns_device = false;
+    } else {
+        p->dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV |
+                                     SDL_GPU_SHADERFORMAT_DXIL  |
+                                     SDL_GPU_SHADERFORMAT_MSL,
+                                     false, NULL);
+        p->owns_device = true;
+    }
     if (!p->dev) {
         fprintf(stderr, "sash: SDL_CreateGPUDevice: %s\n", SDL_GetError());
         SDL_free(p);
@@ -60,7 +68,7 @@ static void *gpu_create(SDL_Window *win)
     }
     if (!SDL_ClaimWindowForGPUDevice(p->dev, win)) {
         fprintf(stderr, "sash: ClaimWindowForGPUDevice: %s\n", SDL_GetError());
-        SDL_DestroyGPUDevice(p->dev);
+        if (p->owns_device) SDL_DestroyGPUDevice(p->dev);
         SDL_free(p);
         return NULL;
     }
@@ -80,7 +88,7 @@ static void gpu_destroy(void *impl)
     if (p->tex)  SDL_ReleaseGPUTexture(p->dev, p->tex);
     if (p->dev) {
         SDL_ReleaseWindowFromGPUDevice(p->dev, p->win);
-        SDL_DestroyGPUDevice(p->dev);
+        if (p->owns_device) SDL_DestroyGPUDevice(p->dev);
     }
     SDL_free(p);
 }

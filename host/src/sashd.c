@@ -39,11 +39,14 @@
 
 struct window {
     uint64_t id;
+    uint64_t owner_id;      /* nonzero for popups */
     uint32_t slot;
     int      has_slot;
     int      attached;
+    int      is_popup;      /* presented by its owner's client, not its own */
     pid_t    child;
     int      client_fd;
+    int32_t  gx, gy;        /* guest screen position of the client area */
     uint32_t width, height;
     char     title[192];
 };
@@ -111,10 +114,10 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
         kill(w->child, SIGTERM);
         w->child = 0;
     }
-    if (w->client_fd >= 0) {
+    if (w->client_fd >= 0 && !w->is_popup) {
         close(w->client_fd);
-        w->client_fd = -1;
     }
+    w->client_fd = -1;
     if (tell_agent && d->agent_fd >= 0 && w->attached) {
         struct sash_msg_window_id gone = { .window_id = w->id };
         msg_send(d->agent_fd, SASH_MSG_DETACH, &gone, sizeof(gone));
@@ -171,8 +174,12 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     }
 
     snprintf(w->title, sizeof(w->title), "%s", title);
-    w->width  = desc->width;
-    w->height = desc->height;
+    w->width    = desc->width;
+    w->height   = desc->height;
+    w->gx       = desc->x;
+    w->gy       = desc->y;
+    w->owner_id = desc->owner_id;
+    w->is_popup = (desc->flags & SASH_WIN_POPUP) != 0 && desc->owner_id != 0;
 
     /* Headroom, so an ordinary resize does not force a re-attach. The bump
      * allocator never rewinds - reusing a freed range under a live writer is
@@ -225,11 +232,20 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         memcpy(title, payload + sizeof(*desc), tlen);
 
         if (type == SASH_MSG_WINDOW_ADDED)
-            fprintf(stderr, "sashd: guest window '%s' %ux%u%s\n", title,
-                    desc->width, desc->height,
-                    title_matches(d, title) ? "" : " (ignored)");
+            fprintf(stderr, "sashd: guest window '%s' %ux%u at %d,%d "
+                            "flags=0x%x owner=0x%llx%s\n", title,
+                    desc->width, desc->height, desc->x, desc->y,
+                    desc->flags, (unsigned long long)desc->owner_id,
+                    title_matches(d, title) ? "" : " (no title match)");
 
-        if (!title_matches(d, title)) break;
+        /* A popup is streamed because its owner is, not because of its title -
+         * menus have no title to match against. */
+        int wanted = title_matches(d, title);
+        if (!wanted && (desc->flags & SASH_WIN_POPUP) && desc->owner_id) {
+            struct window *owner = window_find(d, desc->owner_id);
+            wanted = owner && owner->has_slot && owner->client_fd >= 0;
+        }
+        if (!wanted) break;
 
         struct window *w = window_find(d, desc->window_id);
         if (w && w->has_slot) {
@@ -253,7 +269,16 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         const struct sash_msg_window_id *m = (const void *)payload;
         struct window *w = window_find(d, m->window_id);
         if (w) {
-            fprintf(stderr, "sashd: guest closed '%s'\n", w->title);
+            if (w->is_popup) {
+                struct window *owner = window_find(d, w->owner_id);
+                if (owner && owner->client_fd >= 0) {
+                    struct sash_msg_window_id gone = { .window_id = w->id };
+                    msg_send(owner->client_fd, SASH_MSG_CLIENT_POPUP_END,
+                             &gone, sizeof(gone));
+                }
+            } else {
+                fprintf(stderr, "sashd: guest closed '%s'\n", w->title);
+            }
             window_release(d, w, 0);
         }
         break;
@@ -270,6 +295,30 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             break;
         }
         w->attached = 1;
+
+        if (w->is_popup) {
+            /* Hand it to the owner's client: a popup surface has to be parented
+             * to its owner, which only that process can do. */
+            struct window *owner = window_find(d, w->owner_id);
+            if (!owner || owner->client_fd < 0) {
+                fprintf(stderr, "sashd: popup for a window with no client; dropping\n");
+                window_release(d, w, 1);
+                break;
+            }
+            struct sash_msg_client_popup msg = {0};
+            msg.window_id = w->id;
+            msg.owner_id  = owner->id;
+            msg.slot      = w->slot;
+            msg.dx        = w->gx - owner->gx;
+            msg.dy        = w->gy - owner->gy;
+            msg.width     = w->width;
+            msg.height    = w->height;
+            msg_send(owner->client_fd, SASH_MSG_CLIENT_POPUP, &msg, sizeof(msg));
+            fprintf(stderr, "sashd: popup %ux%u at +%d,+%d of '%s' -> slot %u\n",
+                    w->width, w->height, msg.dx, msg.dy, owner->title, w->slot);
+            break;
+        }
+
         spawn_client(d, w);
         break;
     }

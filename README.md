@@ -114,6 +114,7 @@ serial         : 1947 -> 2067   (60.0 fps)
 | Guest agent — WGC capture | **working** — Notepad at 60 fps |
 | Guest agent — IVSHMEM mapping | **working** — self-identifies by magic |
 | Guest agent — input injection | **working** — typed into the host window, arrived in the guest |
+| Popups and menus | **working** — real popup surfaces, GDI fallback for menus |
 | IVSHMEM device on the VM | added — 512 MB, PCI 08:02 |
 | IVSHMEM driver in the guest | installed with Looking Glass |
 | `host/src/sashd.c` — session daemon | working, verified end to end |

@@ -286,8 +286,13 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--host") && i + 1 < argc)      host = argv[++i];
         else if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+        else if (!std::strcmp(argv[i], "--dump")) {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            sash::dump_all_windows();
+            return 0;
+        }
         else {
-            std::fputs("usage: sash-agent [--host ADDR] [--port N]\n", stderr);
+            std::fputs("usage: sash-agent [--host ADDR] [--port N] [--dump]\n", stderr);
             return 2;
         }
     }

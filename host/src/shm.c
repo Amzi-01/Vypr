@@ -113,7 +113,10 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     }
 
     struct sash_slot *slot = &s->hdr->slots[i];
+    /* Survives the wipe: the whole point is that it never repeats. */
+    const uint32_t epoch = slot->epoch + 1;
     memset(slot, 0, sizeof(*slot));
+    slot->epoch        = epoch;
     slot->format       = SASH_FMT_BGRA8;
     slot->window_id    = window_id;
     slot->ring_offset  = s->alloc_cursor;
@@ -134,7 +137,7 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     out->max_width    = max_w;
     out->max_height   = max_h;
     out->frame_stride = (uint32_t)stride;
-    out->generation   = s->hdr->generation;
+    out->generation   = epoch;   /* the guest echoes this back by binding to it */
     return 0;
 }
 

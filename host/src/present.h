@@ -23,8 +23,14 @@
 
 struct presenter;
 
-/* `backend` is "gpu", "render", or NULL for the default. */
-struct presenter *presenter_create(SDL_Window *win, const char *backend);
+/* `backend` is "gpu", "render", or NULL for the default.
+ *
+ * `share` may name an existing presenter to borrow GPU state from. Creating a
+ * GPU device costs milliseconds, which is fine once per window and far too slow
+ * for a menu that has to appear the instant it opens - so popups share their
+ * owner's device rather than standing one up each time. */
+struct presenter *presenter_create(SDL_Window *win, const char *backend,
+                                   struct presenter *share);
 void              presenter_destroy(struct presenter *p);
 const char       *presenter_name(const struct presenter *p);
 

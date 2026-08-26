@@ -56,6 +56,7 @@ private:
     std::uint8_t*     ring_   = nullptr;
     std::uint32_t     index_  = 0;   // buffer begin_frame is currently lending
     std::uint32_t     serial_ = 0;
+    std::uint32_t     epoch_  = 0;   // the allocation this binding belongs to
 };
 
 }  // namespace sash

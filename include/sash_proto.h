@@ -47,7 +47,31 @@ enum sash_msg_type {
     /* 128 and up are host-internal: they travel between sashd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
      * framing means one reader implementation rather than two. */
-    SASH_MSG_CLIENT_HELLO     = 128  /* sash_msg_window_id */
+    SASH_MSG_CLIENT_HELLO     = 128, /* sash_msg_window_id */
+    SASH_MSG_CLIENT_POPUP     = 129, /* sash_msg_client_popup */
+    SASH_MSG_CLIENT_POPUP_END = 130  /* sash_msg_window_id */
+};
+
+/*
+ * A popup belonging to a window a client is already presenting.
+ *
+ * Popups are not their own host process, unlike top-level windows. A menu has
+ * to be a real popup surface parented to its owner - Wayland's xdg_popup, via
+ * SDL_CreatePopupWindow - and a surface can only be parented to one owned by
+ * the same process. So the daemon hands the popup to the owner's client rather
+ * than spawning another.
+ *
+ * `dx`/`dy` are relative to the owner's client-area origin, computed by the
+ * daemon from the two windows' guest screen positions, because that is the one
+ * place both are known.
+ */
+struct sash_msg_client_popup {
+    uint64_t window_id;
+    uint64_t owner_id;
+    uint32_t slot;
+    uint32_t _pad;
+    int32_t  dx, dy;
+    uint32_t width, height;
 };
 
 /* Every message begins with this. `bytes` counts the payload only. */

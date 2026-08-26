@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 // Step-by-step tracing of capture startup, off unless SASH_TRACE is set. It is
 // worth keeping: the failure that cost the most here was a crash partway
@@ -75,9 +76,89 @@ struct WindowCapture::Impl {
 
     std::uint64_t                 qpc_freq = 0;
 
+    // GDI fallback, for windows WGC will not capture at all.
+    HWND                          gdi_hwnd = nullptr;
+    std::thread                   gdi_thread;
+    std::atomic<bool>             gdi_stop{false};
+
     bool ensure_staging(std::uint32_t w, std::uint32_t h);
     void on_frame(const Direct3D11CaptureFramePool& sender);
+    void gdi_loop();
 };
+
+/*
+ * Capturing a menu.
+ *
+ * WGC refuses class #32768 outright - CreateForWindow returns E_INVALIDARG -
+ * because a menu has no independently capturable DWM surface of its own. What
+ * makes menus tractable anyway is that a menu is always the topmost thing on
+ * screen for as long as it is open, so whatever the screen holds inside its
+ * rectangle *is* the menu.
+ *
+ * So this blits from the screen DC. CAPTUREBLT is required or layered content
+ * is missed. It costs a small GDI copy per frame, which is nothing for a window
+ * this size, and it is only ever used for windows WGC has already rejected.
+ */
+void WindowCapture::Impl::gdi_loop() {
+    HDC screen = GetDC(nullptr);
+    HDC mem    = CreateCompatibleDC(screen);
+    HBITMAP dib = nullptr;
+    void*   bits = nullptr;
+    int     dib_w = 0, dib_h = 0;
+
+    while (!gdi_stop.load()) {
+        RECT r{};
+        if (!IsWindow(gdi_hwnd) || !GetWindowRect(gdi_hwnd, &r)) break;
+
+        const int w = r.right - r.left;
+        const int h = r.bottom - r.top;
+        if (w <= 0 || h <= 0) { Sleep(16); continue; }
+
+        if (!dib || w != dib_w || h != dib_h) {
+            if (dib) DeleteObject(dib);
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth       = w;
+            bi.bmiHeader.biHeight      = -h;   // negative: top-down, like everything else here
+            bi.bmiHeader.biPlanes      = 1;
+            bi.bmiHeader.biBitCount    = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!dib) break;
+            SelectObject(mem, dib);
+            dib_w = w;
+            dib_h = h;
+        }
+
+        if (BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT)) {
+            std::lock_guard<std::mutex> guard(lock);
+            if (pub && pub->bound() &&
+                static_cast<std::uint32_t>(w) <= pub->max_width() &&
+                static_cast<std::uint32_t>(h) <= pub->max_height()) {
+                std::uint32_t stride = 0;
+                if (std::uint8_t* dst = pub->begin_frame(&stride)) {
+                    const auto* srcp = static_cast<const std::uint8_t*>(bits);
+                    const std::size_t row = static_cast<std::size_t>(w) * 4;
+                    for (int y = 0; y < h; y++)
+                        std::memcpy(dst + static_cast<std::size_t>(y) * stride,
+                                    srcp + static_cast<std::size_t>(y) * row, row);
+                    LARGE_INTEGER qpc{};
+                    QueryPerformanceCounter(&qpc);
+                    pub->publish(static_cast<std::uint32_t>(w),
+                                 static_cast<std::uint32_t>(h), stride,
+                                 static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
+                                 SASH_PUB_DAMAGE_FULL);
+                    captured++;
+                }
+            }
+        }
+        Sleep(16);
+    }
+
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
 
 bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
     if (staging && staging_w == w && staging_h == h) return true;
@@ -220,10 +301,20 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
 
     TRACE("rt device ok");
     auto interop = get_activation_factory<GraphicsCaptureItem, ::IGraphicsCaptureItemInterop>();
-    if (FAILED(interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(),
-                                        put_abi(impl_->item)))) {
-        std::fprintf(stderr, "sash: CreateForWindow failed for HWND %p\n", hwnd_raw);
-        return false;
+    const HRESULT hr = interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(),
+                                                put_abi(impl_->item));
+    if (FAILED(hr)) {
+        wchar_t cls[64] = {0};
+        GetClassNameW(hwnd, cls, 64);
+        std::fprintf(stderr,
+                     "sash: WGC refused HWND %p class '%ls' (0x%08lX); using GDI\n",
+                     hwnd_raw, cls, static_cast<unsigned long>(hr));
+
+        impl_->pub      = pub;
+        impl_->gdi_hwnd = hwnd;
+        impl_->gdi_stop = false;
+        impl_->gdi_thread = std::thread([this] { impl_->gdi_loop(); });
+        return true;
     }
 
     TRACE("capture item ok");
@@ -270,6 +361,12 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
 }
 
 void WindowCapture::stop() {
+    if (impl_->gdi_thread.joinable()) {
+        impl_->gdi_stop = true;
+        impl_->gdi_thread.join();
+    }
+    impl_->gdi_hwnd = nullptr;
+
     if (impl_->session) {
         impl_->frame_token.revoke();
         try { impl_->session.Close(); } catch (...) {}

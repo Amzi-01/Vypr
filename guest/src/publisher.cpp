@@ -45,6 +45,7 @@ bool Publisher::bind(void* base, std::size_t region_bytes, std::uint32_t slot_in
     base_   = static_cast<std::uint8_t*>(base);
     bytes_  = region_bytes;
     slot_   = slot;
+    epoch_  = slot->epoch;
     ring_   = base_ + slot->ring_offset;
     index_  = 0;
     serial_ = 0;
@@ -61,6 +62,14 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
                         std::uint64_t capture_ts, std::uint64_t ts_freq,
                         std::uint32_t flags) {
     if (!slot_) return false;
+
+    // The host handed this slot index to somebody else. Writing now would put
+    // this window's pixels into theirs, so stop for good rather than race.
+    if (load_acquire(slot_->epoch) != epoch_) {
+        slot_ = nullptr;
+        return false;
+    }
+
     if (width == 0 || height == 0) return false;
     if (width > slot_->max_width || height > slot_->max_height) return false;
     if (static_cast<std::uint64_t>(stride) * height > slot_->frame_bytes) return false;

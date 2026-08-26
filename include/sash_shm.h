@@ -85,7 +85,17 @@ struct sash_slot {
     uint32_t max_width;
     uint32_t max_height;
     uint32_t frame_stride;
-    uint32_t _pad;
+
+    /*
+     * Incremented by the host every time this slot index is handed out.
+     *
+     * Slot indices get recycled when a window closes, and the guest's publisher
+     * for the previous occupant may still be running - its next publish would
+     * otherwise promote the freshly armed slot to LIVE and scribble the old
+     * window's pixels into the new one's ring. The publisher records the epoch
+     * it bound at and stops the moment it stops matching.
+     */
+    uint32_t epoch;
 
     struct sash_publish pub;
 };

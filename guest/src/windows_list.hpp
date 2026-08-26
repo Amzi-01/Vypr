@@ -26,4 +26,9 @@ bool describe_window(void* hwnd, WindowInfo* out);
 // it actually opened.
 std::vector<WindowInfo> windows_for_pid(std::uint32_t pid);
 
+// Every visible top-level window with the raw facts and the filter's verdict.
+// A diagnostic: which windows exist at a given moment, and why each is kept or
+// dropped, is otherwise only visible through what the filter already discarded.
+void dump_all_windows();
+
 }  // namespace sash

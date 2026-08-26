@@ -33,8 +33,9 @@ static const char *render_driver(void *impl)
     return n ? n : "render";
 }
 
-static void *render_create(SDL_Window *win)
+static void *render_create(SDL_Window *win, void *share_impl)
 {
+    (void)share_impl;   /* SDL_Renderer has no shareable device */
     struct render_state *p = SDL_calloc(1, sizeof(*p));
     if (!p) return NULL;
 
