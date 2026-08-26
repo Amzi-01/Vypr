@@ -4,6 +4,7 @@
 
 #include "geometry.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -88,7 +89,42 @@ void restore_pointer_acceleration() {
 void inject_pointer(const sash_msg_pointer& msg) {
     HWND hwnd = to_hwnd(msg.window_id);
     if (!IsWindow(hwnd)) return;
-    ensure_foreground(hwnd);
+
+    /*
+     * Only a click takes focus; passive motion must not.
+     *
+     * Asserting foreground on every motion event means moving the pointer
+     * across one streamed window drags focus off another - and with two FiveM
+     * windows streaming (launcher and game) they fight, the game loses
+     * foreground, the pointer lock releases, and input falls back to absolute
+     * positioning which cannot work here at all. Focus-follows-click is what
+     * every desktop does, for this reason.
+     */
+    if (msg.buttons & ~g_buttons) ensure_foreground(hwnd);
+
+    // Periodic summary of what is actually being injected: mode, typical
+    // magnitude, and where the guest cursor ended up. Enough to tell "the host
+    // is sending nonsense" apart from "the game is ignoring good input".
+    {
+        static unsigned n = 0;
+        static double sum_x = 0, sum_y = 0;
+        static unsigned rel = 0, abs_ = 0;
+        (msg.flags & SASH_PTR_RELATIVE) ? rel++ : abs_++;
+        sum_x += std::abs((double)msg.x);
+        sum_y += std::abs((double)msg.y);
+        if (++n >= 120) {
+            POINT cur{};
+            GetCursorPos(&cur);
+            RECT clip{};
+            GetClipCursor(&clip);
+            std::fprintf(stderr,
+                "sash: pointer %u rel / %u abs, mean |dx|=%.1f |dy|=%.1f, "
+                "cursor now %ld,%ld, clip %ldx%ld at %ld,%ld\n",
+                rel, abs_, sum_x / n, sum_y / n, cur.x, cur.y,
+                clip.right - clip.left, clip.bottom - clip.top, clip.left, clip.top);
+            n = 0; sum_x = sum_y = 0; rel = abs_ = 0;
+        }
+    }
 
     std::vector<INPUT> batch;
 

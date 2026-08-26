@@ -29,6 +29,7 @@
 #include "input.hpp"
 #include "ivshmem.hpp"
 #include "publisher.hpp"
+#include "geometry.hpp"
 #include "windows_list.hpp"
 
 namespace {
@@ -92,7 +93,39 @@ void Agent::poll_pointer_lock() {
         streaming_fg = streams_.find(fg_id) != streams_.end();
     }
 
-    const bool locked = (hidden || clipped) && streaming_fg;
+    /*
+     * Once an app has the pointer, keep it until the foreground moves away.
+     *
+     * Cursor visibility is a poor release signal: an app shows the cursor for a
+     * moment - a menu, a loading screen, a notification - and dropping the lock
+     * for that instant falls back to absolute positioning, which for this guest
+     * cannot work at all: the game window is 3830x2040 while the virtual
+     * desktop is 2560x1440, so absolute coordinates past the desktop edge are
+     * out of range and land the pointer in a corner. Exactly the reported
+     * symptom. Foreground is the stable signal; visibility only starts it.
+     */
+    /*
+     * A window bigger than the virtual desktop cannot be driven with absolute
+     * coordinates at all. SendInput normalises them across the virtual desktop,
+     * so every point past its edge is out of range and lands in a corner.
+     * FiveM does exactly this: it sets the display mode to 2560x1440 while its
+     * window stays 3830x2040. For such a window relative motion is not a
+     * preference, it is the only thing that works - so treat it as locked
+     * whether or not the app has hidden the cursor.
+     */
+    bool abs_impossible = false;
+    if (fg) {
+        const RECT cap = sash_capture_rect(fg);
+        const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        abs_impossible = cap.right > vx + vw || cap.bottom > vy + vh ||
+                         cap.left < vx || cap.top < vy;
+    }
+
+    const bool locked = streaming_fg &&
+                        ((hidden || clipped) || abs_impossible || lock_state_);
 
     if (locked == lock_state_ && (!locked || fg_id == lock_window_)) {
         lock_agree_ = 0;
