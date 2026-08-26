@@ -176,9 +176,15 @@ static int spawn_client(struct daemon *d, struct window *w)
     if (pid < 0) { perror("fork"); return -1; }
 
     if (pid == 0) {
-        /* A fullscreen app is a game often enough that starting it in direct
-         * pointer control, only to have the user reach for the toggle, is the
-         * wrong default. */
+        /* Direct pointer control by default, even for a fullscreen window.
+         *
+         * Starting captured hides the host cursor the moment the window is
+         * clicked, which is right for a game in mouselook and plainly wrong for
+         * everything else - including a game sitting in its own menus, which is
+         * where a session begins. Capture is entered when the guest says an app
+         * has taken the pointer, or when the user asks for it with
+         * Ctrl+Alt+Shift+M. Guessing from "it is fullscreen" was worse than not
+         * guessing. */
         char *const argv[] = {
             exe,
             "--shm",       (char *)d->shm_path,
@@ -186,7 +192,7 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--title",     w->title[0] ? w->title : (char *)"sash",
             "--window-id", id,
             "--sock",      d->unix_path,
-            w->fullscreen ? "--capture" : "--no-capture",
+            "--no-capture",
             NULL
         };
         execv(exe, argv);
