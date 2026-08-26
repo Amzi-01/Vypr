@@ -113,7 +113,7 @@ serial         : 1947 -> 2067   (60.0 fps)
 | Guest agent — publish path (`guest/src/publisher.cpp`) | verified on Linux, 1080p60, 0 drops |
 | Guest agent — WGC capture | **working** — Notepad at 60 fps |
 | Guest agent — IVSHMEM mapping | **working** — self-identifies by magic |
-| Guest agent — input injection | written, not yet exercised |
+| Guest agent — input injection | **working** — typed into the host window, arrived in the guest |
 | IVSHMEM device on the VM | added — 512 MB, PCI 08:02 |
 | IVSHMEM driver in the guest | installed with Looking Glass |
 | `host/src/sashd.c` — session daemon | working, verified end to end |
