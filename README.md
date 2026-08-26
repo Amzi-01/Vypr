@@ -201,6 +201,24 @@ The fallback strip - for windows that draw their own chrome and report no title
 bar - applies only when the pointer is *not* captured, so a captured game never
 has a dead band across the top of it.
 
+## Raw-input games need a kernel HID device
+
+`SendInput` cannot drive a game that reads raw input for its camera. It always
+goes through the Win32 cursor pipeline, so the game receives
+`MOUSE_MOVE_ABSOLUTE` packets or zeroes rather than the `lLastX`/`lLastY`
+deltas a physical mouse produces - it reads the cursor as (0,0), computes a
+huge negative delta every frame, and throws the camera into a corner. FiveM and
+GTA V both do this; so do Sunshine and Apollo, for the same reason.
+
+Until sash injects through a virtual HID device of its own, **Parsec running in
+the tray** supplies one: its `parsecvusba` driver injects at the kernel level
+where the deltas are real. See `docs/vm-setup.md`.
+
+This is worth knowing before debugging anything else about mouse behaviour in a
+game - it is not fixable at the level sash currently operates, and every
+plausible-looking fix above it (relative mode, acceleration, re-centring) is
+treating a symptom.
+
 ## Mouse capture
 
 A game that takes the pointer needs relative motion, not positions. It warps the

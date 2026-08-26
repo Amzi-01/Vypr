@@ -86,6 +86,27 @@ if ! grep -q sash-agent <<<"$agent_ps"; then
     sleep 6
 fi
 
+# --- Parsec, for the mouse -------------------------------------------------
+#
+# Not for streaming - for its driver.
+#
+# sash injects mouse motion with SendInput, which always goes through the Win32
+# cursor pipeline. A game reading raw input for its camera - FiveM and GTA V
+# both do - wants the lLastX/lLastY deltas a physical mouse produces, and gets
+# MOUSE_MOVE_ABSOLUTE packets or zeroes instead, reads the cursor as (0,0), and
+# whips the camera into a corner every frame. No userspace API can produce a
+# real HID delta, so this is not fixable in sash as it stands.
+#
+# Parsec's parsecvusba driver injects at the kernel HID level. With Parsec
+# running, the deltas are genuine and the camera behaves. Until sash grows its
+# own virtual HID device, keeping Parsec in the tray is the fix.
+parsec_ps=$(guest 'tasklist /fi "imagename eq parsecd.exe" /fo csv /nh' 2>/dev/null || true)
+if ! grep -q parsecd <<<"$parsec_ps"; then
+    say "Starting Parsec (its driver is what makes the mouse work)..."
+    guest 'schtasks /end /tn sash-parsec >nul 2>&1 & schtasks /run /tn sash-parsec' >/dev/null 2>&1
+    sleep 5
+fi
+
 # --- the game --------------------------------------------------------------
 game_ps=$(guest 'tasklist' 2>/dev/null || true)
 if grep -qi 'FiveM_b.*GTAProcess' <<<"$game_ps"; then

@@ -82,3 +82,34 @@ Leaving only `<input type='mouse' bus='ps2'/>`, a relative device. The cost is
 that the SPICE console pointer now needs to be grabbed rather than tracking the
 host pointer, which does not matter when the guest is driven through sash or
 Looking Glass.
+
+## 6. Parsec, running in the tray - for the mouse
+
+Not for streaming. For its driver.
+
+sash injects mouse motion with `SendInput`, which always goes through the Win32
+cursor pipeline. A game that reads **raw input** for its camera - FiveM and
+GTA V both do - wants the `lLastX`/`lLastY` deltas a physical mouse produces.
+`SendInput` gives it `MOUSE_MOVE_ABSOLUTE` packets or zeroes, so the game reads
+the cursor as (0,0), computes an enormous negative delta every frame, and whips
+the camera into a corner.
+
+**No userspace API can produce a real HID delta**, so this cannot be fixed in
+sash as it currently injects input. Sunshine and Apollo have the same bug for
+the same reason. Parsec's `parsecvusba` driver injects at the kernel HID level,
+where the deltas are genuine, and with Parsec running the camera behaves.
+
+```
+https://builds.parsec.app/package/parsec-windows.exe     # the app
+https://builds.parsec.app/vud/parsec-vud-0.3.10.0.exe    # the driver alone
+```
+
+Installed *and running in the tray* - installing alone is not enough. The
+launcher starts it if it is not running.
+
+### The real fix, not yet done
+
+Replace `SendInput` with injection through a signed virtual relative HID
+device, as ViGEmBus and HidHide do - both use free Microsoft attestation
+signing. That removes the dependency on Parsec and the whole class of
+raw-input problems with it. See Apollo issue #1479.
