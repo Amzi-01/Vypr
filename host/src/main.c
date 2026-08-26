@@ -415,6 +415,7 @@ int main(int argc, char **argv)
     enum { DEFAULT_DRAG_STRIP = 32 };
     uint32_t chrome_reported = opt.chrome_top;
     bool  title_press = false, title_dragging = false;
+    bool  title_was_relative = false;
     float press_gx = 0, press_gy = 0;
     int   press_win_x = 0, press_win_y = 0;
     int32_t press_guest_x = 0, press_guest_y = 0;
@@ -479,6 +480,18 @@ int main(int argc, char **argv)
                         ev.button.y < strip) {
                         title_press    = true;
                         title_dragging = false;
+
+                        /*
+                         * Relative mode locks the pointer in place, so the
+                         * global cursor position stops moving and a drag
+                         * measured from it is always zero - the window never
+                         * moves. Let the pointer go for the duration of the
+                         * drag and take capture back on release.
+                         */
+                        title_was_relative = SDL_GetWindowRelativeMouseMode(v->win);
+                        if (title_was_relative)
+                            SDL_SetWindowRelativeMouseMode(v->win, false);
+
                         SDL_GetGlobalMouseState(&press_gx, &press_gy);
                         SDL_GetWindowPosition(v->win, &press_win_x, &press_win_y);
                         to_guest_coords(win_w, win_h, v->src_w, v->src_h,
@@ -504,6 +517,11 @@ int main(int argc, char **argv)
                         ev.button.button == SDL_BUTTON_LEFT) {
                         const bool was_drag = title_dragging;
                         title_press = title_dragging = false;
+
+                        if (title_was_relative) {
+                            SDL_SetWindowRelativeMouseMode(v->win, true);
+                            title_was_relative = false;
+                        }
                         if (!was_drag) {
                             /* A click, not a drag: send it now so the guest's
                              * own close/minimise/maximise buttons respond. */
