@@ -40,6 +40,41 @@ static void to_float(const BYTE* src, const WAVEFORMATEX* wfx,
     }
 }
 
+/*
+ * Fold multichannel down to stereo before it goes anywhere.
+ *
+ * This endpoint is 7.1, so the stream is 48 kHz by 8 channels of float - about
+ * 1.5 MB/s, four times what stereo needs, down the same control channel as
+ * input. Audio that the link cannot keep up with backs up in socket buffers and
+ * arrives seconds late, which is exactly the symptom.
+ *
+ * Centre and the surrounds are attenuated into both sides rather than dropped:
+ * dialogue lives in the centre channel and would otherwise go missing. LFE is
+ * left out, being neither reproducible on most desktop outputs nor worth the
+ * headroom.
+ */
+static void downmix_stereo(const std::vector<float>& in, std::uint32_t frames,
+                           std::uint32_t ch, std::vector<float>& out) {
+    out.resize(static_cast<std::size_t>(frames) * 2);
+
+    for (std::uint32_t f = 0; f < frames; f++) {
+        const float* src = &in[static_cast<std::size_t>(f) * ch];
+        float l = src[0], r = src[1];
+
+        if (ch >= 3) { const float c = src[2] * 0.707f; l += c; r += c; }
+        if (ch >= 6) { l += src[4] * 0.5f; r += src[5] * 0.5f; }
+        if (ch >= 8) { l += src[6] * 0.5f; r += src[7] * 0.5f; }
+
+        if (l >  1.0f) l =  1.0f;
+        if (l < -1.0f) l = -1.0f;
+        if (r >  1.0f) r =  1.0f;
+        if (r < -1.0f) r = -1.0f;
+
+        out[static_cast<std::size_t>(f) * 2 + 0] = l;
+        out[static_cast<std::size_t>(f) * 2 + 1] = r;
+    }
+}
+
 void AudioCapture::Impl::run(Sink sink) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
 
@@ -90,7 +125,7 @@ void AudioCapture::Impl::run(Sink sink) {
     std::fprintf(stderr, "sash: audio %lu Hz, %u channels, %u-bit\n",
                  wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample);
 
-    std::vector<float> samples;
+    std::vector<float> samples, stereo;
     while (!stop.load()) {
         UINT32 packet = 0;
         if (FAILED(capture->GetNextPacketSize(&packet))) break;
@@ -110,8 +145,14 @@ void AudioCapture::Impl::run(Sink sink) {
                 } else {
                     to_float(data, wfx, frames, samples);
                 }
-                if (!samples.empty())
-                    sink(samples.data(), frames, wfx->nSamplesPerSec, wfx->nChannels);
+                if (!samples.empty()) {
+                    if (wfx->nChannels > 2) {
+                        downmix_stereo(samples, frames, wfx->nChannels, stereo);
+                        sink(stereo.data(), frames, wfx->nSamplesPerSec, 2);
+                    } else {
+                        sink(samples.data(), frames, wfx->nSamplesPerSec, wfx->nChannels);
+                    }
+                }
             }
 
             capture->ReleaseBuffer(frames);

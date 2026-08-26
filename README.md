@@ -178,12 +178,18 @@ playback stream on the first block that arrives, matching whatever rate and
 channel count the guest is actually producing rather than asking for a format
 and making somebody resample.
 
-Audio currently arrives late - a standing queue of roughly 400ms was measured -
-and is sent at whatever channel count the guest endpoint uses, which here is
-7.1. An attempt at both (folding to stereo in the guest, trimming the host
-queue) collapsed the *video* stream to about one frame every twenty seconds and
-was reverted. Which of those changes did it is not yet known; they need
-reintroducing one at a time with the frame rate watched after each.
+Multichannel is folded to stereo **in the guest**. This endpoint is 7.1, so the
+stream was 48 kHz by 8 channels of float - about 1.5 MB/s, four times what
+stereo needs, down the same control channel as input. Audio the link cannot keep
+up with backs up in socket buffers and arrives late. Centre and the surrounds
+are attenuated into both sides rather than dropped, since dialogue lives in the
+centre channel.
+
+An earlier attempt bundled this with host-side queue trimming and logging, and
+collapsed the *video* stream to about a frame every twenty seconds. Reintroduced
+on its own, with the frame rate measured after: 60 and 51 fps, unaffected. So
+the collapse was one of the host-side changes, and those stay out until they can
+be tried the same way.
 
 Audio does not go through the shared region. It is tiny beside video - a tenth
 of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
