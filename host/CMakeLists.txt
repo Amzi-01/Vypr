@@ -16,3 +16,12 @@ target_link_libraries(sash-host PRIVATE SDL3::SDL3)
 add_executable(sash-testsrc ../tools/sash-testsrc.c src/shm.c)
 target_include_directories(sash-testsrc PRIVATE src ../include)
 target_link_libraries(sash-testsrc PRIVATE m)
+
+# The guest agent's publish path, compiled for Linux and run against the host
+# client. Proves the frame handoff without a Windows toolchain.
+enable_language(CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(sash-testagent ../tools/sash-testagent.cpp ../guest/src/publisher.cpp src/shm.c)
+target_include_directories(sash-testagent PRIVATE src ../include ../guest/src)

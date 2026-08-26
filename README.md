@@ -94,10 +94,11 @@ requires dropping `SDL_Renderer` for direct EGL or Vulkan.
 | `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
 | `host/src/main.c` — present a slot as a native window | working |
 | `tools/sash-testsrc.c` — reference producer | working |
+| Guest agent — publish path (`guest/src/publisher.cpp`) | **verified on Linux**, 1080p60, 0 drops |
+| Guest agent — WGC capture, IVSHMEM mapping, input | written, unbuilt (no toolchain in guest yet) |
+| IVSHMEM device on the VM | added — 512 MB, PCI 08:02, host stack verified against it |
+| IVSHMEM driver in the guest | installing |
 | Control channel — host end | not started |
-| Guest agent — WGC capture, publish, input | not started |
-| IVSHMEM device on the VM | not added |
-| IVSHMEM driver in the guest | not installed |
 | Launcher / `.desktop` integration | not started |
 
 ## Building

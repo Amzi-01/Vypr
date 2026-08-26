@@ -1,0 +1,299 @@
+// sash-agent - the guest half.
+//
+// Connects to the host, offers the windows it can see, and streams whichever
+// ones the host attaches. One process handles every window in the session: WGC
+// capture sessions are cheap, and a single process keeps window identity, input
+// focus and the shared-memory mapping in one place.
+//
+// Must run as the interactive desktop user, not as a service. Session 0 has no
+// DWM to capture from, and SetForegroundWindow does not work from it.
+#include <windows.h>
+
+#include <cstring>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "capture.hpp"
+#include "control.hpp"
+#include "input.hpp"
+#include "ivshmem.hpp"
+#include "publisher.hpp"
+#include "windows_list.hpp"
+
+namespace {
+
+struct Stream {
+    sash::Publisher     pub;
+    sash::WindowCapture capture;
+    std::uint32_t       slot = 0;
+};
+
+class Agent {
+public:
+    bool run(const char* host, std::uint16_t port);
+
+private:
+    void on_message(std::uint16_t type, const std::uint8_t* payload, std::uint32_t bytes);
+    void handle_attach(const sash_msg_attach& msg);
+    void handle_detach(std::uint64_t window_id);
+    void watch_windows();
+
+    sash::Region  region_;
+    sash::Control control_;
+
+    std::mutex                                          lock_;
+    std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
+    std::map<std::uint64_t, sash::WindowInfo>           known_;
+
+    std::atomic<bool> stop_{false};
+};
+
+// Payload is attacker-adjacent only in the sense that a host bug should not
+// crash the agent; check the size before reinterpreting.
+template <typename T>
+const T* as(const std::uint8_t* payload, std::uint32_t bytes) {
+    return bytes >= sizeof(T) ? reinterpret_cast<const T*>(payload) : nullptr;
+}
+
+void Agent::handle_attach(const sash_msg_attach& msg) {
+    HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(msg.window_id));
+
+    sash_msg_attach_result result{};
+    result.window_id = msg.window_id;
+    result.slot      = msg.slot;
+
+    if (!IsWindow(hwnd)) {
+        result.status = -1;
+        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+
+    auto stream = std::make_unique<Stream>();
+    stream->slot = msg.slot;
+
+    if (!stream->pub.bind(region_.base(), region_.bytes(), msg.slot)) {
+        std::fprintf(stderr, "sash: slot %u not armed for us; host re-carved the region\n",
+                     msg.slot);
+        result.status = -2;
+        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+
+    if (!stream->capture.start(hwnd, &stream->pub)) {
+        result.status = -3;
+        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        streams_[msg.window_id] = std::move(stream);
+    }
+
+    result.status = 0;
+    control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+    std::fprintf(stderr, "sash: streaming HWND %p into slot %u\n",
+                 reinterpret_cast<void*>(hwnd), msg.slot);
+}
+
+void Agent::handle_detach(std::uint64_t window_id) {
+    std::unique_ptr<Stream> dying;
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        auto it = streams_.find(window_id);
+        if (it == streams_.end()) return;
+        dying = std::move(it->second);
+        streams_.erase(it);
+    }
+    // Destroyed outside the lock: stopping a capture waits for an in-flight
+    // frame callback, which itself wants the lock.
+    dying->capture.stop();
+    dying->pub.close();
+}
+
+void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uint32_t bytes) {
+    switch (type) {
+    case SASH_MSG_ATTACH:
+        if (auto* m = as<sash_msg_attach>(payload, bytes)) handle_attach(*m);
+        break;
+    case SASH_MSG_DETACH:
+        if (auto* m = as<sash_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
+        break;
+    case SASH_MSG_POINTER:
+        if (auto* m = as<sash_msg_pointer>(payload, bytes)) sash::inject_pointer(*m);
+        break;
+    case SASH_MSG_KEY:
+        if (auto* m = as<sash_msg_key>(payload, bytes)) sash::inject_key(*m);
+        break;
+    case SASH_MSG_TEXT:
+        if (bytes > sizeof(sash_msg_window_id)) {
+            auto* m = reinterpret_cast<const sash_msg_window_id*>(payload);
+            sash::inject_text(m->window_id,
+                              reinterpret_cast<const char*>(payload + sizeof(*m)),
+                              bytes - static_cast<std::uint32_t>(sizeof(*m)));
+        }
+        break;
+    case SASH_MSG_FOCUS:
+        if (auto* m = as<sash_msg_window_id>(payload, bytes)) sash::focus_window(m->window_id);
+        break;
+    case SASH_MSG_CLOSE:
+        if (auto* m = as<sash_msg_window_id>(payload, bytes)) sash::close_window(m->window_id);
+        break;
+    case SASH_MSG_RESIZE:
+        if (auto* m = as<sash_msg_resize>(payload, bytes)) sash::resize_window(*m);
+        break;
+    case SASH_MSG_LAUNCH: {
+        std::wstring cmd;
+        {
+            const int n = MultiByteToWideChar(CP_UTF8, 0,
+                                              reinterpret_cast<const char*>(payload),
+                                              static_cast<int>(bytes), nullptr, 0);
+            cmd.resize(static_cast<std::size_t>(n));
+            MultiByteToWideChar(CP_UTF8, 0, reinterpret_cast<const char*>(payload),
+                                static_cast<int>(bytes), cmd.data(), n);
+        }
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                           nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        } else {
+            std::fprintf(stderr, "sash: launch failed: %lu\n", GetLastError());
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Polling rather than a shell hook: a WinEvent hook needs a message loop in
+// every process it watches, and window geometry has to be re-read on a timer
+// anyway to notice a resize that WGC reports but nobody sent an event for.
+void Agent::watch_windows() {
+    while (!stop_) {
+        auto current = sash::list_windows();
+
+        std::map<std::uint64_t, sash::WindowInfo> now;
+        for (auto& w : current) now[w.desc.window_id] = w;
+
+        for (auto& [id, info] : now) {
+            auto it = known_.find(id);
+            if (it == known_.end()) {
+                control_.send_window(SASH_MSG_WINDOW_ADDED, info.desc, info.title);
+            } else if (it->second.desc.width  != info.desc.width  ||
+                       it->second.desc.height != info.desc.height ||
+                       it->second.desc.flags  != info.desc.flags  ||
+                       it->second.title       != info.title) {
+                control_.send_window(SASH_MSG_WINDOW_CHANGED, info.desc, info.title);
+            }
+        }
+        for (auto& [id, info] : known_) {
+            if (now.find(id) == now.end()) {
+                sash_msg_window_id gone{ id };
+                control_.send(SASH_MSG_WINDOW_REMOVED, &gone, sizeof(gone));
+                handle_detach(id);
+            }
+        }
+        known_.swap(now);
+
+        // A stream whose window outgrew its ring needs a bigger one; report the
+        // new size and let the host re-attach.
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            for (auto& [id, s] : streams_) {
+                if (!s->capture.needs_bigger_ring()) continue;
+                auto it = known_.find(id);
+                if (it == known_.end()) continue;
+                std::uint32_t w = 0, h = 0;
+                s->capture.content_size(&w, &h);
+                auto desc = it->second.desc;
+                desc.width = w;
+                desc.height = h;
+                control_.send_window(SASH_MSG_WINDOW_CHANGED, desc, it->second.title);
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+bool Agent::run(const char* host, std::uint16_t port) {
+    if (!sash::capture_supported()) {
+        std::fprintf(stderr,
+            "sash: Windows.Graphics.Capture is unavailable.\n"
+            "      Needs Windows 10 1903 or newer, and a display attached to the GPU -\n"
+            "      with no monitor or dummy plug DWM has nothing to composite.\n");
+        return false;
+    }
+
+    if (!control_.connect(host, port)) return false;
+    std::fprintf(stderr, "sash: control channel up to %s:%u\n", host, port);
+
+    // The region only exists once the host has formatted it, so this comes
+    // after the connection rather than before.
+    for (int attempt = 0; attempt < 20 && !region_.open(); attempt++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    if (!region_.valid()) return false;
+
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+
+    sash_msg_hello hello{};
+    hello.version      = SASH_PROTO_VERSION;
+    hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
+    hello.shm_bytes    = region_.bytes();
+    hello.agent_pid    = GetCurrentProcessId();
+    hello.capabilities = SASH_CAP_RESIZE;
+    control_.send(SASH_MSG_HELLO, &hello, sizeof(hello));
+
+    std::thread watcher([this] { watch_windows(); });
+
+    control_.run([this](std::uint16_t t, const std::uint8_t* p, std::uint32_t n) {
+        on_message(t, p, n);
+    });
+
+    stop_ = true;
+    watcher.join();
+
+    for (auto& [id, s] : streams_) {
+        s->capture.stop();
+        s->pub.close();
+    }
+    streams_.clear();
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const char*   host = "192.168.122.1";   // the virtual bridge's host address
+    std::uint16_t port = SASH_CONTROL_PORT;
+
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--host") && i + 1 < argc)      host = argv[++i];
+        else if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+        else {
+            std::fputs("usage: sash-agent [--host ADDR] [--port N]\n", stderr);
+            return 2;
+        }
+    }
+
+    // Per-monitor DPI aware: without this Windows lies about client-area sizes
+    // on a scaled display and the captured surface stops matching the geometry
+    // the host is told.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    Agent agent;
+    return agent.run(host, port) ? 0 : 1;
+}
