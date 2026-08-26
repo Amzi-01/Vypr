@@ -85,6 +85,20 @@ in ~2 ms and lets the upload overlap, so it is now the default.
 uploading from the mapped region directly via a persistently mapped PBO, which
 requires dropping `SDL_Renderer` for direct EGL or Vulkan.
 
+## It works
+
+A Windows Notepad window from the guest, presented as an ordinary window on the
+Linux desktop, at 60 fps with no codec anywhere in the path:
+
+```
+sashd: guest window 'Untitled - Notepad' 2858x1460
+sashd: window 'Untitled - Notepad' -> slot 0, pid 190725
+sash:  streaming HWND 00000000000801FC into slot 0
+
+slot 0 state   : LIVE      frame size : 2860x1536  stride 12544
+serial         : 1947 -> 2067   (60.0 fps)
+```
+
 ## Status
 
 | Component | State |
@@ -96,10 +110,12 @@ requires dropping `SDL_Renderer` for direct EGL or Vulkan.
 | `host/src/present_gpu.c` — SDL_GPU upload path | working, 4x faster at 4K |
 | `host/src/present_render.c` — SDL_Renderer path | kept for comparison |
 | `tools/sash-testsrc.c` — reference producer | working |
-| Guest agent — publish path (`guest/src/publisher.cpp`) | **verified on Linux**, 1080p60, 0 drops |
-| Guest agent — WGC capture, IVSHMEM mapping, input | written, unbuilt (no toolchain in guest yet) |
-| IVSHMEM device on the VM | added — 512 MB, PCI 08:02, host stack verified against it |
-| IVSHMEM driver in the guest | installing |
+| Guest agent — publish path (`guest/src/publisher.cpp`) | verified on Linux, 1080p60, 0 drops |
+| Guest agent — WGC capture | **working** — Notepad at 60 fps |
+| Guest agent — IVSHMEM mapping | **working** — self-identifies by magic |
+| Guest agent — input injection | written, not yet exercised |
+| IVSHMEM device on the VM | added — 512 MB, PCI 08:02 |
+| IVSHMEM driver in the guest | installed with Looking Glass |
 | `host/src/sashd.c` — session daemon | working, verified end to end |
 | `host/src/msg.c` — framing, shared by both host processes | done |
 | Input path — pointer, keys, focus, resize, close | working, verified |

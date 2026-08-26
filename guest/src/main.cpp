@@ -9,6 +9,9 @@
 // DWM to capture from, and SetForegroundWindow does not work from it.
 #include <windows.h>
 
+#include <winrt/Windows.Foundation.h>
+
+#include <cstdlib>
 #include <cstring>
 
 #include <atomic>
@@ -292,7 +295,16 @@ int main(int argc, char** argv) {
     // Per-monitor DPI aware: without this Windows lies about client-area sizes
     // on a scaled display and the captured surface stops matching the geometry
     // the host is told.
+    // Unbuffered, because the interesting output is whatever was printed
+    // immediately before a crash - buffered stderr loses exactly that.
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Every WinRT type used here needs an initialised apartment first.
+    // Multi-threaded because the frame pool is free-threaded: frames arrive on
+    // a pool thread rather than through a message loop.
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
     Agent agent;
     return agent.run(host, port) ? 0 : 1;

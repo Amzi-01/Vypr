@@ -15,7 +15,19 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+
+// Step-by-step tracing of capture startup, off unless SASH_TRACE is set. It is
+// worth keeping: the failure that cost the most here was a crash partway
+// through start(), and knowing which step it reached is what identified it.
+static bool trace_enabled() {
+    static const bool on = std::getenv("SASH_TRACE") != nullptr;
+    return on;
+}
+#define TRACE(...) do { if (trace_enabled()) { \
+    std::fprintf(stderr, "  [cap] " __VA_ARGS__); std::fputc('\n', stderr); } } while (0)
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -93,6 +105,9 @@ bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
 }
 
 void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
+    static bool first = true;
+    if (first) { first = false; TRACE("first frame callback"); }
+
     auto frame = sender.TryGetNextFrame();
     if (!frame) return;
 
@@ -179,6 +194,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     }
     stop();
 
+    TRACE("entered start");
     HWND hwnd = static_cast<HWND>(hwnd_raw);
     if (!IsWindow(hwnd)) return false;
 
@@ -193,6 +209,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
         return false;
     }
 
+    TRACE("d3d11 device ok");
     auto dxgi = impl_->device.as<IDXGIDevice>();
     com_ptr<::IInspectable> inspectable;
     if (FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), inspectable.put()))) {
@@ -201,6 +218,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     }
     impl_->rt_device = inspectable.as<IDirect3DDevice>();
 
+    TRACE("rt device ok");
     auto interop = get_activation_factory<GraphicsCaptureItem, ::IGraphicsCaptureItemInterop>();
     if (FAILED(interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(),
                                         put_abi(impl_->item)))) {
@@ -208,6 +226,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
         return false;
     }
 
+    TRACE("capture item ok");
     const auto size = impl_->item.Size();
 
     // Free-threaded: frames arrive on a pool thread rather than needing a
@@ -215,21 +234,37 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     impl_->pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         impl_->rt_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
 
+    TRACE("frame pool ok");
     impl_->pub = pub;
     impl_->frame_token = impl_->pool.FrameArrived(auto_revoke,
         [this](const Direct3D11CaptureFramePool& sender, const auto&) {
             impl_->on_frame(sender);
         });
 
+    TRACE("handler registered");
     impl_->session = impl_->pool.CreateCaptureSession(impl_->item);
 
-    // The host draws its own cursor from the CURSOR message, so the guest one
-    // must not be burned into the pixels.
-    try { impl_->session.IsCursorCaptureEnabled(false); } catch (...) {}
-    // Removes the yellow capture border. Only on Windows 10 2004+, so a failure
-    // here is cosmetic, not fatal.
-    try { impl_->session.IsBorderRequired(false); } catch (...) {}
+    // Both of these are optional interfaces on newer Windows, and both must be
+    // reached through try_as rather than called directly.
+    //
+    // A direct call is not merely unsupported on an older build - it crashes.
+    // C++/WinRT's property shim reinterpret-casts the object to the interface
+    // instead of doing a QueryInterface, so calling a method the runtime class
+    // does not implement dispatches through a vtable that is not there. That is
+    // an access violation, which no try/catch will save you from. try_as does a
+    // real QueryInterface and returns null.
+    //
+    // IsCursorCaptureEnabled is IGraphicsCaptureSession2 (Windows 10 2004+).
+    // The host draws its own cursor, so the guest's must not be in the pixels.
+    if (auto s2 = impl_->session.try_as<IGraphicsCaptureSession2>())
+        s2.IsCursorCaptureEnabled(false);
 
+    // IsBorderRequired is IGraphicsCaptureSession3 - Windows 11 22000+ only.
+    // On Windows 10 the yellow capture border stays; cosmetic, not fatal.
+    if (auto s3 = impl_->session.try_as<IGraphicsCaptureSession3>())
+        s3.IsBorderRequired(false);
+
+    TRACE("session created; starting");
     impl_->session.StartCapture();
     return true;
 }

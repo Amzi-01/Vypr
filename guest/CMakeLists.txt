@@ -31,7 +31,7 @@ target_compile_definitions(sash-agent PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
-target_compile_options(sash-agent PRIVATE /W4 /permissive- /EHsc)
+target_compile_options(sash-agent PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus /bigobj)
 
 target_link_libraries(sash-agent PRIVATE
     d3d11 dxgi windowsapp setupapi ws2_32 dwmapi user32

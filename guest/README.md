@@ -29,7 +29,7 @@ sash-agent.exe --host 192.168.122.1
 Must run **as the interactive desktop user**, never as a service. Session 0 has
 no DWM to capture from, and `SetForegroundWindow` does not work from it.
 
-## Two things that will bite
+## Two more things that will bite
 
 **Two IVSHMEM devices now exist** on this VM - Looking Glass's and sash's - and
 the same driver binds both. The agent does not select by device index, which
@@ -44,13 +44,37 @@ DWM's composited per-window surfaces; with no monitor or dummy plug there is
 nothing composited and `GraphicsCaptureSession::IsSupported()` is the least of
 the problems.
 
-## Unverified
+## Verified working
 
-Written but never compiled - there is no Windows toolchain in the guest yet. The
-frame handoff underneath it *is* verified: `publisher.cpp` is compiled on Linux
-and run against the real host client by `tools/sash-testagent.cpp`, at 1080p60
-with zero drops. What that leaves unproven is capture, the IVSHMEM mapping, and
-input - not the seqlock ordering or ring arithmetic.
+Built with MSVC 14.44 against Windows SDK 10.0.22621 and run against `sashd`:
+Notepad from the guest presented as a native Linux window at **60 fps**, with
+WGC capture, the IVSHMEM mapping and the control channel all live.
+
+Two things that cost real time, both worth knowing:
+
+**Optional WinRT interfaces must be reached through `try_as`, never called
+directly.** `GraphicsCaptureSession.IsBorderRequired` is `IGraphicsCaptureSession3`
+- Windows 11 22000+ - and this guest is Windows 10 19045. C++/WinRT's property
+shim reinterpret-casts the object to the interface rather than doing a
+QueryInterface, so calling a method the runtime class does not implement
+dispatches through a vtable that is not there. That is an access violation, and
+**no try/catch will catch it**. `IsCursorCaptureEnabled` has the same shape
+(`IGraphicsCaptureSession2`, Windows 10 2004+) and got the same treatment.
+
+**The agent cannot run from an SSH session.** `GraphicsCaptureSession::IsSupported()`
+returns false there because the session has no desktop. Launch it in the console
+session instead:
+
+```
+schtasks /create /tn sash-agent /tr "cmd /c C:\sash\guest\build\sash-agent.exe --host 192.168.122.1 > C:\sash\agent.log 2>&1" /sc once /st 00:00 /it /f
+schtasks /run /tn sash-agent
+```
+
+Set `SASH_TRACE=1` for step-by-step tracing of capture startup.
+
+## Still unproven
+
+Input injection, cursor shapes, popups and menus, reconnect, and DPI scaling.
 
 The IVSHMEM IOCTL numbers in `ivshmem.cpp` were checked against the installed
 driver (2025-03-06) by reading its PDB and image rather than by compiling: the

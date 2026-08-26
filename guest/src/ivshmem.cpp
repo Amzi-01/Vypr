@@ -1,6 +1,9 @@
 #include "ivshmem.hpp"
 
 #include <windows.h>
+// CTL_CODE and the METHOD_/FILE_ constants live here. WIN32_LEAN_AND_MEAN keeps
+// windows.h from pulling it in, so it has to be asked for explicitly.
+#include <winioctl.h>
 #include <setupapi.h>
 #include <initguid.h>
 
@@ -70,7 +73,9 @@ bool Region::try_device(const wchar_t* path) {
     DWORD returned = 0;
     if (!DeviceIoControl(h, IOCTL_IVSHMEM_REQUEST_MMAP, &cfg, sizeof(cfg),
                          &map, sizeof(map), &returned, nullptr)) {
-        std::fprintf(stderr, "sash: IVSHMEM mmap failed on a device: %lu\n", GetLastError());
+        // Expected for any device another process already holds - Looking
+        // Glass's host keeps its own region mapped. Only interesting if no
+        // device works at all, which open() reports.
         CloseHandle(h);
         return false;
     }

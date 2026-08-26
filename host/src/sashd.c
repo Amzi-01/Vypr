@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -306,7 +307,7 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
 
 /* --------------------------------------------------------------------- setup */
 
-static int listen_tcp(uint16_t port)
+static int listen_tcp(const char *bind_addr, uint16_t port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
@@ -315,9 +316,15 @@ static int listen_tcp(uint16_t port)
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     struct sockaddr_in addr = {0};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port        = htons(port);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    if (!bind_addr || !strcmp(bind_addr, "any")) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        fprintf(stderr, "sashd: '%s' is not an address\n", bind_addr);
+        close(fd);
+        return -1;
+    }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "sashd: bind :%u: %s\n", port, strerror(errno));
@@ -358,11 +365,13 @@ static void find_self_dir(struct daemon *d)
 
 static void usage(void)
 {
-    fputs("usage: sashd [--shm PATH] [--port N] [--match SUBSTR]... [--all]\n"
+    fputs("usage: sashd [--shm PATH] [--bind ADDR] [--port N] [--match SUBSTR]... [--all]\n"
           "             [--launch 'C:\\path\\app.exe']\n"
           "\n"
           "  --match  stream guest windows whose title contains SUBSTR (repeatable)\n"
           "  --all    stream every guest window; useful for seeing what is there\n"
+          "  --bind   interface to accept the agent on; defaults to the virtual\n"
+          "           bridge (192.168.122.1). 'any' listens everywhere.\n"
           "  --launch ask the agent to start this command once it connects\n", stderr);
 }
 
@@ -372,12 +381,17 @@ int main(int argc, char **argv)
     d.shm_path   = "/dev/shm/sash";
     d.agent_fd   = -1;
     uint16_t port = SASH_CONTROL_PORT;
+    /* The guest reaches the host across the virtual bridge, so that is the only
+     * interface the control port ever needs to exist on. Listening on every
+     * interface would put it on the real network too. */
+    const char *bind_addr = "192.168.122.1";
 
     for (int i = 0; i < MAX_WINDOWS; i++) d.windows[i].client_fd = -1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shm") && i + 1 < argc)    d.shm_path = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_addr = argv[++i];
         else if (!strcmp(argv[i], "--match") && i + 1 < argc) {
             if (d.match_count < MAX_MATCH) d.match[d.match_count++] = argv[++i];
         }
@@ -406,12 +420,12 @@ int main(int argc, char **argv)
      * from Looking Glass's, so it must already be there when it connects. */
     if (sash_shm_open(&d.shm, d.shm_path, 1) < 0) return 1;
 
-    d.tcp_listen  = listen_tcp(port);
+    d.tcp_listen  = listen_tcp(bind_addr, port);
     d.unix_listen = listen_unix(d.unix_path);
     if (d.tcp_listen < 0 || d.unix_listen < 0) return 1;
 
-    fprintf(stderr, "sashd: region %s (%.0f MiB), waiting for agent on :%u\n",
-            d.shm_path, d.shm.bytes / 1048576.0, port);
+    fprintf(stderr, "sashd: region %s (%.0f MiB), waiting for agent on %s:%u\n",
+            d.shm_path, d.shm.bytes / 1048576.0, bind_addr, port);
 
     struct msg_reader client_rx[MAX_WINDOWS] = {0};
     struct window    *client_owner[MAX_WINDOWS] = {0};
