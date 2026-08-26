@@ -530,7 +530,15 @@ int main(int argc, char **argv)
                  * grabbed the pointer must always be escapable, and the guest's
                  * own detection can miss a fullscreen app that leaves the
                  * cursor nominally visible. */
-                if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_M &&
+                /*
+                 * Matched on scancode, not keycode. A keycode is what the key
+                 * produces *after* the layout and modifiers are applied, so
+                 * with Ctrl+Alt+Shift held it is not necessarily SDLK_M at all
+                 * and the chord silently never fires. The scancode is the
+                 * physical key regardless of what is held down with it.
+                 */
+                if (ev.type == SDL_EVENT_KEY_DOWN &&
+                    ev.key.scancode == SDL_SCANCODE_M &&
                     (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_SHIFT)) {
                     capture_forced = !capture_forced;
                     set_capture(views[0].win, pointer_locked || capture_forced, true);
