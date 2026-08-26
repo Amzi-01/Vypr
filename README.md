@@ -181,7 +181,14 @@ release together - so those buttons still act on the guest window.
 Forwarding the drag instead would move the window inside the guest, which is
 invisible from here: the captured image *is* the window, so it looks like
 nothing happened. The guest reports the height of its own title bar
-(`chrome_top`) because the host cannot otherwise know where that strip ends.
+(`chrome_top`), kept current as the window changes - sent only once it goes
+stale the moment a window is maximised or switches to fullscreen, and a stale
+value means drags leak through again.
+
+A window with custom-drawn chrome reports no title bar at all - FiveM's launcher
+is one - so a window without a Win32 title bar still gets a strip of its own,
+sized like an ordinary one. Otherwise those windows can only ever be dragged
+inside the VM.
 
 Suppressed while the pointer is captured - a game in mouselook has no title bar
 to grab.
@@ -223,13 +230,11 @@ no pointer in it at all. Capturing it means what the user sees is where the
 guest actually believes the pointer is, which is the only version that can be
 trusted for clicking on things.
 
-**Re-centre the guest cursor.** Relative deltas accumulate into the cursor
-position, so without intervention the cursor walks to a screen edge and stops -
-and every further delta in that direction is discarded, which looks exactly
-like the game ignoring the mouse. Observed jammed at 3839,1863 on a 3840x2160
-screen while the host was still sending perfectly good deltas. A game that
-captures the mouse re-centres it itself, so this is a no-op there; it matters
-precisely in the case that was broken.
+**Do not warp the cursor.** An earlier version re-centred it when it strayed,
+to stop relative deltas jamming it against a screen edge. What the user sees is
+the pointer snapping to the middle of the window while they are using it, which
+is worse than the edge case it guarded against - and an app that genuinely needs
+the cursor centred does that itself.
 
 Capture is also a request the compositor may refuse, so the result is checked -
 silently sending deltas after a refused grab looks exactly like broken input.

@@ -53,7 +53,8 @@ enum sash_msg_type {
     SASH_MSG_CLIENT_HELLO     = 128, /* sash_msg_window_id */
     SASH_MSG_CLIENT_POPUP     = 129, /* sash_msg_client_popup */
     SASH_MSG_CLIENT_POPUP_END = 130, /* sash_msg_window_id */
-    SASH_MSG_CLIENT_LOCK      = 131  /* sash_msg_pointer_lock */
+    SASH_MSG_CLIENT_LOCK      = 131, /* sash_msg_pointer_lock */
+    SASH_MSG_CLIENT_GEOM      = 132  /* sash_msg_client_geom */
 };
 
 /*
@@ -208,6 +209,21 @@ struct sash_msg_resize {
 struct sash_msg_pointer_lock {
     uint64_t window_id;
     uint32_t locked;
+    uint32_t _pad;
+};
+
+/*
+ * Geometry a window client needs to keep current.
+ *
+ * chrome_top decides which part of the window is title bar, and therefore which
+ * presses are held for a possible drag rather than forwarded to the guest. Sent
+ * once at spawn it goes stale the moment the window is maximised, restored, or
+ * switches between windowed and fullscreen - and a stale value means drags get
+ * forwarded and move the window inside the VM instead.
+ */
+struct sash_msg_client_geom {
+    uint64_t window_id;
+    uint32_t chrome_top;
     uint32_t _pad;
 };
 

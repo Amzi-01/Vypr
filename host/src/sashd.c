@@ -304,6 +304,17 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (!wanted) break;
 
         struct window *w = window_find(d, desc->window_id);
+
+        /* Keep the client's notion of the title bar in step with the window. */
+        if (w && w->has_slot && w->client_fd >= 0 &&
+            desc->chrome_top != w->chrome_top) {
+            w->chrome_top = desc->chrome_top;
+            struct sash_msg_client_geom geom = {0};
+            geom.window_id  = w->id;
+            geom.chrome_top = desc->chrome_top;
+            msg_send(w->client_fd, SASH_MSG_CLIENT_GEOM, &geom, sizeof(geom));
+        }
+
         if (w && w->has_slot) {
             /* Outgrew its ring: tear the stream down and re-attach bigger. The
              * alternative, resizing under a live writer, shows a torn frame. */

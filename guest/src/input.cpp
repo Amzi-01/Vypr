@@ -147,41 +147,15 @@ void inject_pointer(const sash_msg_pointer& msg) {
          * which is the case that was broken.
          */
         /*
-         * Only when the app is NOT managing the cursor itself.
+         * The cursor is left where it is.
          *
-         * An app that confines the cursor - ClipCursor to something smaller
-         * than the virtual desktop - is doing warp-based mouselook: it re-
-         * centres every frame and reads the delta from centre. Warping as well
-         * injects a jump it cannot distinguish from real movement, and the view
-         * snaps to a corner. That is a worse failure than the edge-jamming this
-         * was meant to fix, and it only ever applies to apps that leave the
-         * cursor alone.
+         * Warping it back to centre was meant to stop relative deltas jamming
+         * it against a screen edge, but what the user sees is the pointer
+         * snapping to the middle of the window while they are using it. A
+         * visible teleport every time the pointer wanders is worse than the
+         * edge case it was guarding against, and an app that genuinely needs
+         * the cursor centred re-centres it itself.
          */
-        RECT clip{};
-        bool app_owns_cursor = false;
-        if (GetClipCursor(&clip)) {
-            const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            app_owns_cursor = (clip.right - clip.left) < vw ||
-                              (clip.bottom - clip.top) < vh;
-        }
-
-        RECT cap = sash_capture_rect(hwnd);
-        POINT cur{};
-        if (!app_owns_cursor && GetCursorPos(&cur)) {
-            /* A few pixels, not an eighth of the screen. Warping from well
-             * inside the window is visible as the pointer teleporting to the
-             * middle while using a menu; the only thing that must be prevented
-             * is the cursor actually reaching an edge and sticking there. */
-            const LONG margin_x = 4;
-            const LONG margin_y = 4;
-            if (cur.x < cap.left + margin_x || cur.x > cap.right - margin_x ||
-                cur.y < cap.top + margin_y || cur.y > cap.bottom - margin_y) {
-                SetCursorPos((cap.left + cap.right) / 2,
-                             (cap.top + cap.bottom) / 2);
-            }
-        }
-
         INPUT in{};
         in.type = INPUT_MOUSE;
         in.mi.dx = msg.x;

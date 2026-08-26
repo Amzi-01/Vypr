@@ -362,6 +362,17 @@ int main(int argc, char **argv)
      * a click on the close, minimise or maximise button and is forwarded then,
      * press and release together, so those still work.
      */
+    /*
+     * How much of the top of the window is a drag handle.
+     *
+     * Windows reports the height of a real title bar, but a launcher with
+     * custom-drawn chrome has none - FiveM's reports zero - and then a drag
+     * there is forwarded and moves the window inside the VM instead, which is
+     * invisible from here. So a window without a Win32 title bar still gets a
+     * strip, sized like an ordinary one.
+     */
+    enum { DEFAULT_DRAG_STRIP = 32 };
+    uint32_t chrome_top = opt.chrome_top ? opt.chrome_top : DEFAULT_DRAG_STRIP;
     bool  title_press = false, title_dragging = false;
     float press_gx = 0, press_gy = 0;
     int   press_win_x = 0, press_win_y = 0;
@@ -398,12 +409,12 @@ int main(int argc, char **argv)
 
                 /* Title-bar handling, only for the top-level and only when the
                  * pointer is not captured - a game has no title bar to grab. */
-                if (!v->is_popup && opt.chrome_top > 0 &&
+                if (!v->is_popup && chrome_top > 0 &&
                     !(pointer_locked || capture_forced)) {
                     SDL_GetWindowSize(v->win, &win_w, &win_h);
                     const float scale_y = (v->src_h && win_h > 0)
                                         ? (float)win_h / (float)v->src_h : 1.0f;
-                    const float strip = opt.chrome_top * scale_y;
+                    const float strip = chrome_top * scale_y;
 
                     if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                         ev.button.button == SDL_BUTTON_LEFT &&
@@ -603,6 +614,12 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct sash_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == SASH_MSG_CLIENT_GEOM &&
+                               head.bytes >= sizeof(struct sash_msg_client_geom)) {
+                        const struct sash_msg_client_geom *m = (const void *)payload;
+                        if (m->window_id == opt.window_id)
+                            chrome_top = m->chrome_top ? m->chrome_top
+                                                       : DEFAULT_DRAG_STRIP;
                     } else if (head.type == SASH_MSG_CLIENT_LOCK &&
                                head.bytes >= sizeof(struct sash_msg_pointer_lock)) {
                         const struct sash_msg_pointer_lock *m = (const void *)payload;
