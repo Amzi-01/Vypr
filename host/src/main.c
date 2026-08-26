@@ -210,6 +210,46 @@ static void set_capture(SDL_Window *win, bool want, bool announce)
 }
 
 /*
+ * Which parts of the window behave like a title bar.
+ *
+ * A client cannot place its own window on Wayland - the compositor owns
+ * position, xdg_toplevel has no request to set one, and SDL_SetWindowPosition
+ * is simply ignored. Moving a window has to be an *interactive move* the
+ * compositor performs, which is what a hit test asks for.
+ *
+ * The guest's caption buttons live at the top right, so that corner stays
+ * ordinary and its clicks are forwarded - close, minimise and maximise keep
+ * working. The rest of the strip is draggable and the compositor moves the
+ * window, with snapping and everything else it normally does.
+ */
+struct hit_ctx {
+    uint32_t chrome_top;   /* guest pixels */
+    uint32_t src_h;        /* guest pixels, to scale into window pixels */
+    bool     captured;     /* a captured game has no title bar to grab */
+};
+
+static SDL_HitTestResult SDLCALL title_hit_test(SDL_Window *win,
+                                                const SDL_Point *pt, void *data)
+{
+    const struct hit_ctx *ctx = data;
+    if (!ctx || ctx->captured || ctx->chrome_top == 0) return SDL_HITTEST_NORMAL;
+
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+    if (h <= 0 || ctx->src_h == 0) return SDL_HITTEST_NORMAL;
+
+    const float scale = (float)h / (float)ctx->src_h;
+    const float strip = ctx->chrome_top * scale;
+    if (pt->y >= strip) return SDL_HITTEST_NORMAL;
+
+    /* Three caption buttons, each about 1.5x the caption height wide. */
+    const float buttons = ctx->chrome_top * 4.5f * scale;
+    if (pt->x > w - buttons) return SDL_HITTEST_NORMAL;
+
+    return SDL_HITTEST_DRAGGABLE;
+}
+
+/*
  * Pointer motion, gathered up and sent once a frame.
  *
  * A high-polling-rate mouse reports around a thousand times a second. Sending
@@ -390,35 +430,13 @@ int main(int argc, char **argv)
      * that does not depend on guessing. */
     bool capture_forced = opt.capture != 0;
 
-    /*
-     * Dragging the guest's own title bar moves the window on *this* desktop.
-     *
-     * The host window is undecorated, so that strip is the only handle there
-     * is. Forwarding the drag would move the window inside the guest instead,
-     * which is invisible here - the captured image is the window, so it looks
-     * like nothing happened.
-     *
-     * A press in the strip is therefore held rather than sent: if the pointer
-     * moves, it becomes a window drag; if it is released without moving, it was
-     * a click on the close, minimise or maximise button and is forwarded then,
-     * press and release together, so those still work.
-     */
-    /*
-     * How much of the top of the window is a drag handle.
-     *
-     * Windows reports the height of a real title bar, but a launcher with
-     * custom-drawn chrome has none - FiveM's reports zero - and then a drag
-     * there is forwarded and moves the window inside the VM instead, which is
-     * invisible from here. So a window without a Win32 title bar still gets a
-     * strip, sized like an ordinary one.
-     */
-    enum { DEFAULT_DRAG_STRIP = 32 };
+    /* Height of the guest window's own title bar, kept in step with the window
+     * - it changes when a window is maximised, restored or goes fullscreen. */
     uint32_t chrome_reported = opt.chrome_top;
-    bool  title_press = false, title_dragging = false;
-    bool  title_was_relative = false;
-    float press_gx = 0, press_gy = 0;
-    int   press_win_x = 0, press_win_y = 0;
-    int32_t press_guest_x = 0, press_guest_y = 0;
+
+    /* Kept current for the hit test, which decides what is title bar. */
+    struct hit_ctx hit = { opt.chrome_top, 0, false };
+    SDL_SetWindowHitTest(views[0].win, title_hit_test, &hit);
 
     struct pointer_accum pointer = {0};
 
@@ -451,94 +469,9 @@ int main(int argc, char **argv)
             case SDL_EVENT_MOUSE_WHEEL: {
                 if (daemon_fd < 0) break;
 
-                /*
-                 * How much of the top is a drag handle.
-                 *
-                 * A window that really has a Win32 title bar keeps it as a drag
-                 * handle even while the pointer is captured - otherwise the
-                 * drag is forwarded and moves the window inside the VM, which
-                 * is invisible from here. A fullscreen game reports no title
-                 * bar, so it is unaffected.
-                 *
-                 * The fallback strip, for windows that draw their own chrome
-                 * and report nothing, applies only when the pointer is *not*
-                 * captured: a captured game must not have a dead band across
-                 * the top of it.
-                 */
-                uint32_t chrome_top = chrome_reported;
-                if (chrome_top == 0 && !(pointer_locked || capture_forced))
-                    chrome_top = DEFAULT_DRAG_STRIP;
-
-                if (!v->is_popup && chrome_top > 0) {
-                    SDL_GetWindowSize(v->win, &win_w, &win_h);
-                    const float scale_y = (v->src_h && win_h > 0)
-                                        ? (float)win_h / (float)v->src_h : 1.0f;
-                    const float strip = chrome_top * scale_y;
-
-                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
-                        ev.button.button == SDL_BUTTON_LEFT &&
-                        ev.button.y < strip) {
-                        title_press    = true;
-                        title_dragging = false;
-
-                        /*
-                         * Relative mode locks the pointer in place, so the
-                         * global cursor position stops moving and a drag
-                         * measured from it is always zero - the window never
-                         * moves. Let the pointer go for the duration of the
-                         * drag and take capture back on release.
-                         */
-                        title_was_relative = SDL_GetWindowRelativeMouseMode(v->win);
-                        if (title_was_relative)
-                            SDL_SetWindowRelativeMouseMode(v->win, false);
-
-                        SDL_GetGlobalMouseState(&press_gx, &press_gy);
-                        SDL_GetWindowPosition(v->win, &press_win_x, &press_win_y);
-                        to_guest_coords(win_w, win_h, v->src_w, v->src_h,
-                                        ev.button.x, ev.button.y,
-                                        &press_guest_x, &press_guest_y);
-                        break;                      /* held, not sent */
-                    }
-
-                    if (title_press && ev.type == SDL_EVENT_MOUSE_MOTION) {
-                        float gx, gy;
-                        SDL_GetGlobalMouseState(&gx, &gy);
-                        const float dx = gx - press_gx, dy = gy - press_gy;
-                        if (title_dragging || dx * dx + dy * dy > 16.0f) {
-                            title_dragging = true;
-                            SDL_SetWindowPosition(v->win,
-                                                  press_win_x + (int)dx,
-                                                  press_win_y + (int)dy);
-                        }
-                        break;
-                    }
-
-                    if (title_press && ev.type == SDL_EVENT_MOUSE_BUTTON_UP &&
-                        ev.button.button == SDL_BUTTON_LEFT) {
-                        const bool was_drag = title_dragging;
-                        title_press = title_dragging = false;
-
-                        if (title_was_relative) {
-                            SDL_SetWindowRelativeMouseMode(v->win, true);
-                            title_was_relative = false;
-                        }
-                        if (!was_drag) {
-                            /* A click, not a drag: send it now so the guest's
-                             * own close/minimise/maximise buttons respond. */
-                            struct sash_msg_pointer down = {0};
-                            down.window_id = v->window_id;
-                            down.x = press_guest_x;
-                            down.y = press_guest_y;
-                            down.buttons = 1u;
-                            msg_send(daemon_fd, SASH_MSG_POINTER, &down, sizeof(down));
-                            struct sash_msg_pointer up = down;
-                            up.buttons = 0;
-                            msg_send(daemon_fd, SASH_MSG_POINTER, &up, sizeof(up));
-                        }
-                        break;
-                    }
-                }
-
+                /* The hit test handles the title bar; anything arriving here
+                 * is either content or a caption button, and both are the
+                 * guest's business. */
                 float hx, hy;
                 const SDL_MouseButtonFlags held = SDL_GetMouseState(&hx, &hy);
 
@@ -700,6 +633,10 @@ int main(int argc, char **argv)
                 break;
             }
         }
+
+        hit.chrome_top = chrome_reported;
+        hit.src_h      = views[0].src_h;
+        hit.captured   = pointer_locked || capture_forced;
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
