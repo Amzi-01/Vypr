@@ -475,6 +475,7 @@ int main(int argc, char **argv)
     uint16_t audio_channels = 0;
     uint64_t audio_logged_at = 0;
     uint64_t audio_dropped = 0, audio_taken = 0;
+    bool     audio_draining = false;
 
     struct pointer_accum pointer = {0};
 
@@ -798,8 +799,29 @@ int main(int argc, char **argv)
                                  */
                                 const int per_second =
                                     (int)(audio_rate * audio_channels * sizeof(float));
+                                /*
+                                 * Drain to a low mark, then stop - do not
+                                 * simply drop whatever is above a threshold.
+                                 *
+                                 * A bare threshold becomes the steady state:
+                                 * the queue settles just beneath it and packets
+                                 * are shed continuously to hold it there.
+                                 * Measured at 163-187ms queued with 7-25% of
+                                 * packets dropped, heard as sound cutting out
+                                 * at random.
+                                 *
+                                 * With a low mark, a backlog is drained once in
+                                 * a short burst and then nothing is dropped at
+                                 * all until another one forms.
+                                 */
                                 const int queued = SDL_GetAudioStreamQueued(audio);
-                                if (queued < per_second / 5) {   /* under 200ms */
+                                const int high = per_second / 8;    /* 125ms */
+                                const int low  = per_second / 25;   /*  40ms */
+
+                                if (queued > high) audio_draining = true;
+                                else if (queued <= low) audio_draining = false;
+
+                                if (!audio_draining) {
                                     SDL_PutAudioStreamData(audio,
                                                            payload + sizeof(*a), (int)want);
                                     audio_taken++;

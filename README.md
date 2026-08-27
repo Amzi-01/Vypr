@@ -200,8 +200,16 @@ on its own, with the frame rate measured after: 60 and 51 fps, unaffected. So
 the collapse was one of the host-side changes, and those stay out until they can
 be tried the same way.
 
-When the queue runs deep the host drops what arrives until it drains, rather
-than emptying it. Clearing is a hard silence of however much was queued - a
+When the queue runs deep the host drains it to a low mark and then stops, rather
+than shedding whatever sits above a threshold. A bare threshold becomes the
+steady state: the queue settles just beneath it and packets are dropped
+continuously to hold it there. Measured at 163-187 ms queued with 7-25% of
+packets dropped, heard as sound cutting out at random. With a low mark - drain
+below 40 ms once a backlog passes 125 ms - the same backlog costs one short
+burst and then nothing: 49 ms queued and 92 drops, then 53 ms and 16, then 46 ms
+and none.
+
+Clearing is a hard silence of however much was queued - a
 quarter of a second of nothing - and it fired on busy scenes, when the guest
 falls behind and a backlog builds. Busy scenes are loud ones, so the symptom
 was audio cutting out exactly when something loud happened. Dropping loses the
