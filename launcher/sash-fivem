@@ -64,6 +64,23 @@ if ! grep -qi console <<<"$sessions"; then
 fi
 
 # --- the session daemon ----------------------------------------------------
+#
+# A window the user closed is remembered as dismissed, so that an app which
+# ignores WM_CLOSE - as games routinely do - does not have its window reappear
+# seconds later. The cost is that closing such a window leaves the app running
+# with nothing showing it, and no way back.
+#
+# Clicking the icon is the way back: if the game is running but nothing is
+# presenting it, restart the daemon, which forgets what was dismissed.
+if pgrep -x sashd >/dev/null && ! pgrep -x sash-host >/dev/null; then
+    running=$(guest 'tasklist' 2>/dev/null || true)
+    if grep -qi 'GTAProcess' <<<"$running"; then
+        say "Reattaching to the running game..."
+        pkill -x sashd
+        sleep 2
+    fi
+fi
+
 if ! pgrep -x sashd >/dev/null; then
     say "Starting the sash session..."
     [ -x "$SASH/sashd" ] || die "$SASH/sashd is missing - build it first"
