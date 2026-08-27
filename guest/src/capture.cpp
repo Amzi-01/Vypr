@@ -86,6 +86,7 @@ struct WindowCapture::Impl {
 
     std::atomic<std::uint64_t>    captured{0};
     std::atomic<std::uint64_t>    dropped{0};
+    std::atomic<std::uint64_t>    arrived{0};
     std::atomic<bool>             too_big{false};
     std::atomic<std::uint32_t>    content_w{0}, content_h{0};
 
@@ -212,6 +213,7 @@ bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
 void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     static bool first = true;
     if (first) { first = false; TRACE("first frame callback"); }
+    arrived++;
 
     auto frame = sender.TryGetNextFrame();
     if (!frame) return;
@@ -489,5 +491,6 @@ void WindowCapture::content_size(std::uint32_t* w, std::uint32_t* h) const {
 
 std::uint64_t WindowCapture::frames_captured() const { return impl_->captured.load(); }
 std::uint64_t WindowCapture::frames_dropped() const { return impl_->dropped.load(); }
+std::uint64_t WindowCapture::frames_arrived() const { return impl_->arrived.load(); }
 
 }  // namespace vypr

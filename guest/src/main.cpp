@@ -39,6 +39,11 @@ struct Stream {
     vypr::Publisher     pub;
     vypr::WindowCapture capture;
     std::uint32_t       slot = 0;
+
+    /* For noticing that WGC has stopped calling back. */
+    std::uint64_t last_arrived = 0;
+    ULONGLONG     last_change  = 0;
+    unsigned      restarts     = 0;
 };
 
 class Agent {
@@ -380,6 +385,67 @@ void Agent::watch_windows() {
             }
         }
         known_.swap(now);
+
+        // Say, periodically, whether WGC is still delivering. A window that has
+        // stopped producing frames is indistinguishable from one being dropped
+        // unless these are reported separately.
+        {
+            static ULONGLONG last_report = 0;
+            const ULONGLONG t = GetTickCount64();
+            if (t - last_report > 5000) {
+                last_report = t;
+                std::lock_guard<std::mutex> guard(lock_);
+                for (auto& [id, s] : streams_) {
+                    const std::uint64_t arrived = s->capture.frames_arrived();
+                    if (arrived != s->last_arrived) {
+                        s->last_arrived = arrived;
+                        s->last_change  = t;
+                        s->restarts     = 0;
+                    } else if (s->last_change == 0) {
+                        s->last_change = t;
+                    }
+
+                    /*
+                     * WGC stops calling back for a window whose swapchain gets
+                     * promoted past the compositor - a borderless fullscreen
+                     * game going to independent flip does it. Nothing fails:
+                     * the session is still running, we are dropping nothing,
+                     * and the window simply freezes.
+                     *
+                     * Recreating the session against the same window picks the
+                     * new surface up. Bounded, because if it is not coming
+                     * back, restarting forever helps nobody.
+                     */
+                    if (t - s->last_change > 5000 && s->restarts < 5) {
+                        HWND hwnd = reinterpret_cast<HWND>(static_cast<UINT_PTR>(id));
+                        if (IsWindow(hwnd)) {
+                            s->restarts++;
+                            std::fprintf(stderr,
+                                "vypr: hwnd %llx has produced no frames for 5s; "
+                                "restarting capture (attempt %u)\n",
+                                (unsigned long long)id, s->restarts);
+                            s->capture.stop();
+                            if (!s->capture.start(hwnd, &s->pub))
+                                std::fprintf(stderr,
+                                    "vypr: hwnd %llx would not restart\n",
+                                    (unsigned long long)id);
+                            s->last_change = t;
+                        }
+                    }
+
+                    std::uint32_t w = 0, h = 0;
+                    s->capture.content_size(&w, &h);
+                    std::fprintf(stderr,
+                        "vypr: hwnd %llx  wgc callbacks %llu  dropped %llu  "
+                        "content %ux%u%s\n",
+                        (unsigned long long)id,
+                        (unsigned long long)arrived,
+                        (unsigned long long)s->capture.frames_dropped(),
+                        w, h,
+                        s->capture.needs_bigger_ring() ? "  [ring too small]" : "");
+                }
+            }
+        }
 
         // A stream whose window outgrew its ring needs a bigger one; report the
         // new size and let the host re-attach.

@@ -38,6 +38,10 @@ public:
 
     std::uint64_t frames_captured() const;
     std::uint64_t frames_dropped() const;
+    // How many times WGC has called back at all. Distinguishes a capture that
+    // has stopped from one whose frames we are discarding - which look the
+    // same from the host, and both look like a frozen window.
+    std::uint64_t frames_arrived() const;
 
 private:
     struct Impl;

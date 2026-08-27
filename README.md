@@ -231,12 +231,23 @@ Rockstar launcher and the sign-in dialog, not only the main game window - so the
 whole startup sequence is visible rather than a blank wait followed by a game.
 Each appears and closes in turn as its own host window.
 
-**Exclusive fullscreen cannot be captured.** `Windows.Graphics.Capture` reads
-DWM's per-window surfaces, and a game in true exclusive fullscreen bypasses DWM
-entirely — so frames stop with no error anywhere: the process is running, the
-window still reports its size, and audio keeps playing. Set the game to
-**borderless** or **windowed** and it streams normally. A window that goes ten
-seconds without a frame now says so, and says this, rather than sitting black.
+**A window can freeze while everything around it is healthy.** WGC reads DWM's
+per-window surfaces, so anything that takes a window's swapchain past the
+compositor takes the surface with it: true exclusive fullscreen does, and so
+does a *borderless* window whose swapchain is promoted to independent flip.
+Nothing fails when it happens — the process runs, the window reports its size,
+audio keeps playing, no error is raised anywhere, and WGC simply stops calling
+back. Measured on Call of Duty: `wgc callbacks 33, dropped 0`, unchanged across
+every report while the game burned four cores.
+
+Two things follow. Exclusive fullscreen genuinely cannot be captured, so a
+window that produces nothing for ten seconds says so and suggests borderless.
+And because borderless can stall too, the agent restarts the capture session
+against the same `HWND` after five seconds without a callback, up to five
+attempts — recreating the session picks up the new surface. The counters that
+made this diagnosable are reported every five seconds and stay in: a capture
+that has stopped and one whose frames are being discarded look identical from
+the host, and both look like a frozen window.
 
 **Some games hide their window title from matching.** Call of Duty's title
 carries fifty-two `U+200B` ZERO WIDTH SPACE characters, one between every
