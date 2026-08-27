@@ -474,6 +474,7 @@ int main(int argc, char **argv)
     uint32_t audio_rate = 0;
     uint16_t audio_channels = 0;
     uint64_t audio_logged_at = 0;
+    uint64_t audio_dropped = 0, audio_taken = 0;
 
     struct pointer_accum pointer = {0};
 
@@ -798,15 +799,38 @@ int main(int argc, char **argv)
                                 const int per_second =
                                     (int)(audio_rate * audio_channels * sizeof(float));
                                 const int queued = SDL_GetAudioStreamQueued(audio);
-                                if (queued < per_second / 5)     /* under 200ms */
+                                if (queued < per_second / 5) {   /* under 200ms */
                                     SDL_PutAudioStreamData(audio,
                                                            payload + sizeof(*a), (int)want);
+                                    audio_taken++;
+                                } else {
+                                    audio_dropped++;
+                                }
 
-                                if (opt.stats && SDL_GetTicks() - audio_logged_at > 5000) {
+                                /*
+                                 * Reported unconditionally, not behind --stats.
+                                 *
+                                 * Dropping is the only thing here that can be
+                                 * heard as audio cutting out, and it is
+                                 * otherwise invisible: everything else in the
+                                 * path looks healthy while it happens. A line
+                                 * every ten seconds is cheap, and it is the
+                                 * difference between measuring this and
+                                 * guessing at it again.
+                                 */
+                                if (SDL_GetTicks() - audio_logged_at > 10000) {
                                     audio_logged_at = SDL_GetTicks();
-                                    printf("sash: audio queued %.0f ms\n",
-                                           queued * 1000.0 / per_second);
+                                    if (audio_dropped)
+                                        printf("sash: audio queued %.0f ms, dropped %llu of "
+                                               "%llu packets\n",
+                                               queued * 1000.0 / per_second,
+                                               (unsigned long long)audio_dropped,
+                                               (unsigned long long)(audio_dropped + audio_taken));
+                                    else
+                                        printf("sash: audio queued %.0f ms, no drops\n",
+                                               queued * 1000.0 / per_second);
                                     fflush(stdout);
+                                    audio_dropped = audio_taken = 0;
                                 }
                             }
                         }
