@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <urlmon.h>
 #include <string>
@@ -31,15 +32,20 @@
 #define ID_CHK_SSH       1011
 #define ID_CHK_AUTOLOGIN 1012
 #define ID_CHK_PARSEC    1013
+#define ID_PASSWORD      1014
+#define ID_SOURCE_LINK   1015
 #define WM_STEP_DONE     (WM_APP + 1)
 
 static const wchar_t *LG_HOST_URL =
     L"https://looking-glass.io/artifact/stable/host";
 static const wchar_t *PARSEC_VUD_URL =
     L"https://builds.parsec.app/vud/parsec-vud-0.3.10.0.exe";
+static const wchar_t *SOURCE_URL =
+    L"https://github.com/Amzi-01/Vypr/blob/master/install/windows/vypr-setup.cpp";
 
 static HWND g_main, g_log, g_key, g_install, g_progress;
 static HWND g_chk_drivers, g_chk_ssh, g_chk_autologin, g_chk_parsec;
+static HWND g_password, g_pw_label, g_pw_note, g_link;
 static HFONT g_font, g_font_bold;
 static bool  g_failed = false;
 
@@ -336,29 +342,51 @@ static void setup_ssh(const std::wstring &pubkey)
 
 // -------------------------------------------------------------- auto-login
 
-static void setup_autologin()
+static void setup_autologin(std::wstring &password)
 {
     logf(L"Automatic login");
 
     // Without a logged-in session there is no desktop to capture and
-    // interactive scheduled tasks will not run, so a VM that boots to the
-    // lock screen is a VM Vypr cannot use. The password is stored by Windows
-    // in the registry, which is worth knowing before turning this on.
-    logf(L"  [--] this stores your Windows password in the registry in a");
-    logf(L"       recoverable form. It is here because Vypr needs a desktop");
-    logf(L"       to capture; leave it off if that trade is not worth it.");
-
+    // interactive scheduled tasks will not run, so a VM that boots to a lock
+    // screen is a VM Vypr cannot use. This is the only reason the password is
+    // asked for, and the only thing it is used for.
     wchar_t user[256];
     DWORD n = 256;
     GetUserNameW(user, &n);
 
-    std::wstring key = L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
-    run(L"reg add \"" + key + L"\" /v AutoAdminLogon /t REG_SZ /d 1 /f", true);
-    run(L"reg add \"" + key + L"\" /v DefaultUserName /t REG_SZ /d " +
-        std::wstring(user) + L" /f", true);
+    const std::wstring key =
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
 
-    logf(L"  [ok] enabled for %s - set the password with:", user);
-    logf(L"       reg add \"%s\" /v DefaultPassword /t REG_SZ /d YOURPASSWORD /f", key.c_str());
+    run(L"reg add \"" + key + L"\" /v AutoAdminLogon /t REG_SZ /d 1 /f", true);
+    run(L"reg add \"" + key + L"\" /v DefaultUserName /t REG_SZ /d \"" +
+        std::wstring(user) + L"\" /f", true);
+
+    if (password.empty()) {
+        logf(L"  [--] no password given, so this is half-done: Windows will try");
+        logf(L"       to log %s in and stop at the password prompt.", user);
+        SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+        return;
+    }
+
+    // Windows itself reads this value at logon; there is no way to enable
+    // automatic login without it being here, and no encrypted form of it that
+    // Winlogon accepts. Said plainly rather than buried.
+    const DWORD rc = run(L"reg add \"" + key + L"\" /v DefaultPassword /t REG_SZ /d \"" +
+                         password + L"\" /f", true);
+
+    /* Out of this process's memory as soon as it has been handed over. */
+    SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+    password.clear();
+
+    if (rc == 0) {
+        logf(L"  [ok] %s will be logged in automatically at boot", user);
+        logf(L"  [--] Windows stores this password in the registry in a form it");
+        logf(L"       can read back. That is how automatic login works; it is");
+        logf(L"       not something Vypr chose. Anyone with administrator access");
+        logf(L"       to this VM can read it.");
+    } else {
+        step_ok(false, L"could not write the automatic-login password");
+    }
 }
 
 // ------------------------------------------------------------------ driver
@@ -377,11 +405,22 @@ static DWORD WINAPI worker(LPVOID)
     while (!pubkey.empty() && (pubkey.back() == L'\r' || pubkey.back() == L'\n'))
         pubkey.pop_back();
 
+    std::wstring password;
+    if (want_autologin) {
+        int plen = GetWindowTextLengthW(g_password);
+        password.assign(plen + 1, L'\0');
+        GetWindowTextW(g_password, password.data(), plen + 1);
+        password.resize(plen);
+        /* Cleared from the control too, so it is not sitting in a window that
+         * stays open after the work is done. */
+        SetWindowTextW(g_password, L"");
+    }
+
     install_agent();
     if (want_drivers)   install_ivshmem();
     if (want_parsec)    install_parsec_vud();
     if (want_ssh)       setup_ssh(pubkey);
-    if (want_autologin) setup_autologin();
+    if (want_autologin) setup_autologin(password);
 
     PostMessageW(g_main, WM_STEP_DONE, 0, 0);
     return 0;
@@ -424,27 +463,55 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
                           BS_AUTOCHECKBOX, 24, 132, 480, 22, ID_CHK_PARSEC, h);
         g_chk_ssh = mk(L"BUTTON", L"OpenSSH server \x2014 lets the host start things in here",
                        BS_AUTOCHECKBOX, 24, 156, 480, 22, ID_CHK_SSH, h);
-        g_chk_autologin = mk(L"BUTTON", L"Log in automatically \x2014 stores your password in the registry",
+        g_chk_autologin = mk(L"BUTTON",
+                             L"Log in to Windows automatically \x2014 Vypr needs a desktop to capture",
                              BS_AUTOCHECKBOX, 24, 180, 480, 22, ID_CHK_AUTOLOGIN, h);
 
         SendMessageW(g_chk_drivers, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_parsec, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_ssh, BM_SETCHECK, BST_CHECKED, 0);
 
+        g_pw_label = mk(L"STATIC", L"Windows password for this account:",
+                        0, 44, 206, 480, 20, 0, h);
+        g_password = mk(L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL,
+                        44, 226, 300, 24, ID_PASSWORD, h);
+        g_pw_note = mk(L"STATIC",
+            L"Used once, to write Windows' own automatic-login setting. It is "
+            L"not sent anywhere and Vypr does not keep it. Windows stores it in "
+            L"the registry \x2014 that is how automatic login works.",
+            0, 44, 256, 490, 72, 0, h);
+        g_link = mk(L"STATIC", L"Read exactly what this does \x2014 the source of this installer",
+                    SS_NOTIFY, 44, 332, 490, 20, ID_SOURCE_LINK, h);
+
+        /* Off until asked for, so the field cannot be filled in by habit. */
+        EnableWindow(g_password, FALSE);
+        EnableWindow(g_pw_label, FALSE);
+
         mk(L"STATIC", L"Host public key (the Linux installer printed this):",
-           0, 24, 216, 480, 20, 0, h);
+           0, 24, 368, 480, 20, 0, h);
         g_key = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
-                   24, 238, 520, 24, ID_KEY, h);
+                   24, 390, 520, 24, ID_KEY, h);
 
         g_log = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOSEL,
-                   24, 276, 520, 190, ID_LOG, h);
+                   24, 428, 520, 186, ID_LOG, h);
 
         g_install = mk(L"BUTTON", L"Install", BS_DEFPUSHBUTTON,
-                       444, 478, 100, 30, ID_INSTALL, h);
+                       444, 626, 100, 30, ID_INSTALL, h);
         return 0;
     }
 
     case WM_COMMAND:
+        if (LOWORD(w) == ID_CHK_AUTOLOGIN) {
+            const BOOL on = SendMessageW(g_chk_autologin, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            EnableWindow(g_password, on);
+            EnableWindow(g_pw_label, on);
+            if (!on) SetWindowTextW(g_password, L"");
+            return 0;
+        }
+        if (LOWORD(w) == ID_SOURCE_LINK && HIWORD(w) == STN_CLICKED) {
+            ShellExecuteW(nullptr, L"open", SOURCE_URL, nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
         if (LOWORD(w) == ID_INSTALL) {
             EnableWindow(g_install, FALSE);
             SendMessageW(g_log, LB_RESETCONTENT, 0, 0);
@@ -468,6 +535,7 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)w, TRANSPARENT);
+        if ((HWND)l == g_link) SetTextColor((HDC)w, RGB(0, 90, 200));
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 
     case WM_DESTROY:
@@ -492,7 +560,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_VYPR));
     RegisterClassExW(&wc);
 
-    RECT r{0, 0, 570, 550};
+    RECT r{0, 0, 570, 676};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME, FALSE);
     g_main = CreateWindowExW(0, L"VyprSetup", L"Vypr Setup",
                              (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX),
