@@ -231,6 +231,28 @@ Rockstar launcher and the sign-in dialog, not only the main game window - so the
 whole startup sequence is visible rather than a blank wait followed by a game.
 Each appears and closes in turn as its own host window.
 
+**Exclusive fullscreen cannot be captured.** `Windows.Graphics.Capture` reads
+DWM's per-window surfaces, and a game in true exclusive fullscreen bypasses DWM
+entirely — so frames stop with no error anywhere: the process is running, the
+window still reports its size, and audio keeps playing. Set the game to
+**borderless** or **windowed** and it streams normally. A window that goes ten
+seconds without a frame now says so, and says this, rather than sitting black.
+
+**Some games hide their window title from matching.** Call of Duty's title
+carries fifty-two `U+200B` ZERO WIDTH SPACE characters, one between every
+visible character, so the title that reads `Call of Duty: Modern Warfare II`
+contains the substring `Call` nowhere in it — and it is invisible in any log you
+print it to. Titles are therefore reduced to letters and digits, lowercased,
+before matching, on both sides. The same pass absorbs the ordinary reasons a
+title does not match what someone typed: `®`, colons and spacing.
+
+**Steam games** are registered by their URL, and the app id is not a window
+title, so Steam's own record of the game's name is used instead:
+
+```bash
+vypr add cod 'steam://rungameid/3595230' --name 'Call of Duty Modern Warfare II'
+```
+
 **Window titles to match are derived from the app** — its display name, its
 short name and the executable's basename — so `vypr add notepad ...` finds
 'Untitled - Notepad' without being told. Anything beyond that is app-specific:

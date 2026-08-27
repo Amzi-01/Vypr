@@ -728,6 +728,10 @@ int main(int argc, char **argv)
     bool guest_minimized = false;
 
     uint64_t presented = 0, dropped = 0;
+    /* To notice a window that has stopped producing frames while still being
+     * perfectly alive - which is what exclusive fullscreen looks like. */
+    uint64_t last_frame_ms = SDL_GetTicks();
+    bool     stall_reported = false;
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
     uint64_t age_total_ns = 0, age_samples = 0, age_worst_ns = 0;
@@ -1092,13 +1096,36 @@ int main(int argc, char **argv)
                 }
 
                 presenter_upload(v->pres, &f);
-                if (i == 0) presented++;
+                if (i == 0) {
+                    presented++;
+                    last_frame_ms = SDL_GetTicks();
+                    stall_reported = false;
+                }
             } else if (rc == -1 && !v->is_popup &&
                        vypr_slot_state(&shm, v->slot) == VYPR_SLOT_CLOSED) {
                 running = 0;
             }
 
             presenter_present(v->pres);
+        }
+
+        /*
+         * A window that is alive and silent.
+         *
+         * Windows.Graphics.Capture reads DWM's per-window surfaces. A game in
+         * *exclusive* fullscreen bypasses DWM entirely, so there is no surface
+         * left to capture: frames simply stop, with no error anywhere - the
+         * process is running, the window still reports its size, and audio
+         * keeps playing. Said plainly here because it is otherwise a silent
+         * black window, and the fix is in the game's own settings.
+         */
+        if (!stall_reported && SDL_GetTicks() - last_frame_ms > 10000) {
+            stall_reported = true;
+            printf("vypr: no frames for 10s from '%s' - if it just went "
+                   "fullscreen, set it to borderless or windowed: exclusive "
+                   "fullscreen bypasses the compositor and cannot be captured\n",
+                   opt.title);
+            fflush(stdout);
         }
 
         if (opt.stats) {

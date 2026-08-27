@@ -222,7 +222,9 @@ start_daemon() {
         wanted=$(printf '%s\n' "${_m[@]}" | sort -u)
         if [ -n "$(comm -13 <(printf '%s\n' "$running") <(printf '%s\n' "$wanted"))" ]; then
             say "Restarting the session to watch for $APP_NAME as well..."
-            mapfile -t _m < <(printf '%s\n%s\n' "$running" "$wanted" | grep -v '^$' | sort -u)
+            # sed, not grep: a title can carry bytes that make grep call the
+            # stream binary and print a warning instead of the lines.
+            mapfile -t _m < <(printf '%s\n%s\n' "$running" "$wanted" | sed '/^$/d' | sort -u)
             pkill -x vyprd
             sleep 2
         fi
@@ -341,14 +343,32 @@ cmd_run() {
 # window 'Untitled - Notepad', so the bare name is enough. Anything beyond that
 # is app-specific - FiveM also puts up Cfx, Rockstar and Social Club windows -
 # and belongs in that app's --match flags rather than in everyone's defaults.
+# Steam's own name for an app id. A steam:// URL says nothing about what the
+# game calls its window, but Steam wrote the name down when it installed it.
+steam_app_name() {
+    guest "reg query \"HKCU\\Software\\Valve\\Steam\\Apps\\$1\" /v Name" 2>/dev/null |
+        sed -n 's/^[[:space:]]*Name[[:space:]]*REG_SZ[[:space:]]*//p' | tr -d '\r'
+}
+
 derive_matches() {
     local app="$1" label="$2" path="$3"
     local base="${path##*\\}"      # drop the Windows directories
     base="${base##*/}"
     base="${base%.*}"               # and the .exe or .lnk
+
+    # The last element of a steam:// URL is the app id, which no window is ever
+    # titled. Ask Steam what the game is actually called instead.
+    local steam_name=""
+    if [[ "$path" =~ ^steam://(rungameid|run)/([0-9]+) ]]; then
+        steam_name=$(steam_app_name "${BASH_REMATCH[2]}")
+        base=""
+    fi
+
     local out=() cand have dup
-    for cand in "$label" "$app" "$base"; do
+    for cand in "$label" "$steam_name" "$app" "$base"; do
         [ -n "$cand" ] || continue
+        # A bare number is an id, not a title.
+        [[ "$cand" =~ ^[0-9]+$ ]] && continue
         dup=0
         for have in ${out[@]+"${out[@]}"}; do
             [ "${have,,}" = "${cand,,}" ] && { dup=1; break; }

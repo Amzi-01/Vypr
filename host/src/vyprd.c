@@ -14,6 +14,7 @@
  * place where window identity, slot ownership and reconnect are decided.
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -201,12 +202,42 @@ static void forget_dismissed(struct daemon *d, uint64_t id)
     }
 }
 
+/*
+ * Reduce a window title to letters and digits, lowercased.
+ *
+ * Titles cannot be matched as they are written. Call of Duty's window title
+ * carries fifty-two U+200B ZERO WIDTH SPACE characters, one between every
+ * visible character, so the title that reads "Call of Duty: Modern Warfare II"
+ * contains the substring "Call" nowhere in it. Games do this deliberately, and
+ * it is invisible in any log you print it to.
+ *
+ * The same pass takes care of the ordinary reasons a title does not match what
+ * a person typed: the registered-trademark signs, the colon, and the spacing.
+ * Everything outside [a-z0-9] is dropped from both sides, so multi-byte
+ * sequences - which is what the zero-width spaces and the ® are - disappear
+ * byte by byte without needing to be decoded.
+ */
+static void title_key(const char *in, char *out, size_t cap)
+{
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && j + 1 < cap; p++)
+        if (isalnum(*p)) out[j++] = (char)tolower(*p);
+    out[j] = '\0';
+}
+
 static int title_matches(struct daemon *d, const char *title)
 {
     if (d->match_all) return 1;
     if (d->match_count == 0) return 0;
-    for (int i = 0; i < d->match_count; i++)
-        if (strcasestr(title, d->match[i])) return 1;
+
+    char tkey[1024];
+    title_key(title, tkey, sizeof tkey);
+
+    for (int i = 0; i < d->match_count; i++) {
+        char pkey[256];
+        title_key(d->match[i], pkey, sizeof pkey);
+        if (pkey[0] && strstr(tkey, pkey)) return 1;
+    }
     return 0;
 }
 
