@@ -8,6 +8,11 @@
   Per-application native windows from a Windows VM, over shared memory.
 </p>
 
+> [!NOTE]
+> **Vypr is in the public domain.** No rights reserved — copy it, change it,
+> redistribute it, sell it, with or without credit. It comes with no warranty
+> of any kind, express or implied.
+
 An app running in the guest appears as an ordinary window on the Linux desktop —
 its own entry in the taskbar, its own place in the stacking order — with no RDP
 and no video codec in the path.
