@@ -185,7 +185,9 @@ if [ ! -e "/dev/shm/$SHM_NAME" ]; then
 else
     ok "/dev/shm/$SHM_NAME exists"
 fi
-MANUAL+=("sudo install -Dm644 /dev/stdin /etc/tmpfiles.d/10-vypr.conf <<< 'f /dev/shm/$SHM_NAME 0660 $USER kvm -'   # so it survives a reboot")
+# Printed for the user to paste, so it has to work in whatever shell they run.
+# A here-string is bash syntax and fish rejects it outright; a pipe is universal.
+MANUAL+=("echo 'f /dev/shm/$SHM_NAME 0660 $USER kvm -' | sudo install -Dm644 /dev/stdin /etc/tmpfiles.d/10-vypr.conf   # so it survives a reboot")
 
 # --------------------------------------------------------------------- firewall
 head2 "Firewall"
