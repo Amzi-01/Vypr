@@ -216,6 +216,16 @@ was audio cutting out exactly when something loud happened. Dropping loses the
 same audio in ten-millisecond pieces spread across the drain, which is close to
 inaudible.
 
+Audio has **its own TCP connection**, not a share of the control channel. A
+queued input event or window update sitting in front of an audio packet delays
+it however promptly TCP is configured to send - `TCP_NODELAY` says nothing about
+a message already ahead of yours in the same stream. It also gave the audio
+thread a socket to itself, where three threads had been writing one.
+
+Both connections go to the same port, so there is only ever one firewall rule:
+a new connection is parked until its first message says whether it is the
+control channel or the audio one.
+
 Audio does not go through the shared region. It is tiny beside video - a tenth
 of a second of 48 kHz stereo is under 40 KB - and it wants ordering and
 reliability far more than it wants the last microsecond of latency, which is

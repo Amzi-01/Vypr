@@ -34,6 +34,21 @@ enum sash_msg_type {
     SASH_MSG_LOG              = 7,   /* utf8 text */
     SASH_MSG_PONG             = 8,   /* sash_msg_pong */
     SASH_MSG_AUDIO            = 10,  /* sash_msg_audio + interleaved float */
+
+    /*
+     * First message on a second connection, saying it carries audio and
+     * nothing else.
+     *
+     * Audio shared the control channel, which meant a queued input event or
+     * window update sat in front of an audio packet and delayed it however
+     * promptly TCP was configured to send - TCP_NODELAY does nothing about a
+     * message already ahead of yours in the same stream. It also had three
+     * threads writing one socket.
+     *
+     * Same port, so no second firewall rule: the connection announces itself
+     * and the daemon sorts it from the control channel by what arrives first.
+     */
+    SASH_MSG_AUDIO_HELLO      = 11,  /* no payload */
     SASH_MSG_POINTER_LOCK     = 9,   /* sash_msg_pointer_lock */
 
     /* host -> guest */

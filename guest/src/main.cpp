@@ -53,6 +53,7 @@ private:
 
     sash::Region       region_;
     sash::Control      control_;
+    sash::Control      audio_link_;   /* audio only; written by one thread */
     sash::AudioCapture audio_;
 
     std::mutex                                          lock_;
@@ -100,7 +101,7 @@ void Agent::start_audio(unsigned long pid) {
         hdr.frames      = frames;
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), samples, bytes);
-        control_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
+        audio_link_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
     }, pid);
 }
 
@@ -434,6 +435,15 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
     if (!control_.connect(host, port)) return false;
     std::fprintf(stderr, "sash: control channel up to %s:%u\n", host, port);
+
+    /* A second connection for audio, so a queued input event cannot sit in
+     * front of a sound, and so the audio thread has a socket to itself. */
+    if (audio_link_.connect(host, port)) {
+        audio_link_.send(SASH_MSG_AUDIO_HELLO, nullptr, 0);
+        std::fprintf(stderr, "sash: audio channel up\n");
+    } else {
+        std::fprintf(stderr, "sash: no audio channel; sound disabled\n");
+    }
 
     // The region only exists once the host has formatted it, so this comes
     // after the connection rather than before.

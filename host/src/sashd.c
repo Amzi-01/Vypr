@@ -82,6 +82,20 @@ struct daemon {
     int  agent_fd;
     struct msg_reader agent_rx;
 
+    /*
+     * The guest opens two connections to the same port: one for control and
+     * one carrying nothing but audio. Which is which is not known until the
+     * first message arrives, so a new connection waits here until it says.
+     */
+    int  audio_fd;
+    struct msg_reader audio_rx;
+
+    struct {
+        int fd;
+        struct msg_reader rx;
+        uint64_t at_ns;
+    } pending[4];
+
     char unix_path[108];   /* sun_path is 108; anything longer truncates */
 
     struct window windows[MAX_WINDOWS];
@@ -633,6 +647,9 @@ int main(int argc, char **argv)
     struct daemon d = {0};
     d.shm_path   = "/dev/shm/sash";
     d.agent_fd   = -1;
+    d.audio_fd   = -1;
+    for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++)
+        d.pending[i].fd = -1;
     uint16_t port = SASH_CONTROL_PORT;
     /* The guest reaches the host across the virtual bridge, so that is the only
      * interface the control port ever needs to exist on. Listening on every
@@ -686,7 +703,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < MAX_WINDOWS; i++) client_fd[i] = -1;
 
     while (!g_stop) {
-        struct pollfd pfd[3 + MAX_WINDOWS];
+        struct pollfd pfd[8 + MAX_WINDOWS];
         int n = 0;
 
         pfd[n].fd = d.tcp_listen;  pfd[n].events = POLLIN; n++;
@@ -696,6 +713,18 @@ int main(int argc, char **argv)
         if (d.agent_fd >= 0) {
             agent_slot = n;
             pfd[n].fd = d.agent_fd; pfd[n].events = POLLIN; n++;
+        }
+
+        int audio_slot = -1;
+        if (d.audio_fd >= 0) {
+            audio_slot = n;
+            pfd[n].fd = d.audio_fd; pfd[n].events = POLLIN; n++;
+        }
+
+        int first_pending = n;
+        for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++) {
+            if (d.pending[i].fd < 0) continue;
+            pfd[n].fd = d.pending[i].fd; pfd[n].events = POLLIN; n++;
         }
 
         int first_client = n;
@@ -722,6 +751,77 @@ int main(int argc, char **argv)
             }
         }
 
+        /* A parked connection announcing itself. */
+        for (size_t i = 0, p = (size_t)first_pending;
+             i < sizeof(d.pending) / sizeof(d.pending[0]); i++) {
+            if (d.pending[i].fd < 0) continue;
+            const int slot = (int)p++;
+
+            /* Drop one that never says anything, rather than leaking it. */
+            if (now_ns() - d.pending[i].at_ns > 10000000000ull) {
+                close(d.pending[i].fd);
+                msg_reader_free(&d.pending[i].rx);
+                d.pending[i].fd = -1;
+                continue;
+            }
+            if (!(pfd[slot].revents & (POLLIN | POLLHUP))) continue;
+
+            if (msg_reader_fill(&d.pending[i].rx, d.pending[i].fd) < 0) {
+                close(d.pending[i].fd);
+                msg_reader_free(&d.pending[i].rx);
+                d.pending[i].fd = -1;
+                continue;
+            }
+
+            struct sash_msg_head head;
+            const uint8_t *payload;
+            if (msg_reader_next(&d.pending[i].rx, &head, &payload) != 1) continue;
+
+            if (head.type == SASH_MSG_AUDIO_HELLO) {
+                if (d.audio_fd >= 0) { close(d.audio_fd); msg_reader_free(&d.audio_rx); }
+                d.audio_fd = d.pending[i].fd;
+                d.audio_rx = d.pending[i].rx;      /* keep anything already buffered */
+                memset(&d.pending[i].rx, 0, sizeof(d.pending[i].rx));
+                d.pending[i].fd = -1;
+                fprintf(stderr, "sashd: audio channel connected\n");
+            } else if (head.type == SASH_MSG_HELLO) {
+                if (d.agent_fd >= 0) {
+                    /* One agent per session. A second is a stale agent from a
+                     * previous VM boot; the newest wins. */
+                    fprintf(stderr, "sashd: replacing existing agent link\n");
+                    close(d.agent_fd);
+                    msg_reader_free(&d.agent_rx);
+                    for (int w = 0; w < MAX_WINDOWS; w++)
+                        window_release(&d, &d.windows[w], 0);
+                }
+                d.agent_fd = d.pending[i].fd;
+                d.agent_rx = d.pending[i].rx;
+                memset(&d.pending[i].rx, 0, sizeof(d.pending[i].rx));
+                d.pending[i].fd = -1;
+                fprintf(stderr, "sashd: agent connected\n");
+                on_agent_message(&d, head.type, payload, head.bytes);
+            } else {
+                close(d.pending[i].fd);
+                msg_reader_free(&d.pending[i].rx);
+                d.pending[i].fd = -1;
+            }
+        }
+
+        /* Audio, on its own connection so nothing queues in front of it. */
+        if (audio_slot >= 0 && (pfd[audio_slot].revents & (POLLIN | POLLHUP))) {
+            if (msg_reader_fill(&d.audio_rx, d.audio_fd) < 0) {
+                fprintf(stderr, "sashd: audio channel closed\n");
+                close(d.audio_fd);
+                d.audio_fd = -1;
+                msg_reader_free(&d.audio_rx);
+            } else {
+                struct sash_msg_head head;
+                const uint8_t *payload;
+                while (msg_reader_next(&d.audio_rx, &head, &payload) == 1)
+                    on_agent_message(&d, head.type, payload, head.bytes);
+            }
+        }
+
         /* Reap window clients the user closed. */
         for (;;) {
             int status;
@@ -739,19 +839,20 @@ int main(int argc, char **argv)
         if (pfd[0].revents & POLLIN) {
             int fd = accept(d.tcp_listen, NULL, NULL);
             if (fd >= 0) {
-                if (d.agent_fd >= 0) {
-                    /* One agent per session. A second connection is a stale
-                     * agent from a previous VM boot; the newest wins. */
-                    fprintf(stderr, "sashd: replacing existing agent link\n");
-                    close(d.agent_fd);
-                    msg_reader_free(&d.agent_rx);
-                    for (int i = 0; i < MAX_WINDOWS; i++)
-                        window_release(&d, &d.windows[i], 0);
-                }
                 int one = 1;
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                d.agent_fd = fd;
-                fprintf(stderr, "sashd: agent connected\n");
+
+                /* Park it until it says what it is. */
+                int placed = 0;
+                for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++) {
+                    if (d.pending[i].fd < 0) {
+                        d.pending[i].fd = fd;
+                        d.pending[i].at_ns = now_ns();
+                        placed = 1;
+                        break;
+                    }
+                }
+                if (!placed) close(fd);
             }
         }
 
@@ -810,6 +911,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < MAX_WINDOWS; i++)
         if (client_fd[i] >= 0) { close(client_fd[i]); msg_reader_free(&client_rx[i]); }
     if (d.agent_fd >= 0) close(d.agent_fd);
+    if (d.audio_fd >= 0) { close(d.audio_fd); msg_reader_free(&d.audio_rx); }
+    for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++)
+        if (d.pending[i].fd >= 0) { close(d.pending[i].fd); msg_reader_free(&d.pending[i].rx); }
     close(d.tcp_listen);
     close(d.unix_listen);
     unlink(d.unix_path);
