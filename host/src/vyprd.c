@@ -90,6 +90,28 @@ struct daemon {
     int  audio_fd;
     struct msg_reader audio_rx;
 
+    /*
+     * One outgoing buffer per client.
+     *
+     * These sockets used to be blocking, and msg_send loops until everything
+     * is written - so a client that was slow to read stalled the whole daemon
+     * inside a write, including the guest's audio connection. The guest kept
+     * sending, the kernel buffered megabytes of it, and when the client caught
+     * up the backlog arrived as one burst that the far end could only discard.
+     * Measured at twenty seconds of silence followed by 1745 packets landing
+     * inside a millisecond of each other.
+     *
+     * Now nothing is written straight to a client. Messages are queued here and
+     * flushed when the socket says it can take them, so one slow reader costs
+     * only its own audio.
+     */
+    struct out_q {
+        int      fd;
+        uint8_t *buf;
+        size_t   len, cap;
+        uint64_t audio_dropped;
+    } out[MAX_WINDOWS];
+
     struct {
         int fd;
         struct msg_reader rx;
@@ -304,6 +326,93 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
         fprintf(stderr, "vyprd: failed to send ATTACH for '%s'\n", title);
 }
 
+
+/*
+ * Queue a message for a client instead of writing it.
+ *
+ * Control messages are always queued: dropping one would desynchronise the far
+ * end, and they are small and rare. Audio is dropped once a client is far
+ * enough behind, because it is realtime - a sound that cannot be delivered now
+ * is worth less than the ones behind it, and letting the queue grow without
+ * bound just moves the stall somewhere else.
+ */
+#define OUT_AUDIO_LIMIT (256 * 1024)   /* ~0.7s of 48 kHz stereo float */
+
+static struct out_q *out_for(struct daemon *d, int fd)
+{
+    if (fd < 0) return NULL;
+    struct out_q *free_slot = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (d->out[i].fd == fd) return &d->out[i];
+        if (!free_slot && d->out[i].fd <= 0) free_slot = &d->out[i];
+    }
+    if (free_slot) {
+        free_slot->fd = fd;
+        free_slot->len = 0;
+        return free_slot;
+    }
+    return NULL;
+}
+
+static void out_drop(struct daemon *d, int fd)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (d->out[i].fd == fd) {
+            free(d->out[i].buf);
+            memset(&d->out[i], 0, sizeof(d->out[i]));
+            d->out[i].fd = -1;
+        }
+    }
+}
+
+static void client_send(struct daemon *d, int fd, uint16_t type,
+                        const void *payload, uint32_t bytes)
+{
+    struct out_q *q = out_for(d, fd);
+    if (!q || bytes > VYPR_MAX_MSG_BYTES) return;
+
+    if (type == VYPR_MSG_CLIENT_AUDIO && q->len > OUT_AUDIO_LIMIT) {
+        if (++q->audio_dropped % 500 == 0)
+            fprintf(stderr, "vyprd: client is behind; dropped %llu audio packets\n",
+                    (unsigned long long)q->audio_dropped);
+        return;
+    }
+
+    struct vypr_msg_head head = { .bytes = bytes, .type = type, .flags = 0 };
+    const size_t need = q->len + sizeof(head) + bytes;
+    if (need > q->cap) {
+        size_t want = q->cap ? q->cap * 2 : 16384;
+        while (want < need) want *= 2;
+        uint8_t *grown = realloc(q->buf, want);
+        if (!grown) return;
+        q->buf = grown;
+        q->cap = want;
+    }
+    memcpy(q->buf + q->len, &head, sizeof(head));
+    q->len += sizeof(head);
+    if (bytes) {
+        memcpy(q->buf + q->len, payload, bytes);
+        q->len += bytes;
+    }
+}
+
+/* Returns -1 if the client is gone. */
+static int out_flush(struct out_q *q)
+{
+    while (q->len) {
+        ssize_t n = send(q->fd, q->buf, q->len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        if (n == 0) return -1;
+        memmove(q->buf, q->buf + n, q->len - (size_t)n);
+        q->len -= (size_t)n;
+    }
+    return 0;
+}
+
 static void on_agent_message(struct daemon *d, uint16_t type,
                              const uint8_t *payload, uint32_t bytes)
 {
@@ -368,7 +477,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
                 st.window_id  = w->id;
                 st.minimized  = (uint32_t)mini;
                 st.fullscreen = (uint32_t)fs;
-                msg_send(w->client_fd, VYPR_MSG_CLIENT_STATE, &st, sizeof(st));
+                client_send(d, w->client_fd, VYPR_MSG_CLIENT_STATE, &st, sizeof(st));
             }
         }
 
@@ -379,7 +488,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             struct vypr_msg_client_geom geom = {0};
             geom.window_id  = w->id;
             geom.chrome_top = desc->chrome_top;
-            msg_send(w->client_fd, VYPR_MSG_CLIENT_GEOM, &geom, sizeof(geom));
+            client_send(d, w->client_fd, VYPR_MSG_CLIENT_GEOM, &geom, sizeof(geom));
         }
 
         if (w && w->has_slot) {
@@ -408,7 +517,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
                 struct window *owner = window_find(d, w->owner_id);
                 if (owner && owner->client_fd >= 0) {
                     struct vypr_msg_window_id gone = { .window_id = w->id };
-                    msg_send(owner->client_fd, VYPR_MSG_CLIENT_POPUP_END,
+                    client_send(d, owner->client_fd, VYPR_MSG_CLIENT_POPUP_END,
                              &gone, sizeof(gone));
                 }
             } else {
@@ -448,7 +557,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             msg.dy        = w->gy - owner->gy;
             msg.width     = w->width;
             msg.height    = w->height;
-            msg_send(owner->client_fd, VYPR_MSG_CLIENT_POPUP, &msg, sizeof(msg));
+            client_send(d, owner->client_fd, VYPR_MSG_CLIENT_POPUP, &msg, sizeof(msg));
             fprintf(stderr, "vyprd: popup %ux%u at +%d,+%d of '%s' -> slot %u\n",
                     w->width, w->height, msg.dx, msg.dy, owner->title, w->slot);
             break;
@@ -514,7 +623,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             if (owner) w = owner;
         }
         if (w && w->client_fd >= 0)
-            msg_send(w->client_fd, VYPR_MSG_CLIENT_LOCK, m, sizeof(*m));
+            client_send(d, w->client_fd, VYPR_MSG_CLIENT_LOCK, m, sizeof(*m));
         fprintf(stderr, "vyprd: guest %s the pointer\n",
                 m->locked ? "captured" : "released");
         break;
@@ -527,7 +636,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         for (int i = 0; i < MAX_WINDOWS; i++) {
             struct window *w = &d->windows[i];
             if (w->id && !w->is_popup && w->client_fd >= 0) {
-                msg_send(w->client_fd, VYPR_MSG_CLIENT_AUDIO, payload, bytes);
+                client_send(d, w->client_fd, VYPR_MSG_CLIENT_AUDIO, payload, bytes);
                 break;
             }
         }
@@ -701,6 +810,7 @@ int main(int argc, char **argv)
     struct window    *client_owner[MAX_WINDOWS] = {0};
     int               client_fd[MAX_WINDOWS];
     for (int i = 0; i < MAX_WINDOWS; i++) client_fd[i] = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) d.out[i].fd = -1;
 
     while (!g_stop) {
         struct pollfd pfd[8 + MAX_WINDOWS];
@@ -730,7 +840,13 @@ int main(int argc, char **argv)
         int first_client = n;
         for (int i = 0; i < MAX_WINDOWS; i++) {
             if (client_fd[i] < 0) continue;
-            pfd[n].fd = client_fd[i]; pfd[n].events = POLLIN; n++;
+            pfd[n].fd = client_fd[i];
+            pfd[n].events = POLLIN;
+            /* Only while something is queued, so an idle client does not spin
+             * the loop on a socket that is permanently writable. */
+            struct out_q *q = out_for(&d, client_fd[i]);
+            if (q && q->len) pfd[n].events |= POLLOUT;
+            n++;
         }
 
         if (poll(pfd, (nfds_t)n, 500) < 0) {
@@ -858,6 +974,12 @@ int main(int argc, char **argv)
 
         if (pfd[1].revents & POLLIN) {
             int fd = accept(d.unix_listen, NULL, NULL);
+            /* Non-blocking, so a client that stops reading costs it its own
+             * audio rather than stalling every other connection. */
+            if (fd >= 0) {
+                int fl = fcntl(fd, F_GETFL, 0);
+                if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            }
             if (fd >= 0) {
                 int placed = 0;
                 for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -888,10 +1010,27 @@ int main(int argc, char **argv)
         for (int i = 0, p = first_client; i < MAX_WINDOWS; i++) {
             if (client_fd[i] < 0) continue;
             int slot = p++;
+
+            /* Send first: draining what is queued is what lets the next audio
+             * packet be queued rather than dropped. */
+            if (pfd[slot].revents & POLLOUT) {
+                struct out_q *q = out_for(&d, client_fd[i]);
+                if (q && out_flush(q) < 0) {
+                    if (client_owner[i]) client_owner[i]->client_fd = -1;
+                    out_drop(&d, client_fd[i]);
+                    close(client_fd[i]);
+                    client_fd[i] = -1;
+                    client_owner[i] = NULL;
+                    msg_reader_free(&client_rx[i]);
+                    continue;
+                }
+            }
+
             if (!(pfd[slot].revents & (POLLIN | POLLHUP))) continue;
 
             if (msg_reader_fill(&client_rx[i], client_fd[i]) < 0) {
                 if (client_owner[i]) client_owner[i]->client_fd = -1;
+                out_drop(&d, client_fd[i]);
                 close(client_fd[i]);
                 client_fd[i] = -1;
                 client_owner[i] = NULL;
@@ -909,7 +1048,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "\nsashd: shutting down\n");
     for (int i = 0; i < MAX_WINDOWS; i++) window_release(&d, &d.windows[i], 1);
     for (int i = 0; i < MAX_WINDOWS; i++)
-        if (client_fd[i] >= 0) { close(client_fd[i]); msg_reader_free(&client_rx[i]); }
+        if (client_fd[i] >= 0) {
+            out_drop(&d, client_fd[i]);
+            close(client_fd[i]);
+            msg_reader_free(&client_rx[i]);
+        }
     if (d.agent_fd >= 0) close(d.agent_fd);
     if (d.audio_fd >= 0) { close(d.audio_fd); msg_reader_free(&d.audio_rx); }
     for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++)
