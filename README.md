@@ -48,6 +48,11 @@ Windows will ask you to accept the drivers, which only a person can click.
 vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM --process GTAProcess
 ```
 
+`vypr remove fivem` undoes all of it — the guest task, the profile, the menu
+entry, the desktop icon and the extracted icon. It refuses to run with the VM
+down rather than deleting the profile that records which guest task to clear;
+`--force` removes everything on this side anyway.
+
 That creates the scheduled task in the guest, pulls the application's own icon
 out of the guest executable, and adds it both to your application menu and to
 your desktop — `--no-desktop-icon` if you only want the menu entry. The desktop
@@ -220,6 +225,27 @@ An app can match every window it puts up - for FiveM that is the splash, the
 Rockstar launcher and the sign-in dialog, not only the main game window - so the
 whole startup sequence is visible rather than a blank wait followed by a game.
 Each appears and closes in turn as its own host window.
+
+**Window titles to match are derived from the app** — its display name, its
+short name and the executable's basename — so `vypr add notepad ...` finds
+'Untitled - Notepad' without being told. Anything beyond that is app-specific:
+FiveM also puts up Cfx, Rockstar and Social Club windows, and those belong in
+that app's `--match` flags rather than in every app's defaults.
+
+A daemon already running for a *different* app is watching for that app's
+titles and will ignore the new one — the window is offered and logged as `no
+title match`, which looks exactly like the app failing to start. Launching a
+second app therefore restarts the daemon with both sets of titles, so neither
+app goes dark.
+
+**The VM shuts down when the last window closes.** Nothing else was watching:
+`vypr run` returns as soon as the app is on screen and the daemon stays up
+waiting for more windows, so a supervisor runs alongside the session and, once
+the last streamed window has been gone for `SHUTDOWN_GRACE` seconds, tears the
+session down and asks the VM to shut down. The grace period is what makes it
+recoverable — a window closed by accident is one relaunch away from cancelling
+the countdown. The shutdown is graceful, so a guest that refuses to go down is
+left running rather than pulled out from under.
 
 It waits for the guest to *answer*, not merely for the domain to report
 'running': a booting Windows cannot do anything useful yet. It also refuses

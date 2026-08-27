@@ -250,6 +250,12 @@ SHM_SIZE_MB=$SHM_SIZE_MB
 # Parsec is started alongside the session because its driver is what makes the
 # mouse work in games that read raw input. Set to 0 if you do not play those.
 USE_PARSEC=1
+
+# Shut the VM down once the last streamed window has been gone this long.
+# Relaunching anything during the countdown cancels it. Set to 0 to leave the
+# VM running after you close things.
+SHUTDOWN_VM_ON_EXIT=1
+SHUTDOWN_GRACE=60
 EOF
 ok "wrote $CONF_DIR/config"
 

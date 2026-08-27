@@ -4,6 +4,7 @@
 #
 #   vypr run <app>      bring everything up and start the app
 #   vypr add <app>      register a Windows application as a launchable app
+#   vypr remove <app>   undo that - task, profile, menu entry and icons
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -185,6 +186,16 @@ start_parsec() {
 }
 
 # --------------------------------------------------------- the session daemon
+# What the running daemon was told to look for, so we can tell whether it is
+# watching for this app or a different one.
+daemon_matches() {
+    local pid
+    pid=$(pgrep -x vyprd | head -1) || return 1
+    [ -n "$pid" ] || return 1
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
+        awk '$0 == "--match" { getline; print }' | sort -u
+}
+
 start_daemon() {
     local -n _m=$1
     # A window the user closed is remembered as dismissed, so an app that
@@ -201,6 +212,22 @@ start_daemon() {
         fi
     fi
 
+    # A daemon started for a different app is watching for that app's window
+    # titles and will ignore this one - the window is offered and logged as
+    # 'no title match'. Restart it with both sets, so launching a second app
+    # does not silently do nothing and does not stop streaming the first.
+    if pgrep -x vyprd >/dev/null; then
+        local running wanted
+        running=$(daemon_matches)
+        wanted=$(printf '%s\n' "${_m[@]}" | sort -u)
+        if [ -n "$(comm -13 <(printf '%s\n' "$running") <(printf '%s\n' "$wanted"))" ]; then
+            say "Restarting the session to watch for $APP_NAME as well..."
+            mapfile -t _m < <(printf '%s\n%s\n' "$running" "$wanted" | grep -v '^$' | sort -u)
+            pkill -x vyprd
+            sleep 2
+        fi
+    fi
+
     if ! pgrep -x vyprd >/dev/null; then
         say "Starting the Vypr session..."
         [ -x "$BIN/vyprd" ] || die "$BIN/vyprd is missing - reinstall"
@@ -210,6 +237,66 @@ start_daemon() {
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2
     fi
+}
+
+# --------------------------------------------------- shutting the VM down
+#
+# Nothing else is watching: 'vypr run' returns as soon as the app is on screen,
+# and vyprd stays up waiting for more windows. So a supervisor is started
+# alongside the session, and when the last streamed window has been gone for
+# the grace period it tears the session down and asks the VM to shut down.
+#
+# The grace period is not politeness - it is what makes this recoverable. A game
+# whose window you closed by accident is one relaunch away from cancelling the
+# shutdown, because a window appearing resets the count.
+watch_and_shutdown() {
+    [ "${SHUTDOWN_VM_ON_EXIT:-1}" = "1" ] || exit 0
+    local grace="${SHUTDOWN_GRACE:-60}"
+
+    # Wait for the session to actually start before deciding it has ended.
+    local i
+    for i in $(seq 1 60); do
+        pgrep -x vypr-window >/dev/null && break
+        sleep 5
+    done
+    pgrep -x vypr-window >/dev/null || exit 0
+
+    local idle=0 warned=0
+    while true; do
+        if pgrep -x vypr-window >/dev/null; then
+            idle=0
+            warned=0
+        else
+            if [ "$warned" = "0" ]; then
+                say "Nothing left on screen - shutting the VM down in ${grace}s. Launch something to cancel."
+                warned=1
+            fi
+            idle=$((idle + 5))
+            [ "$idle" -ge "$grace" ] && break
+        fi
+        sleep 5
+    done
+
+    pkill -x vyprd 2>/dev/null
+    guest 'schtasks /end /tn vypr-agent' >/dev/null 2>&1
+
+    # Graceful, so Windows closes things properly. A guest that refuses - a
+    # crash dialog holding it open, which has happened here - is left running
+    # rather than pulled out from under, since forcing it risks the disk.
+    virsh shutdown "$VM" >/dev/null 2>&1
+    for i in $(seq 1 30); do
+        [ "$(virsh domstate "$VM" 2>/dev/null)" = "shut off" ] && { say "VM is off."; exit 0; }
+        sleep 10
+    done
+    say "The VM did not shut down - something in Windows is holding it open."
+}
+
+start_watcher() {
+    [ "${SHUTDOWN_VM_ON_EXIT:-1}" = "1" ] || return 0
+    command -v flock >/dev/null 2>&1 || return 0
+    # flock -n keeps this to one watcher however many times 'vypr run' is used.
+    setsid nohup flock -n "${XDG_RUNTIME_DIR:-/tmp}/vypr-watch.lock" \
+        "$0" __watch >>"${XDG_RUNTIME_DIR:-/tmp}/vypr-watch.log" 2>&1 &
 }
 
 # -------------------------------------------------------------- subcommands
@@ -237,12 +324,38 @@ cmd_run() {
         guest "schtasks /end /tn $TASK >nul 2>&1 & schtasks /run /tn $TASK" >/dev/null 2>&1
     fi
 
+    start_watcher
+
     local i
     for i in $(seq 1 60); do
         pgrep -x vypr-window >/dev/null && { say "$APP_NAME is on screen."; exit 0; }
         sleep 5
     done
     die "$APP_NAME did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+}
+
+# What to look for in a window title, when the user has not said.
+#
+# The display name, the short name and the executable's own basename, which
+# between them cover how apps actually title their windows: Notepad calls its
+# window 'Untitled - Notepad', so the bare name is enough. Anything beyond that
+# is app-specific - FiveM also puts up Cfx, Rockstar and Social Club windows -
+# and belongs in that app's --match flags rather than in everyone's defaults.
+derive_matches() {
+    local app="$1" label="$2" path="$3"
+    local base="${path##*\\}"      # drop the Windows directories
+    base="${base##*/}"
+    base="${base%.*}"               # and the .exe or .lnk
+    local out=() cand have dup
+    for cand in "$label" "$app" "$base"; do
+        [ -n "$cand" ] || continue
+        dup=0
+        for have in ${out[@]+"${out[@]}"}; do
+            [ "${have,,}" = "${cand,,}" ] && { dup=1; break; }
+        done
+        [ "$dup" = "0" ] && out+=("$cand")
+    done
+    printf '%s\n' ${out[@]+"${out[@]}"}
 }
 
 cmd_add() {
@@ -278,8 +391,10 @@ EOF
             *) die "unknown option '$1'" ;;
         esac
     done
-    [ "${#matches[@]}" -gt 0 ] || matches=("$app")
     [ -n "$label" ] || label="$app"
+    if [ "${#matches[@]}" -eq 0 ]; then
+        mapfile -t matches < <(derive_matches "$app" "$label" "$path")
+    fi
 
     start_vm
 
@@ -357,6 +472,58 @@ EOF
 
     echo
     say "'$label' is ready. Launch it from your application menu, or: vypr run $app"
+}
+
+cmd_remove() {
+    local app="${1:-}" force=0
+    [ "${2:-}" = "--force" ] && force=1
+    [ -n "$app" ] || die "usage: vypr remove <app> [--force]   (see 'vypr apps')"
+    local profile="$APPS/$app.conf"
+    [ -f "$profile" ] || die "no such app '$app' - see 'vypr apps'"
+
+    # shellcheck source=/dev/null
+    . "$profile"
+    local label="${NAME:-$app}"
+    local removed=0
+
+    # The guest task first, because it is the only part that needs the VM, and
+    # the local files should not be torn down if it is unreachable and the user
+    # would rather try again later.
+    if [ "$(virsh domstate "$VM" 2>/dev/null)" = "running" ] && guest 'echo ok' >/dev/null 2>&1; then
+        if guest "schtasks /delete /tn ${TASK:-vypr-$app} /f" >/dev/null 2>&1; then
+            echo "  removed the scheduled task from the guest"
+            removed=1
+        fi
+    elif [ "$force" = "1" ]; then
+        echo "  the VM is not reachable, so '${TASK:-vypr-$app}' stays registered in the guest"
+    else
+        # Removing the profile now would delete the only record of which task to
+        # clear, so 'run this again later' would be advice that cannot be taken.
+        echo "vypr: the VM is not running, so the guest still has '${TASK:-vypr-$app}'." >&2
+        echo "      Start it and run this again, or 'vypr remove $app --force' to" >&2
+        echo "      remove everything on this side and leave that task behind." >&2
+        exit 1
+    fi
+
+    local dtop
+    dtop=$(xdg-user-dir DESKTOP 2>/dev/null) || dtop=""
+    [ -n "$dtop" ] || dtop="$HOME/Desktop"
+
+    local f
+    for f in "$profile" \
+             "${XDG_DATA_HOME:-$HOME/.local/share}/applications/vypr-$app.desktop" \
+             "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/vypr-$app.png" \
+             "$dtop/${label//\//-}.desktop"; do
+        if [ -e "$f" ]; then
+            rm -f "$f" && echo "  removed $f"
+            removed=1
+        fi
+    done
+
+    update-desktop-database "${XDG_DATA_HOME:-$HOME/.local/share}/applications" 2>/dev/null || true
+    gtk-update-icon-cache -qtf "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+
+    [ "$removed" = "1" ] && say "'$label' removed." || echo "vypr: nothing to remove"
 }
 
 cmd_apps() {
@@ -453,16 +620,25 @@ cmd_down() {
     pkill -x vypr-window 2>/dev/null
     pkill -x vyprd 2>/dev/null
     guest 'schtasks /end /tn vypr-agent' >/dev/null 2>&1
-    say "Session stopped. The VM is still running - 'virsh shutdown $VM' to stop it too."
+    if [ "${SHUTDOWN_VM_ON_EXIT:-1}" = "1" ]; then
+        virsh shutdown "$VM" >/dev/null 2>&1
+        say "Session stopped, and the VM is shutting down."
+    else
+        say "Session stopped. The VM is still running - 'virsh shutdown $VM' to stop it too."
+    fi
 }
 
 case "${1:-}" in
     run)    shift; cmd_run "$@" ;;
     add)    shift; cmd_add "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
     apps)   cmd_apps ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;
+    __watch) watch_and_shutdown ;;   # internal: the shutdown supervisor
     up)     cmd_up ;;
     down)   cmd_down ;;
-    *) sed -n '3,10p' "$0" | sed 's/^# \?//' ;;
+    # The title plus every documented subcommand, wherever they sit in the
+    # header - a fixed line range went stale each time one was added.
+    *) sed -n '3p;/^#   vypr /p' "$0" | sed 's/^# \?//' ;;
 esac
