@@ -48,8 +48,11 @@ Windows will ask you to accept the drivers, which only a person can click.
 vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM --process GTAProcess
 ```
 
-That creates the scheduled task in the guest and a desktop entry here, so the
-game is in your application menu like anything else. `vypr run fivem` starts it,
+That creates the scheduled task in the guest, pulls the application's own icon
+out of the guest executable, and adds it both to your application menu and to
+your desktop — `--no-desktop-icon` if you only want the menu entry. The desktop
+copy is installed executable, because Plasma and GNOME both refuse to launch a
+desktop file that is not, warning about untrusted content instead. `vypr run fivem` starts it,
 `vypr apps` lists what is registered, `vypr status` says what is up, and
 `vypr doctor` checks the parts that fail quietly — a region that came back empty
 after a reboot, a domain that lost its shmem device to an edit in virt-manager,

@@ -260,12 +260,13 @@ usage: vypr add <name> '<windows path to the .exe or shortcut>'
     --name <text>      the name to show in your application menu
     --elevated         run it as administrator (most games refuse this)
     --icon <file.png>  use this icon instead of the one in the .exe
+    --no-desktop-icon  only add it to the application menu, not the desktop
 EOF
         return 1
     fi
     shift 2
 
-    local matches=() process="" label="" elevated=0 iconfile="" m
+    local matches=() process="" label="" elevated=0 iconfile="" desktop_icon=1 m
     while [ $# -gt 0 ]; do
         case "$1" in
             --match)   matches+=("$2"); shift 2 ;;
@@ -273,6 +274,7 @@ EOF
             --name)    label="$2"; shift 2 ;;
             --elevated) elevated=1; shift ;;
             --icon)    iconfile="$2"; shift 2 ;;
+            --no-desktop-icon) desktop_icon=0; shift ;;
             *) die "unknown option '$1'" ;;
         esac
     done
@@ -334,6 +336,24 @@ Terminal=false
 Categories=Game;
 EOF
     update-desktop-database "$(dirname "$desktop")" 2>/dev/null || true
+
+    # And on the desktop itself. Plasma and GNOME both refuse to launch a
+    # desktop file that is not executable, warning about untrusted content
+    # instead, so it is installed 755 rather than 644 like the menu entry.
+    if [ "$desktop_icon" = "1" ]; then
+        local dtop
+        dtop=$(xdg-user-dir DESKTOP 2>/dev/null) || dtop=""
+        [ -n "$dtop" ] || dtop="$HOME/Desktop"
+        if [ -d "$dtop" ]; then
+            # The display name is what the user will read under the icon, but a
+            # slash in it would be a path separator here.
+            local file="${label//\//-}"
+            install -Dm755 "$desktop" "$dtop/$file.desktop"
+            say "Added an icon to your desktop."
+        else
+            echo "vypr: no desktop directory at $dtop; added to the application menu only"
+        fi
+    fi
 
     echo
     say "'$label' is ready. Launch it from your application menu, or: vypr run $app"
