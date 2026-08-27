@@ -210,6 +210,21 @@ void Agent::handle_attach(const sash_msg_attach& msg) {
         return;
     }
 
+    /*
+     * A minimised window produces no frames at all.
+     *
+     * Windows parks a minimised window at -32000,-32000 and WGC has nothing to
+     * capture, so the slot stays armed, the host shows an empty window, and it
+     * reads as a freeze. Attaching is a request to see the window, so restore
+     * it - otherwise a game that minimised itself on losing focus can only be
+     * recovered from inside the guest, which rather defeats the point.
+     */
+    if (IsIconic(hwnd)) {
+        std::fprintf(stderr, "sash: HWND %p is minimised; restoring it\n",
+                     reinterpret_cast<void*>(hwnd));
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+
     auto stream = std::make_unique<Stream>();
     stream->slot = msg.slot;
 
