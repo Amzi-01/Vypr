@@ -79,10 +79,12 @@ that property.
 ```
 guest (Windows, C++)                       host (Linux, C)
 ┌───────────────────────────┐              ┌─────────────────────────────┐
-│ WGC capture per HWND      │── IVSHMEM ──▶│ vypr-window, one per window   │
-│ publish under a seqlock   │   (pixels)   │ SDL3 present, native window │
+│ WGC capture per HWND      │── IVSHMEM ──▶│ vyprd, then one vypr-window │
+│ publish under a seqlock   │   (pixels)   │ per top-level and its popups│
 │ SendInput injection       │◀── TCP ──────│ input, window lifecycle     │
-└───────────────────────────┘  (control)   └─────────────────────────────┘
+│ WASAPI loopback           │── TCP ──────▶│ playback                    │
+└───────────────────────────┘              └─────────────────────────────┘
+            two TCP connections on one port: control, and audio on its own
 ```
 
 **Pixels go through IVSHMEM uncompressed.** The guest has a passthrough GPU, and
@@ -127,11 +129,17 @@ found so far: SDL's default `opengl` backend presents synchronously at 21-24 ms,
 which misses vsync on its own and pins the stream to half refresh. `gpu` presents
 in ~2 ms and lets the upload overlap, so it is now the default.
 
-4K60 is not yet clean. The remaining cost is the 16 ms upload, which runs at
-~2 GB/s against 14.5 GB/s of measured memory bandwidth — the ceiling is SDL's
-`LockTexture`/`UnlockTexture` staging, not the transport. Closing it means
-uploading from the mapped region directly via a persistently mapped PBO, which
-requires dropping `SDL_Renderer` for direct EGL or Vulkan.
+The 16 ms upload above runs at ~2 GB/s against 14.5 GB/s of measured memory
+bandwidth. That ceiling was `SDL_Renderer`'s `LockTexture`/`UnlockTexture`
+staging, which copies through a CPU buffer — not the transport. `present_gpu.c`
+avoids it by writing into a mapped `SDL_GPUTransferBuffer` instead, and is the
+default for that reason.
+
+**These figures predate that becoming the default and want re-measuring.** They
+are left as recorded rather than adjusted by hand; run `vypr-window --stats`
+against `vypr-testsrc` to replace them. In live use a 4K guest window publishes
+a steady 60 fps, but that is the guest's publish rate, which is a different
+measurement from the host's present cost.
 
 ## It works
 
@@ -221,7 +229,7 @@ on a picture of the inner one.
 ## Audio
 
 The guest captures its default playback endpoint with WASAPI loopback and sends
-it down the control channel as interleaved 32-bit float. The host opens a
+it as interleaved 32-bit float over a TCP connection of its own. The host opens a
 playback stream on the first block that arrives, matching whatever rate and
 channel count the guest is actually producing rather than asking for a format
 and making somebody resample.
@@ -269,6 +277,40 @@ queued input event or window update sitting in front of an audio packet delays
 it however promptly TCP is configured to send - `TCP_NODELAY` says nothing about
 a message already ahead of yours in the same stream. It also gave the audio
 thread a socket to itself, where three threads had been writing one.
+
+### One slow window stalled the whole daemon
+
+The symptom was audio cutting out, worst in fullscreen. The cause was not in the
+audio path at all.
+
+Client sockets were accepted **blocking**, and the send loop writes until every
+byte is gone. A window slow to drain its socket therefore stalled `vyprd` inside
+that write — including the guest's audio connection, which has nothing to do
+with that window. Fullscreen made it routine: a 4K present slows the render
+loop, the window drains more slowly, its socket fills, and the daemon blocks.
+The guest keeps sending, the kernel buffers megabytes, and when the client
+catches up the whole backlog lands at once. Measured at twenty seconds of
+silence followed by 1745 packets arriving inside a millisecond of each other,
+nearly all then discarded as a burst too deep to queue.
+
+Client sockets are now non-blocking and nothing is written to them directly:
+messages are queued per client and flushed when the socket says it can take
+them. Control messages are always queued, since dropping one desynchronises the
+far end and they are small and rare; audio is dropped once a client is far
+enough behind, since a sound that cannot be delivered now is worth less than the
+ones behind it. The window process also receives on its own thread rather than
+once per rendered frame, so audio no longer depends on how long a frame takes.
+
+Measured after: bursts of 1–22 packets, gaps of 20–130 ms, and nothing dropped
+at all in most ten-second windows, against 60–83% before.
+
+**The instrumentation is why this was found.** The log line reported a single
+queue depth, which was consistent with several different faults and identified
+none — the same reading appeared whether the queue was overflowing or starving.
+Reporting the queue's range, the number of drain cycles, the largest gap between
+arrivals and the longest unbroken burst named the real fault on first read: a
+1745-packet burst is a backlog being flushed, not a queue being mismanaged. It
+stays in for that reason.
 
 Both connections go to the same port, so there is only ever one firewall rule:
 a new connection is parked until its first message says whether it is the
@@ -449,7 +491,7 @@ past 2560x1440 mapped out of range.
 | Component | State |
 |---|---|
 | `include/vypr_shm.h` — region layout | done |
-| `include/vypr_proto.h` — control protocol v1 | defined, not yet spoken |
+| `include/vypr_proto.h` — control protocol | spoken by both ends |
 | `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
 | `host/src/main.c` — present a slot as a native window | working |
 | `host/src/present_gpu.c` — SDL_GPU upload path | working, 4x faster at 4K |
@@ -466,6 +508,7 @@ past 2560x1440 mapped out of range.
 | `host/src/msg.c` — framing, shared by both host processes | done |
 | Input path — pointer, keys, focus, resize, close | working, verified |
 | Launcher / `.desktop` integration | done — `vypr add` registers any app |
+| `vypr doctor` — health check | done |
 | Linux installer | done — `install/install.sh` |
 | Windows installer | done — one `vypr-setup.exe` |
 
@@ -480,6 +523,9 @@ cmake --build build
 Needs SDL3.
 
 ## Running
+
+`vypr run <app>` is the normal way in. Driving the daemon directly is still the
+way to see what the guest is offering:
 
 ```bash
 ./build/vyprd --match Notepad --launch 'C:\\Windows\\System32\\notepad.exe'
@@ -524,9 +570,10 @@ Inherited from the earlier prototype's notes, none of them solved yet:
   menu bar clicks reached the text area instead. `geometry.hpp` now defines the
   captured rectangle once and enumeration, input and the GDI fallback all use
   it.
-- **Popups and menus.** Each is its own `HWND`, so each arrives as its own
-  stream and has to be positioned against its owner — `owner_id` exists in the
-  protocol for this, and nothing uses it yet.
+- ~~**Popups and menus.**~~ Done. Each is its own `HWND` and arrives as its own
+  stream, positioned against its owner: the popup message carries `owner_id`
+  and a `dx, dy` offset, and the owner's process opens it, so a menu belongs to
+  the window it came from rather than becoming a top-level of its own.
 - **Z-order and focus.** The host WM owns stacking; the guest has its own idea.
   Unreconciled, the two fight.
 - ~~**Reconnect.**~~ Partly done. The guest re-offers any window nothing is
