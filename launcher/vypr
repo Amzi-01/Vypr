@@ -347,7 +347,9 @@ cmd_apps() {
 cmd_status() {
     printf '  VM %-14s %s\n' "$VM" "$(virsh domstate "$VM" 2>/dev/null || echo missing)"
     printf '  vyprd          %s\n' "$(pgrep -x vyprd >/dev/null && echo running || echo stopped)"
-    printf '  windows open   %s\n' "$(pgrep -xc vypr-window 2>/dev/null || echo 0)"
+    # pgrep -c prints 0 and *also* exits non-zero when nothing matches, so a
+    # '|| echo 0' fallback appends a second count rather than supplying one.
+    printf '  windows open   %s\n' "$(pgrep -xc vypr-window 2>/dev/null || true)"
     if [ -e "$SHM" ]; then
         printf '  region         %s (%s MiB)\n' "$SHM" "$(( $(stat -c%s "$SHM") / 1024 / 1024 ))"
     else
