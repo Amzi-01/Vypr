@@ -206,10 +206,40 @@ static void install_agent()
 
     step_ok(write_resource(IDR_AGENT, exe), L"vypr-agent.exe unpacked");
 
+    /*
+     * The task runs a small script rather than the agent directly, so its
+     * output lands in a file. Everything the agent has to say about why it is
+     * not working - no display attached, a region it does not recognise, a
+     * capture that stopped - goes to stderr, and a task started with no
+     * redirection throws all of it away. Diagnosing anything without this
+     * means reconstructing the launch by hand first.
+     */
+    wchar_t progdata[MAX_PATH];
+    SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, progdata);
+    const std::wstring logdir = std::wstring(progdata) + L"\\Vypr";
+    CreateDirectoryW(logdir.c_str(), nullptr);
+
+    const std::wstring script = dir + L"\\run-agent.cmd";
+    {
+        std::wstring body = L"@echo off\r\n\"" + exe + L"\" > \"" +
+                            logdir + L"\\agent.log\" 2>&1\r\n";
+        HANDLE f = CreateFileW(script.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            std::string utf8;
+            utf8.reserve(body.size());
+            for (wchar_t c : body) utf8.push_back((char)(c & 0x7f));
+            DWORD wrote = 0;
+            WriteFile(f, utf8.data(), (DWORD)utf8.size(), &wrote, nullptr);
+            CloseHandle(f);
+        }
+    }
+    logf(L"  [--] the agent logs to %s\\agent.log", logdir.c_str());
+
     // Interactive and elevated: a non-interactive task has no desktop to
     // capture, and the agent needs to see windows owned by elevated apps.
     std::wstring task =
-        L"schtasks /create /tn vypr-agent /tr \"\\\"" + exe + L"\\\"\" "
+        L"schtasks /create /tn vypr-agent /tr \"\\\"" + script + L"\\\"\" "
         L"/sc onlogon /it /rl highest /f";
     step_ok(run(task, true) == 0, L"registered to start when you log in");
 }
@@ -513,6 +543,18 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (LOWORD(w) == ID_INSTALL) {
+            /*
+             * Once the work is done this button is Close.
+             *
+             * That used to be handled in the message loop, which never saw it:
+             * a button sends WM_COMMAND straight to its parent's window
+             * procedure, so it is never posted to the queue and GetMessage
+             * cannot filter for it. The button did nothing at all.
+             */
+            if (GetWindowLongPtrW(g_install, GWLP_USERDATA) == 1) {
+                DestroyWindow(h);
+                return 0;
+            }
             EnableWindow(g_install, FALSE);
             SendMessageW(g_log, LB_RESETCONTENT, 0, 0);
             g_failed = false;
@@ -583,11 +625,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == ID_INSTALL &&
-            GetWindowLongPtrW(g_install, GWLP_USERDATA) == 1) {
-            DestroyWindow(g_main);
-            continue;
-        }
         if (!IsDialogMessageW(g_main, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

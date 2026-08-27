@@ -41,6 +41,17 @@ What was actually wanted was narrower than any of those: **one window, from the
 VM, behaving like a native one.** Vypr is that, and it turned out to work for
 anything else in the VM too.
 
+## What it looks like
+
+FiveM, running in the VM, shown on the Linux desktop with its own taskbar entry —
+the application this was built for:
+
+![FiveM running through Vypr](docs/images/fivem.png)
+
+Call of Duty: Modern Warfare II, launched from Steam inside the guest:
+
+![Call of Duty running through Vypr](docs/images/cod.png)
+
 ## What you need
 
 Vypr does not create your VM — it makes an existing one useful. Before
