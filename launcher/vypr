@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+#
+# Vypr - run a Windows application as a window on this desktop.
+#
+#   vypr run <app>      bring everything up and start the app
+#   vypr add <app>      register a Windows application as a launchable app
+#   vypr apps           list registered apps
+#   vypr up / down      start or stop the session on its own
+#   vypr status         what is running
+#
+# Every step is skipped if it is already done, so running this twice is safe.
+set -uo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vypr"
+CONF="$CONF_DIR/config"
+APPS="$CONF_DIR/apps"
+BIN="$(dirname "$(readlink -f "$0")")"
+SHM=/dev/shm/vypr
+KEY="$HOME/.ssh/vypr-guest"
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
+
+[ -f "$CONF" ] || { echo "vypr: not configured - run the installer first" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$CONF"
+: "${VM:?VM is not set in $CONF}"
+: "${GUEST:?GUEST is not set in $CONF}"
+: "${GUEST_USER:=Lucy}"
+
+APP_NAME="Vypr"; APP_ICON="vypr"
+
+say() {
+    echo "vypr: $*"
+    notify-send --app-name="$APP_NAME" --icon="$APP_ICON" "$APP_NAME" "$*" 2>/dev/null || true
+}
+die() {
+    echo "vypr: $*" >&2
+    notify-send --app-name="$APP_NAME" --icon=dialog-error -u critical "$APP_NAME" "$*" 2>/dev/null || true
+    exit 1
+}
+guest() {
+    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+        -o ConnectTimeout=8 "$GUEST_USER@$GUEST" "$@"
+}
+
+# --------------------------------------------------------------- the VM
+start_vm() {
+    local state
+    state=$(virsh domstate "$VM" 2>/dev/null || echo missing)
+    [ "$state" = "missing" ] && die "VM '$VM' does not exist"
+
+    if [ "$state" != "running" ]; then
+        say "Starting the VM..."
+        virsh start "$VM" >/dev/null || die "could not start the VM"
+    fi
+
+    # Wait for the guest to answer, not merely for the domain to say 'running' -
+    # a booting Windows cannot do anything useful yet.
+    local i
+    for i in $(seq 1 60); do
+        guest 'echo ok' >/dev/null 2>&1 && break
+        sleep 5
+    done
+    guest 'echo ok' >/dev/null 2>&1 || die "the guest never answered - check the VM's screen"
+
+    # Windows needs a logged-in session: no desktop means nothing to capture,
+    # and interactive scheduled tasks will not run. 'query user' exits non-zero
+    # even when it lists a user, so capture before matching rather than piping.
+    local sessions
+    sessions=$(guest 'query user' 2>/dev/null || true)
+    grep -qi console <<<"$sessions" || \
+        die "nobody is logged in to Windows - enable auto-login, or log in on the VM's screen"
+}
+
+# ----------------------------------------------------------- the guest agent
+#
+# Never taskkill the agent: the IVSHMEM driver does not clean up after a
+# TerminateProcess and leaves an unkillable process holding the device, which
+# takes a guest reboot to clear. Ending the scheduled task lets it exit.
+start_agent() {
+    local ps
+    ps=$(guest 'tasklist /fi "imagename eq vypr-agent.exe" /fo csv /nh' 2>/dev/null || true)
+    if ! grep -q vypr-agent <<<"$ps"; then
+        say "Starting the guest agent..."
+        guest 'schtasks /end /tn vypr-agent >nul 2>&1 & schtasks /run /tn vypr-agent' >/dev/null 2>&1
+        sleep 6
+    fi
+}
+
+# --------------------------------------------------- Parsec, for the mouse
+#
+# Not for streaming - for its driver.
+#
+# Vypr injects mouse motion with SendInput, which always goes through the Win32
+# cursor pipeline. A game reading raw input for its camera wants the lLastX and
+# lLastY deltas a physical mouse produces, and gets MOUSE_MOVE_ABSOLUTE packets
+# or zeroes instead, reads the cursor as (0,0), and whips the camera into a
+# corner every frame. No userspace API can produce a real HID delta, so this is
+# not fixable in Vypr as it stands. Parsec's parsecvusba driver injects at the
+# kernel HID level, and with it running the deltas are genuine.
+start_parsec() {
+    [ "${USE_PARSEC:-1}" = "1" ] || return 0
+    local ps
+    ps=$(guest 'tasklist /fi "imagename eq parsecd.exe" /fo csv /nh' 2>/dev/null || true)
+    if ! grep -q parsecd <<<"$ps"; then
+        say "Starting Parsec (its driver is what makes the mouse work in games)..."
+        guest 'schtasks /end /tn vypr-parsec >nul 2>&1 & schtasks /run /tn vypr-parsec' >/dev/null 2>&1
+        sleep 5
+    fi
+}
+
+# --------------------------------------------------------- the session daemon
+start_daemon() {
+    local -n _m=$1
+    # A window the user closed is remembered as dismissed, so an app that
+    # ignores WM_CLOSE - as games routinely do - does not have its window
+    # reappear seconds later. The cost is that closing such a window leaves the
+    # app running with nothing showing it. Relaunching is the way back: if the
+    # app is running but nothing is presenting it, restart the daemon, which
+    # forgets what was dismissed.
+    if pgrep -x vyprd >/dev/null && ! pgrep -x vypr-window >/dev/null; then
+        if [ -n "${PROCESS:-}" ] && grep -qi "$PROCESS" <<<"$(guest 'tasklist' 2>/dev/null || true)"; then
+            say "Reattaching to the running app..."
+            pkill -x vyprd
+            sleep 2
+        fi
+    fi
+
+    if ! pgrep -x vyprd >/dev/null; then
+        say "Starting the Vypr session..."
+        [ -x "$BIN/vyprd" ] || die "$BIN/vyprd is missing - reinstall"
+        local args=() m
+        for m in "${_m[@]}"; do args+=(--match "$m"); done
+        nohup "$BIN/vyprd" --shm "$SHM" "${args[@]}" \
+            >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
+        sleep 2
+    fi
+}
+
+# -------------------------------------------------------------- subcommands
+cmd_run() {
+    local app="${1:-}"
+    [ -n "$app" ] || die "usage: vypr run <app>   (see 'vypr apps')"
+    local profile="$APPS/$app.conf"
+    [ -f "$profile" ] || die "no such app '$app' - see 'vypr apps', or add it with 'vypr add'"
+    # shellcheck source=/dev/null
+    . "$profile"
+    APP_NAME="${NAME:-$app}"; APP_ICON="${ICON:-vypr}"
+    : "${MATCHES:?$profile does not set MATCHES}"
+    : "${TASK:?$profile does not set TASK}"
+
+    start_vm
+    start_daemon MATCHES
+    start_agent
+    start_parsec
+
+    if [ -n "${PROCESS:-}" ] && grep -qi "$PROCESS" <<<"$(guest 'tasklist' 2>/dev/null || true)"; then
+        say "$APP_NAME is already running."
+    else
+        say "Launching $APP_NAME..."
+        guest "schtasks /end /tn $TASK >nul 2>&1 & schtasks /run /tn $TASK" >/dev/null 2>&1
+    fi
+
+    local i
+    for i in $(seq 1 60); do
+        pgrep -x vypr-window >/dev/null && { say "$APP_NAME is on screen."; exit 0; }
+        sleep 5
+    done
+    die "$APP_NAME did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+}
+
+cmd_add() {
+    local app="${1:-}" path="${2:-}"
+    if [ -z "$app" ] || [ -z "$path" ]; then
+        cat >&2 <<EOF
+usage: vypr add <name> '<windows path to the .exe or shortcut>'
+
+  e.g. vypr add notepad 'C:\\Windows\\System32\\notepad.exe'
+       vypr add fivem   'C:\\Users\\Me\\Desktop\\FiveM.lnk'
+
+  Optional, and worth setting for games:
+    --match <text>     window titles to stream (repeatable; defaults to <name>)
+    --process <exe>    how to tell it is already running, e.g. GTAProcess
+EOF
+        return 1
+    fi
+    shift 2
+
+    local matches=() process="" label="" m
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --match)   matches+=("$2"); shift 2 ;;
+            --process) process="$2"; shift 2 ;;
+            --name)    label="$2"; shift 2 ;;
+            *) die "unknown option '$1'" ;;
+        esac
+    done
+    [ "${#matches[@]}" -gt 0 ] || matches=("$app")
+    [ -n "$label" ] || label="$app"
+
+    start_vm
+
+    # The task must be interactive and elevated: a non-interactive task has no
+    # desktop to draw on, and games that check for administrator refuse to run.
+    #
+    # It is run through 'cmd /c start' rather than directly because Task
+    # Scheduler launches with CreateProcess, which cannot open a .lnk - and
+    # desktop shortcuts are how people usually point at a game. 'start' goes
+    # through the shell, which resolves them.
+    local task="vypr-$app"
+    say "Registering '$label' in the guest..."
+    guest "schtasks /delete /tn $task /f >nul 2>&1 & schtasks /create /tn $task /tr \"cmd /c start \\\"\\\" \\\"$path\\\"\" /sc once /st 00:00 /it /rl highest /f" \
+        >/dev/null 2>&1 || die "could not create the scheduled task in the guest"
+
+    mkdir -p "$APPS"
+    {
+        echo "NAME=\"$label\""
+        echo "TASK=$task"
+        [ -n "$process" ] && echo "PROCESS=\"$process\""
+        printf 'MATCHES=('
+        for m in "${matches[@]}"; do printf '"%s" ' "$m"; done
+        echo ')'
+    } > "$APPS/$app.conf"
+
+    local desktop="${XDG_DATA_HOME:-$HOME/.local/share}/applications/vypr-$app.desktop"
+    mkdir -p "$(dirname "$desktop")"
+    cat > "$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$label
+Comment=Runs in Windows, shown here by Vypr
+Exec=$BIN/vypr run $app
+Icon=vypr
+Terminal=false
+Categories=Game;
+EOF
+    update-desktop-database "$(dirname "$desktop")" 2>/dev/null || true
+
+    echo
+    say "'$label' is ready. Launch it from your application menu, or: vypr run $app"
+}
+
+cmd_apps() {
+    [ -d "$APPS" ] && ls -1 "$APPS"/*.conf 2>/dev/null | while read -r f; do
+        printf '  %-16s %s\n' "$(basename "$f" .conf)" "$(sed -n 's/^NAME="\(.*\)"/\1/p' "$f")"
+    done || echo "  no apps registered yet - add one with 'vypr add'"
+}
+
+cmd_status() {
+    printf '  VM %-14s %s\n' "$VM" "$(virsh domstate "$VM" 2>/dev/null || echo missing)"
+    printf '  vyprd          %s\n' "$(pgrep -x vyprd >/dev/null && echo running || echo stopped)"
+    printf '  windows open   %s\n' "$(pgrep -xc vypr-window 2>/dev/null || echo 0)"
+    printf '  region         %s\n' "$([ -e "$SHM" ] && echo "$SHM" || echo missing)"
+}
+
+cmd_up()   { start_vm; start_agent; start_parsec; say "Session is up."; }
+cmd_down() {
+    pkill -x vypr-window 2>/dev/null
+    pkill -x vyprd 2>/dev/null
+    guest 'schtasks /end /tn vypr-agent' >/dev/null 2>&1
+    say "Session stopped. The VM is still running - 'virsh shutdown $VM' to stop it too."
+}
+
+case "${1:-}" in
+    run)    shift; cmd_run "$@" ;;
+    add)    shift; cmd_add "$@" ;;
+    apps)   cmd_apps ;;
+    status) cmd_status ;;
+    up)     cmd_up ;;
+    down)   cmd_down ;;
+    *) sed -n '3,10p' "$0" | sed 's/^# \?//' ;;
+esac
