@@ -1,6 +1,12 @@
-# Vypr
+<p align="center">
+  <img src="launcher/vypr.png" width="96" height="96" alt="">
+</p>
 
-Per-application native windows from a Windows VM, over shared memory.
+<h1 align="center">Vypr</h1>
+
+<p align="center">
+  Per-application native windows from a Windows VM, over shared memory.
+</p>
 
 An app running in the guest appears as an ordinary window on the Linux desktop —
 its own entry in the taskbar, its own place in the stacking order — with no RDP
