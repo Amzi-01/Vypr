@@ -20,6 +20,9 @@
 #include "shm.h"
 
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -70,12 +73,233 @@ static int connect_daemon(const char *path, uint64_t window_id)
         return -1;
     }
 
-    /* Non-blocking: this socket is polled from inside the render loop, and a
-     * blocking read would stall presentation waiting for a popup message that
-     * may never arrive. */
+    /*
+     * Non-blocking, still. A reader thread owns receiving and waits in poll(),
+     * so reads no longer need it - but the render loop sends pointer and key
+     * events on this same socket, and a blocking send would stall presentation
+     * whenever the daemon was slow to drain. That is the coupling the reader
+     * thread exists to remove, so it must not be reintroduced in the other
+     * direction.
+     */
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
+}
+
+/*
+ * The link to vyprd is read by its own thread.
+ *
+ * It used to be read once per rendered frame, which quietly made audio a
+ * function of presentation: a long frame - and fullscreen frames are the long
+ * ones - left the audio device with nothing to play, so it ran dry and went
+ * silent, and then the backlog that had gathered in the socket arrived all at
+ * once, overshot the queue's high mark, and was dropped as a burst. The log
+ * showed both halves of that oscillation at the same time: a queue reading zero
+ * milliseconds next to thousands of dropped packets.
+ *
+ * Audio is fed to the device straight from this thread, which SDL permits -
+ * audio streams are safe to use from any thread. Everything else is parked for
+ * the main thread, because it opens windows and touches the compositor, and
+ * neither is safe to do from here.
+ */
+
+struct byte_buf {
+    uint8_t *p;
+    size_t   len, cap;
+};
+
+static int bb_append(struct byte_buf *b, const void *data, size_t n)
+{
+    if (b->len + n > b->cap) {
+        size_t want = b->cap ? b->cap * 2 : 8192;
+        while (want < b->len + n) want *= 2;
+        uint8_t *grown = realloc(b->p, want);
+        if (!grown) return -1;
+        b->p = grown;
+        b->cap = want;
+    }
+    memcpy(b->p + b->len, data, n);
+    b->len += n;
+    return 0;
+}
+
+struct link {
+    int fd;
+
+    /* Audio, owned entirely by the reader thread. */
+    SDL_AudioStream *audio;
+    uint32_t         rate;
+    uint16_t         channels;
+    uint64_t         logged_at;
+    uint64_t         dropped, taken;
+    bool             draining;
+    /* Temporary instrumentation: the reported queue depth is only the value at
+     * the moment of reporting, which told us nothing about how it got there. */
+    int              q_min, q_max;
+    uint64_t         toggles;
+    /* Arrival timing, to tell a bursty producer apart from a queue we are
+     * mismanaging. The queue depth alone cannot distinguish them. */
+    uint64_t         last_ns, max_gap_ns;
+    uint64_t         run, max_run;
+
+    /* Everything else, handed to the main thread. */
+    pthread_mutex_t  lock;
+    struct byte_buf  pending;
+
+    atomic_int stop;
+    atomic_int dead;
+};
+
+static void link_audio(struct link *l, const struct vypr_msg_head *head,
+                       const uint8_t *payload)
+{
+    const struct vypr_msg_audio *a = (const void *)payload;
+    const uint32_t want = a->frames * a->channels * sizeof(float);
+
+    if (!a->channels || !a->sample_rate || head->bytes < sizeof(*a) + want)
+        return;
+
+    if (!l->audio || l->rate != a->sample_rate || l->channels != a->channels) {
+        if (l->audio) SDL_DestroyAudioStream(l->audio);
+        SDL_AudioSpec spec = {
+            .format   = SDL_AUDIO_F32,
+            .channels = (int)a->channels,
+            .freq     = (int)a->sample_rate,
+        };
+        l->audio = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+        if (l->audio) {
+            SDL_ResumeAudioStreamDevice(l->audio);
+            l->rate = a->sample_rate;
+            l->channels = a->channels;
+            printf("vypr: audio %u Hz, %u channels\n", a->sample_rate, a->channels);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "vypr: audio device: %s\n", SDL_GetError());
+            return;
+        }
+    }
+
+    /*
+     * Hold the queue down by dropping what arrives while it is too deep, rather
+     * than emptying it.
+     *
+     * Clearing is a hard silence of however much was queued - a quarter of a
+     * second of nothing, which is what "the audio cuts out" sounds like.
+     * Dropping instead loses the same audio in ten-millisecond pieces spread
+     * over the time it takes to drain, which is close to inaudible.
+     *
+     * Drain to a low mark, then stop - do not simply drop whatever is above a
+     * threshold. A bare threshold becomes the steady state: the queue settles
+     * just beneath it and packets are shed continuously to hold it there.
+     * Measured at 163-187ms queued with 7-25% of packets dropped, heard as
+     * sound cutting out at random.
+     */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+        if (l->last_ns) {
+            const uint64_t gap = now - l->last_ns;
+            if (gap > l->max_gap_ns) l->max_gap_ns = gap;
+            /* Back-to-back arrivals are a backlog being flushed, not a live
+             * stream: at 48 kHz a packet is worth milliseconds of sound. */
+            if (gap < 1000000ull) {
+                l->run++;
+                if (l->run > l->max_run) l->max_run = l->run;
+            } else {
+                l->run = 0;
+            }
+        }
+        l->last_ns = now;
+    }
+
+    const int per_second = (int)(l->rate * l->channels * sizeof(float));
+    const int queued = SDL_GetAudioStreamQueued(l->audio);
+    const int high = per_second / 8;    /* 125ms */
+    const int low  = per_second / 25;   /*  40ms */
+
+    if (!l->q_max && !l->q_min) { l->q_min = queued; l->q_max = queued; }
+    if (queued > l->q_max) l->q_max = queued;
+    if (queued < l->q_min) l->q_min = queued;
+
+    const bool was = l->draining;
+    if (queued > high) l->draining = true;
+    else if (queued <= low) l->draining = false;
+    if (was != l->draining) l->toggles++;
+
+    if (!l->draining) {
+        SDL_PutAudioStreamData(l->audio, payload + sizeof(*a), (int)want);
+        l->taken++;
+    } else {
+        l->dropped++;
+    }
+
+    /*
+     * Reported unconditionally, not behind --stats. Dropping is the only thing
+     * here that can be heard as audio cutting out, and it is otherwise
+     * invisible: everything else in the path looks healthy while it happens.
+     */
+    if (SDL_GetTicks() - l->logged_at > 10000) {
+        l->logged_at = SDL_GetTicks();
+        printf("vypr: audio queue %.0f ms (min %.0f, max %.0f), "
+               "%llu of %llu dropped, %llu cycles | arrivals: gap max %.0f ms, "
+               "longest burst %llu packets\n",
+               queued  * 1000.0 / per_second,
+               l->q_min * 1000.0 / per_second,
+               l->q_max * 1000.0 / per_second,
+               (unsigned long long)l->dropped,
+               (unsigned long long)(l->dropped + l->taken),
+               (unsigned long long)(l->toggles / 2),
+               l->max_gap_ns / 1e6,
+               (unsigned long long)l->max_run);
+        fflush(stdout);
+        l->dropped = l->taken = 0;
+        l->q_min = l->q_max = 0;
+        l->toggles = 0;
+        l->max_gap_ns = 0;
+        l->max_run = 0;
+    }
+}
+
+static void *link_thread(void *arg)
+{
+    struct link *l = arg;
+    struct msg_reader rx = {0};
+
+    while (!atomic_load(&l->stop)) {
+        struct pollfd pfd = { .fd = l->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
+        if (msg_reader_fill(&rx, l->fd) < 0) {
+            atomic_store(&l->dead, 1);
+            break;
+        }
+
+        struct vypr_msg_head head;
+        const uint8_t *payload;
+        while (msg_reader_next(&rx, &head, &payload) == 1) {
+            if (head.type == VYPR_MSG_CLIENT_AUDIO &&
+                head.bytes >= sizeof(struct vypr_msg_audio)) {
+                link_audio(l, &head, payload);
+            } else {
+                /* Parked whole - header and payload together - so the main
+                 * thread can walk it with the same parser. */
+                pthread_mutex_lock(&l->lock);
+                if (bb_append(&l->pending, &head, sizeof(head)) == 0)
+                    bb_append(&l->pending, payload, head.bytes);
+                pthread_mutex_unlock(&l->lock);
+            }
+        }
+    }
+
+    msg_reader_free(&rx);
+    return NULL;
 }
 
 static int parse_args(int argc, char **argv, struct options *o)
@@ -444,7 +668,19 @@ int main(int argc, char **argv)
     if (capture_forced_initial(&opt))
         set_capture(views[0].win, true, true);
 
-    struct msg_reader daemon_rx = {0};
+    struct link link = {0};
+    link.fd = daemon_fd;
+    pthread_mutex_init(&link.lock, NULL);
+    pthread_t link_tid = 0;
+    bool link_running = false;
+    if (daemon_fd >= 0) {
+        if (pthread_create(&link_tid, NULL, link_thread, &link) == 0)
+            link_running = true;
+        else
+            fprintf(stderr, "vypr: could not start the link reader thread\n");
+    }
+    uint8_t *parked = NULL;
+    size_t   parked_cap = 0;
 
     /* Relative pointer mode, driven by the guest telling us an app has taken
      * the pointer. `suspended` is the user's override: a captured pointer must
@@ -470,12 +706,6 @@ int main(int argc, char **argv)
      * for a rate the guest is not producing would mean resampling for no
      * reason. SDL converts if the device disagrees.
      */
-    SDL_AudioStream *audio = NULL;
-    uint32_t audio_rate = 0;
-    uint16_t audio_channels = 0;
-    uint64_t audio_logged_at = 0;
-    uint64_t audio_dropped = 0, audio_taken = 0;
-    bool     audio_draining = false;
 
     struct pointer_accum pointer = {0};
 
@@ -738,124 +968,44 @@ int main(int argc, char **argv)
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
 
-        /* Popups arrive and vanish while we run, so the daemon link is read
-         * every frame rather than only at startup. */
+        /* Messages the reader thread parked for us. Popups open windows and
+         * the rest touches the compositor, so they are handled here rather
+         * than on the thread that receives them. */
         if (daemon_fd >= 0) {
-            int rc = msg_reader_fill(&daemon_rx, daemon_fd);
-            if (rc > 0) {
+            if (atomic_load(&link.dead)) running = 0;
+
+            pthread_mutex_lock(&link.lock);
+            size_t plen = link.pending.len;
+            if (plen) {
+                if (parked_cap < plen) {
+                    uint8_t *g = realloc(parked, plen);
+                    if (g) { parked = g; parked_cap = plen; }
+                    else plen = 0;
+                }
+                if (plen) memcpy(parked, link.pending.p, plen);
+                link.pending.len = 0;
+            }
+            pthread_mutex_unlock(&link.lock);
+
+            size_t off = 0;
+            while (plen - off >= sizeof(struct vypr_msg_head)) {
                 struct vypr_msg_head head;
-                const uint8_t *payload;
-                while (msg_reader_next(&daemon_rx, &head, &payload) == 1) {
+                memcpy(&head, parked + off, sizeof(head));
+                /* head.bytes counts the payload only - the message on the wire
+                 * is the header plus that. Treating it as the total walked this
+                 * buffer at the wrong stride, so every message after the first
+                 * was read from the wrong offset: the client acted on a pointer
+                 * release while the daemon had sent a capture. */
+                const size_t total = sizeof(head) + head.bytes;
+                if (head.bytes > VYPR_MAX_MSG_BYTES || off + total > plen) break;
+                const uint8_t *payload = parked + off + sizeof(head);
+                off += total;
+                {
                     if (head.type == VYPR_MSG_CLIENT_POPUP &&
                         head.bytes >= sizeof(struct vypr_msg_client_popup)) {
                         view_open_popup(views, &view_count, &shm,
                                         (const struct vypr_msg_client_popup *)payload,
                                         opt.backend);
-                    } else if (head.type == VYPR_MSG_CLIENT_AUDIO &&
-                               head.bytes >= sizeof(struct vypr_msg_audio)) {
-                        const struct vypr_msg_audio *a = (const void *)payload;
-                        const uint32_t want = a->frames * a->channels * sizeof(float);
-                        if (a->channels && a->sample_rate &&
-                            head.bytes >= sizeof(*a) + want) {
-                            if (!audio || audio_rate != a->sample_rate ||
-                                audio_channels != a->channels) {
-                                if (audio) SDL_DestroyAudioStream(audio);
-                                SDL_AudioSpec spec = {
-                                    .format   = SDL_AUDIO_F32,
-                                    .channels = (int)a->channels,
-                                    .freq     = (int)a->sample_rate,
-                                };
-                                audio = SDL_OpenAudioDeviceStream(
-                                    SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-                                if (audio) {
-                                    SDL_ResumeAudioStreamDevice(audio);
-                                    audio_rate = a->sample_rate;
-                                    audio_channels = a->channels;
-                                    printf("vypr: audio %u Hz, %u channels\n",
-                                           a->sample_rate, a->channels);
-                                    fflush(stdout);
-                                } else {
-                                    fprintf(stderr, "vypr: audio device: %s\n",
-                                            SDL_GetError());
-                                }
-                            }
-                            if (audio) {
-                                /*
-                                 * Hold the queue down by dropping what arrives
-                                 * while it is too deep, rather than emptying it.
-                                 *
-                                 * Clearing is a hard silence of however much was
-                                 * queued - a quarter of a second of nothing,
-                                 * which is what "the audio cuts out" sounds
-                                 * like. It fired on busy scenes, when the guest
-                                 * falls behind and a backlog builds, and busy
-                                 * scenes are loud ones.
-                                 *
-                                 * Dropping instead loses the same audio in
-                                 * ten-millisecond pieces spread over the time it
-                                 * takes to drain, which is close to inaudible,
-                                 * and the queue still comes down. Only the query
-                                 * runs per packet, which is a counter read.
-                                 */
-                                const int per_second =
-                                    (int)(audio_rate * audio_channels * sizeof(float));
-                                /*
-                                 * Drain to a low mark, then stop - do not
-                                 * simply drop whatever is above a threshold.
-                                 *
-                                 * A bare threshold becomes the steady state:
-                                 * the queue settles just beneath it and packets
-                                 * are shed continuously to hold it there.
-                                 * Measured at 163-187ms queued with 7-25% of
-                                 * packets dropped, heard as sound cutting out
-                                 * at random.
-                                 *
-                                 * With a low mark, a backlog is drained once in
-                                 * a short burst and then nothing is dropped at
-                                 * all until another one forms.
-                                 */
-                                const int queued = SDL_GetAudioStreamQueued(audio);
-                                const int high = per_second / 8;    /* 125ms */
-                                const int low  = per_second / 25;   /*  40ms */
-
-                                if (queued > high) audio_draining = true;
-                                else if (queued <= low) audio_draining = false;
-
-                                if (!audio_draining) {
-                                    SDL_PutAudioStreamData(audio,
-                                                           payload + sizeof(*a), (int)want);
-                                    audio_taken++;
-                                } else {
-                                    audio_dropped++;
-                                }
-
-                                /*
-                                 * Reported unconditionally, not behind --stats.
-                                 *
-                                 * Dropping is the only thing here that can be
-                                 * heard as audio cutting out, and it is
-                                 * otherwise invisible: everything else in the
-                                 * path looks healthy while it happens. A line
-                                 * every ten seconds is cheap, and it is the
-                                 * difference between measuring this and
-                                 * guessing at it again.
-                                 */
-                                if (SDL_GetTicks() - audio_logged_at > 10000) {
-                                    audio_logged_at = SDL_GetTicks();
-                                    if (audio_dropped)
-                                        printf("vypr: audio queued %.0f ms, dropped %llu of "
-                                               "%llu packets\n",
-                                               queued * 1000.0 / per_second,
-                                               (unsigned long long)audio_dropped,
-                                               (unsigned long long)(audio_dropped + audio_taken));
-                                    else
-                                        printf("vypr: audio queued %.0f ms, no drops\n",
-                                               queued * 1000.0 / per_second);
-                                    fflush(stdout);
-                                    audio_dropped = audio_taken = 0;
-                                }
-                            }
-                        }
                     } else if (head.type == VYPR_MSG_CLIENT_STATE &&
                                head.bytes >= sizeof(struct vypr_msg_window_state)) {
                         const struct vypr_msg_window_state *m = (const void *)payload;
@@ -978,8 +1128,14 @@ int main(int argc, char **argv)
         if (views[i].pres) presenter_destroy(views[i].pres);
         if (views[i].win)  SDL_DestroyWindow(views[i].win);
     }
-    if (audio) SDL_DestroyAudioStream(audio);
-    msg_reader_free(&daemon_rx);
+    if (link_running) {
+        atomic_store(&link.stop, 1);
+        pthread_join(link_tid, NULL);
+    }
+    if (link.audio) SDL_DestroyAudioStream(link.audio);
+    pthread_mutex_destroy(&link.lock);
+    free(link.pending.p);
+    free(parked);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
     vypr_shm_close(&shm);
