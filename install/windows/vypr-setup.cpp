@@ -119,6 +119,42 @@ static DWORD run(const std::wstring &cmd, bool quiet = false)
 // PowerShell is driven through a script file rather than -Command. Passing a
 // script as an argument means escaping quotes through both the C++ literal and
 // the command line, which is where mistakes hide; a file has to escape nothing.
+/*
+ * Run something without capturing its output, and give up on it.
+ *
+ * The output-capturing version waits for the pipe to close, which never
+ * happens if the child leaves a grandchild holding the write handle - and it
+ * waits INFINITE besides. Parsec's driver installer did exactly that: two of
+ * its processes sat there indefinitely and the whole setup stopped, showing a
+ * disabled Install button and no explanation. A third-party installer is not
+ * something to stake the session on.
+ *
+ * Its window is shown rather than hidden: if it wants a click, the person
+ * running this should be able to give it one.
+ */
+static DWORD run_bounded(const std::wstring &cmd, DWORD timeout_ms)
+{
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    std::wstring mutable_cmd = cmd;
+
+    if (!CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
+                        0, nullptr, nullptr, &si, &pi))
+        return (DWORD)-1;
+
+    const DWORD waited = WaitForSingleObject(pi.hProcess, timeout_ms);
+    DWORD code = (DWORD)-2;          /* -2 means it ran out of time */
+    if (waited == WAIT_OBJECT_0)
+        GetExitCodeProcess(pi.hProcess, &code);
+    else
+        TerminateProcess(pi.hProcess, 1);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code;
+}
+
 static DWORD powershell(const std::wstring &script, bool quiet = false)
 {
     wchar_t tmp[MAX_PATH];
@@ -280,7 +316,9 @@ static void install_ivshmem()
     // lays the files down, and pnputil then binds them to the device.
     powershell(L"Expand-Archive -LiteralPath '" + zip + L"' -DestinationPath '" +
                dir + L"' -Force", true);
-    run(L"\"" + dir + L"\\looking-glass-host-setup.exe\" /S", true);
+    if (run_bounded(L"\"" + dir + L"\\looking-glass-host-setup.exe\" /S", 180000)
+        == (DWORD)-2)
+        logf(L"  [!!] the Looking Glass installer did not finish in time");
 
     std::wstring inf = L"C:\\Program Files\\Looking Glass (host)\\ivshmem.inf";
     run(L"pnputil /add-driver \"" + inf + L"\" /install", true);
@@ -298,6 +336,14 @@ static void install_parsec_vud()
     // reads the cursor at a corner and whips the camera there every frame. No
     // userspace API can produce a real HID delta. Parsec's driver injects at
     // the kernel HID level, which is why it is here.
+    // Already present is the common case on a machine being set up twice, and
+    // running the installer again is what hung it.
+    if (powershell(L"if ((pnputil /enum-drivers) -match 'parsecvusba') "
+                   L"{ exit 0 } else { exit 1 }\n", true) == 0) {
+        logf(L"  [ok] already installed");
+        return;
+    }
+
     std::wstring exe = temp_dir() + L"parsec-vud.exe";
     logf(L"  downloading...");
     if (URLDownloadToFileW(nullptr, PARSEC_VUD_URL, exe.c_str(), 0, nullptr) != S_OK) {
@@ -309,8 +355,17 @@ static void install_parsec_vud()
     }
 
     logf(L"  installing (Windows may ask you to trust the driver)...");
-    step_ok(run(L"\"" + exe + L"\" /silent", true) == 0 ||
-            run(L"\"" + exe + L"\"", true) == 0,
+    const DWORD rc = run_bounded(L"\"" + exe + L"\" /silent", 180000);
+    if (rc == (DWORD)-2) {
+        logf(L"  [!!] Parsec's installer did not finish within three minutes.");
+        logf(L"       Run it yourself: %s", exe.c_str());
+        logf(L"       Everything else here is done; games that read raw input");
+        logf(L"       will misbehave until that driver is in.");
+        g_failed = true;
+        return;
+    }
+    step_ok(powershell(L"if ((pnputil /enum-drivers) -match 'parsecvusba') "
+                       L"{ exit 0 } else { exit 1 }\n", true) == 0,
             L"Parsec virtual USB driver installed");
 }
 
