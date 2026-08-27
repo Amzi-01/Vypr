@@ -43,14 +43,23 @@ anything else in the VM too.
 
 ## What it looks like
 
-FiveM, running in the VM, shown on the Linux desktop with its own taskbar entry —
-the application this was built for:
+<details>
+<summary><b>FiveM</b> — the application this was built for, running in the VM with its own taskbar entry</summary>
+
+<br>
 
 ![FiveM running through Vypr](docs/images/fivem.png)
 
-Call of Duty: Modern Warfare II, launched from Steam inside the guest:
+</details>
+
+<details>
+<summary><b>Call of Duty: Modern Warfare II</b> — launched from Steam inside the guest</summary>
+
+<br>
 
 ![Call of Duty running through Vypr](docs/images/cod.png)
+
+</details>
 
 ## What you need
 
