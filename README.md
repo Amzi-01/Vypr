@@ -44,7 +44,10 @@ vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM --process GTAProces
 
 That creates the scheduled task in the guest and a desktop entry here, so the
 game is in your application menu like anything else. `vypr run fivem` starts it,
-`vypr apps` lists what is registered, `vypr status` says what is up.
+`vypr apps` lists what is registered, `vypr status` says what is up, and
+`vypr doctor` checks the parts that fail quietly — a region that came back empty
+after a reboot, a domain that lost its shmem device to an edit in virt-manager,
+a guest that is running but not answering.
 
 Applications are registered **without** elevation. Several games refuse to run as
 administrator outright — FiveM says so and exits — and there is no need: the

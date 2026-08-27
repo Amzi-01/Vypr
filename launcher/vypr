@@ -7,6 +7,7 @@
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
+#   vypr doctor         check the setup for the things that go quietly wrong
 #
 # Every step is skipped if it is already done, so running this twice is safe.
 set -uo pipefail
@@ -357,6 +358,76 @@ cmd_status() {
     fi
 }
 
+# A health check for the parts that are easy to get wrong and quiet when they
+# are: a region recreated empty by tmpfiles, a domain that lost its shmem device
+# to an edit in virt-manager, a guest that is up but not answering.
+cmd_doctor() {
+    local want=$(( ${SHM_SIZE_MB:-$SHM_SIZE_MB_DEFAULT} * 1024 * 1024 ))
+    local bad=0
+
+    echo "region"
+    if [ -e "$SHM" ]; then
+        local size owner
+        size=$(stat -c%s "$SHM"); owner=$(stat -c'%U:%G %a' "$SHM")
+        printf '  %s  %s  %s MiB\n' "$SHM" "$owner" "$(( size / 1024 / 1024 ))"
+        if [ "$size" -lt "$want" ]; then
+            echo "  it is smaller than the configured $(( want / 1024 / 1024 )) MiB;"
+            echo "  this is normal after a reboot and 'vypr run' fixes it"
+        fi
+    else
+        echo "  MISSING - apply the tmpfiles rule the installer printed"
+        bad=1
+    fi
+
+    echo "binaries"
+    local b p
+    for b in vyprd vypr-window; do
+        p=$(command -v "$b" 2>/dev/null)
+        if [ -n "$p" ]; then printf '  %-12s %s\n' "$b" "$p"
+        else printf '  %-12s NOT ON PATH\n' "$b"; bad=1; fi
+    done
+
+    echo "vm"
+    local state; state=$(virsh domstate "$VM" 2>/dev/null || echo missing)
+    printf '  %-12s %s\n' "$VM" "$state"
+    if [ "$state" = "missing" ]; then
+        echo "  that domain does not exist - check VM= in your config"
+        bad=1
+    else
+        local xml; xml=$(virsh dumpxml --inactive "$VM" 2>/dev/null)
+        grep -q "shmem name='vypr'" <<<"$xml" \
+            && echo "  shmem device  present" \
+            || { echo "  shmem device  MISSING - re-run install/install.sh"; bad=1; }
+        grep -q topoext <<<"$xml" \
+            && echo "  topoext       required" \
+            || echo "  topoext       absent (the guest will not see SMT)"
+        grep -q "type='tablet'" <<<"$xml" \
+            && { echo "  usb tablet    PRESENT - this breaks the mouse in games"; bad=1; } \
+            || echo "  usb tablet    absent, as it should be"
+    fi
+
+    echo "guest"
+    if [ "$state" = "running" ]; then
+        if guest 'echo ok' >/dev/null 2>&1; then
+            echo "  ssh           answering"
+            guest 'tasklist /fi "imagename eq vypr-agent.exe" /fo csv /nh' 2>/dev/null \
+                | grep -q vypr-agent \
+                && echo "  agent         running" \
+                || echo "  agent         not running ('vypr up' starts it)"
+        else
+            echo "  ssh           NOT answering - check GUEST/GUEST_USER in your config"
+            bad=1
+        fi
+    else
+        echo "  not running, so nothing to ask"
+    fi
+
+    echo
+    [ "$bad" -eq 0 ] && echo "Nothing here needs attention." \
+                     || echo "Some of the above needs attention."
+    return "$bad"
+}
+
 cmd_up()   { ensure_region; start_vm; start_agent; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
@@ -370,6 +441,7 @@ case "${1:-}" in
     add)    shift; cmd_add "$@" ;;
     apps)   cmd_apps ;;
     status) cmd_status ;;
+    doctor) cmd_doctor ;;
     up)     cmd_up ;;
     down)   cmd_down ;;
     *) sed -n '3,10p' "$0" | sed 's/^# \?//' ;;
