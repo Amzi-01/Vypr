@@ -11,7 +11,7 @@
 #include <vector>
 
 extern "C" {
-#include "sash_shm.h"
+#include "vypr_shm.h"
 }
 
 #pragma comment(lib, "setupapi.lib")
@@ -54,7 +54,7 @@ struct IVSHMEM_MMAP {
 
 }  // namespace
 
-namespace sash {
+namespace vypr {
 
 Region::~Region() { close(); }
 
@@ -80,22 +80,22 @@ bool Region::try_device(const wchar_t* path) {
         return false;
     }
 
-    if (!map.ptr || map.size < SASH_HEADER_BYTES) {
+    if (!map.ptr || map.size < VYPR_HEADER_BYTES) {
         DeviceIoControl(h, IOCTL_IVSHMEM_RELEASE_MMAP, nullptr, 0, nullptr, 0, &returned, nullptr);
         CloseHandle(h);
         return false;
     }
 
-    const auto* hdr = static_cast<const sash_shm_header*>(map.ptr);
-    if (hdr->magic != SASH_SHM_MAGIC) {
+    const auto* hdr = static_cast<const vypr_shm_header*>(map.ptr);
+    if (hdr->magic != VYPR_SHM_MAGIC) {
         // Somebody else's region - Looking Glass's, most likely. Let it go.
         DeviceIoControl(h, IOCTL_IVSHMEM_RELEASE_MMAP, nullptr, 0, nullptr, 0, &returned, nullptr);
         CloseHandle(h);
         return false;
     }
-    if (hdr->version != SASH_SHM_VERSION) {
-        std::fprintf(stderr, "sash: region is version %u, agent speaks %u\n",
-                     hdr->version, SASH_SHM_VERSION);
+    if (hdr->version != VYPR_SHM_VERSION) {
+        std::fprintf(stderr, "vypr: region is version %u, agent speaks %u\n",
+                     hdr->version, VYPR_SHM_VERSION);
         DeviceIoControl(h, IOCTL_IVSHMEM_RELEASE_MMAP, nullptr, 0, nullptr, 0, &returned, nullptr);
         CloseHandle(h);
         return false;
@@ -104,7 +104,7 @@ bool Region::try_device(const wchar_t* path) {
     handle_ = h;
     base_   = map.ptr;
     bytes_  = static_cast<std::size_t>(map.size);
-    std::fprintf(stderr, "sash: mapped %.0f MiB region, generation %u\n",
+    std::fprintf(stderr, "vypr: mapped %.0f MiB region, generation %u\n",
                  bytes_ / 1048576.0, hdr->generation);
     return true;
 }
@@ -115,7 +115,7 @@ bool Region::open() {
     HDEVINFO info = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_IVSHMEM, nullptr, nullptr,
                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (info == INVALID_HANDLE_VALUE) {
-        std::fprintf(stderr, "sash: no IVSHMEM class; is the driver installed?\n");
+        std::fprintf(stderr, "vypr: no IVSHMEM class; is the driver installed?\n");
         return false;
     }
 
@@ -145,10 +145,10 @@ bool Region::open() {
 
     SetupDiDestroyDeviceInfoList(info);
     if (seen == 0)
-        std::fprintf(stderr, "sash: IVSHMEM driver present but no devices\n");
+        std::fprintf(stderr, "vypr: IVSHMEM driver present but no devices\n");
     else
         std::fprintf(stderr,
-                     "sash: %d IVSHMEM device(s), none holding a sash region - "
+                     "vypr: %d IVSHMEM device(s), none holding a vypr region - "
                      "start the host session first\n", seen);
     return false;
 }
@@ -165,4 +165,4 @@ void Region::close() {
     bytes_  = 0;
 }
 
-}  // namespace sash
+}  // namespace vypr

@@ -1,5 +1,5 @@
 /*
- * sash_shm.h - layout of the shared-memory region between the Windows guest
+ * vypr_shm.h - layout of the shared-memory region between the Windows guest
  *              and the Linux host. Included verbatim by both sides, so it must
  *              stay free of platform headers and free of anything C++-only.
  *
@@ -19,31 +19,31 @@
  *   - Nothing here is a security boundary. A hostile guest can scribble over
  *     the whole region; it already has a passthrough GPU.
  */
-#ifndef SASH_SHM_H
-#define SASH_SHM_H
+#ifndef VYPR_SHM_H
+#define VYPR_SHM_H
 
 #include <stdint.h>
 
-#define SASH_SHM_MAGIC      0x48534153u  /* 'SASH' little-endian */
-#define SASH_SHM_VERSION    1u
+#define VYPR_SHM_MAGIC      0x48534153u  /* 'SASH' little-endian */
+#define VYPR_SHM_VERSION    1u
 
 /* Slots are windows. Sixteen is far past what a person keeps open from one VM,
  * and keeping it fixed lets the header be a plain struct at a known offset. */
-#define SASH_MAX_SLOTS      16u
+#define VYPR_MAX_SLOTS      16u
 
 /* Ring depth per window. Three is the smallest depth where the producer can
  * write while the consumer reads and still have a spare to publish into. */
-#define SASH_RING_FRAMES    3u
+#define VYPR_RING_FRAMES    3u
 
 /* Pixel formats. BGRA is what Windows.Graphics.Capture hands back, so it is
  * the only one the first version speaks. */
-#define SASH_FMT_BGRA8      1u
+#define VYPR_FMT_BGRA8      1u
 
-enum sash_slot_state {
-    SASH_SLOT_FREE   = 0,  /* host may allocate it */
-    SASH_SLOT_ARMED  = 1,  /* host allocated, guest has not published yet */
-    SASH_SLOT_LIVE   = 2,  /* guest is publishing frames */
-    SASH_SLOT_CLOSED = 3   /* guest window is gone; host reclaims */
+enum vypr_slot_state {
+    VYPR_SLOT_FREE   = 0,  /* host may allocate it */
+    VYPR_SLOT_ARMED  = 1,  /* host allocated, guest has not published yet */
+    VYPR_SLOT_LIVE   = 2,  /* guest is publishing frames */
+    VYPR_SLOT_CLOSED = 3   /* guest window is gone; host reclaims */
 };
 
 /*
@@ -56,7 +56,7 @@ enum sash_slot_state {
  * record and drops that read. It costs two stores per frame and removes the
  * need for any lock across the VM boundary.
  */
-struct sash_publish {
+struct vypr_publish {
     volatile uint32_t seq;       /* even = stable, odd = being written */
     uint32_t index;              /* which ring buffer holds the frame */
     uint32_t serial;             /* increments once per published frame */
@@ -69,12 +69,12 @@ struct sash_publish {
     uint32_t _pad;
 };
 
-#define SASH_PUB_CURSOR_VISIBLE  (1u << 0)
-#define SASH_PUB_DAMAGE_FULL     (1u << 1)
+#define VYPR_PUB_CURSOR_VISIBLE  (1u << 0)
+#define VYPR_PUB_DAMAGE_FULL     (1u << 1)
 
-struct sash_slot {
-    volatile uint32_t state;     /* enum sash_slot_state */
-    uint32_t format;             /* SASH_FMT_* */
+struct vypr_slot {
+    volatile uint32_t state;     /* enum vypr_slot_state */
+    uint32_t format;             /* VYPR_FMT_* */
     uint64_t window_id;          /* guest HWND, as an opaque identity */
 
     /* Ring geometry, written by the host at allocation and read-only to the
@@ -97,10 +97,10 @@ struct sash_slot {
      */
     uint32_t epoch;
 
-    struct sash_publish pub;
+    struct vypr_publish pub;
 };
 
-struct sash_shm_header {
+struct vypr_shm_header {
     uint32_t magic;
     uint32_t version;
     uint64_t region_bytes;
@@ -129,13 +129,13 @@ struct sash_shm_header {
      * uncertainty instead of implying precision they do not have. */
     uint32_t offset_rtt_us;
 
-    struct sash_slot slots[SASH_MAX_SLOTS];
+    struct vypr_slot slots[VYPR_MAX_SLOTS];
 };
 
 /* Pixel data starts after the header, rounded up to a page so that ring buffers
  * are page-aligned and a memcpy out of one does not straddle needlessly. */
-#define SASH_DATA_ALIGN     4096u
-#define SASH_HEADER_BYTES   ((sizeof(struct sash_shm_header) + SASH_DATA_ALIGN - 1) \
-                             & ~(uint64_t)(SASH_DATA_ALIGN - 1))
+#define VYPR_DATA_ALIGN     4096u
+#define VYPR_HEADER_BYTES   ((sizeof(struct vypr_shm_header) + VYPR_DATA_ALIGN - 1) \
+                             & ~(uint64_t)(VYPR_DATA_ALIGN - 1))
 
-#endif /* SASH_SHM_H */
+#endif /* VYPR_SHM_H */

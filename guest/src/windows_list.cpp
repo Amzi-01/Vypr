@@ -10,7 +10,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
 
-namespace sash {
+namespace vypr {
 
 namespace {
 
@@ -86,7 +86,7 @@ bool is_presentable(HWND hwnd) {
     const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if (ex & WS_EX_NOREDIRECTIONBITMAP) return false;  // nothing for WGC to capture
 
-    const RECT cap = sash_capture_rect(hwnd);
+    const RECT cap = vypr_capture_rect(hwnd);
     if (cap.right - cap.left < 8 || cap.bottom - cap.top < 8) return false;
 
     return true;
@@ -156,7 +156,7 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     // The whole window including Windows' own title bar and border. The host
     // presents it undecorated, so that title bar is the window's title bar -
     // its buttons work because the input goes straight to Windows.
-    const RECT cap = sash_capture_rect(hwnd);
+    const RECT cap = vypr_capture_rect(hwnd);
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
@@ -176,7 +176,7 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     d.height = static_cast<std::uint32_t>(cap.bottom - cap.top);
     d.pid    = pid;
 
-    const RECT content = sash_content_rect(hwnd);
+    const RECT content = vypr_content_rect(hwnd);
     d.chrome_top = (content.top > cap.top)
                  ? static_cast<std::uint32_t>(content.top - cap.top) : 0;
 
@@ -185,10 +185,10 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
     d.dpi = GetDpiForWindow(hwnd);
     if (d.dpi == 0) d.dpi = 96;
 
-    if (ex & WS_EX_TOOLWINDOW)      d.flags |= SASH_WIN_TOOL_WINDOW;
-    if (popup)                      d.flags |= SASH_WIN_POPUP;
-    if (style & WS_THICKFRAME)      d.flags |= SASH_WIN_RESIZABLE;
-    if (IsIconic(hwnd))             d.flags |= SASH_WIN_MINIMIZED;
+    if (ex & WS_EX_TOOLWINDOW)      d.flags |= VYPR_WIN_TOOL_WINDOW;
+    if (popup)                      d.flags |= VYPR_WIN_POPUP;
+    if (style & WS_THICKFRAME)      d.flags |= VYPR_WIN_RESIZABLE;
+    if (IsIconic(hwnd))             d.flags |= VYPR_WIN_MINIMIZED;
 
     // Covers the whole desktop: treat it as a fullscreen app, which the host
     // uses to decide whether to start with the pointer captured.
@@ -200,7 +200,7 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
         const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if ((LONG)d.width >= vw - 2 && (LONG)d.height >= vh - 2)
-            d.flags |= SASH_WIN_FULLSCREEN;
+            d.flags |= VYPR_WIN_FULLSCREEN;
     }
 
     const int len = GetWindowTextLengthW(hwnd);
@@ -278,4 +278,4 @@ std::vector<WindowInfo> windows_for_pid(std::uint32_t pid) {
     return out;
 }
 
-}  // namespace sash
+}  // namespace vypr

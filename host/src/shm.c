@@ -14,13 +14,13 @@
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
-int sash_shm_open(struct sash_shm *s, const char *path, int format)
+int vypr_shm_open(struct vypr_shm *s, const char *path, int format)
 {
     memset(s, 0, sizeof(*s));
 
     s->fd = open(path, O_RDWR);
     if (s->fd < 0) {
-        fprintf(stderr, "sash: open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "vypr: open %s: %s\n", path, strerror(errno));
         return -1;
     }
 
@@ -28,8 +28,8 @@ int sash_shm_open(struct sash_shm *s, const char *path, int format)
     if (fstat(s->fd, &st) < 0) { close(s->fd); return -1; }
     s->bytes = (size_t)st.st_size;
 
-    if (s->bytes < SASH_HEADER_BYTES + SASH_DATA_ALIGN) {
-        fprintf(stderr, "sash: %s is only %zu bytes; too small to be useful\n",
+    if (s->bytes < VYPR_HEADER_BYTES + VYPR_DATA_ALIGN) {
+        fprintf(stderr, "vypr: %s is only %zu bytes; too small to be useful\n",
                 path, s->bytes);
         close(s->fd);
         return -1;
@@ -37,61 +37,61 @@ int sash_shm_open(struct sash_shm *s, const char *path, int format)
 
     s->base = mmap(NULL, s->bytes, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
     if (s->base == MAP_FAILED) {
-        fprintf(stderr, "sash: mmap %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "vypr: mmap %s: %s\n", path, strerror(errno));
         close(s->fd);
         return -1;
     }
 
-    s->hdr = (struct sash_shm_header *)s->base;
-    s->alloc_cursor = SASH_HEADER_BYTES;
+    s->hdr = (struct vypr_shm_header *)s->base;
+    s->alloc_cursor = VYPR_HEADER_BYTES;
 
     if (format) {
         uint32_t generation = 1;
         /* Preserve the generation across a restart if the region already held a
          * session, so a guest still running notices its offsets went stale. */
-        if (s->hdr->magic == SASH_SHM_MAGIC)
+        if (s->hdr->magic == VYPR_SHM_MAGIC)
             generation = s->hdr->generation + 1;
 
         memset(s->hdr, 0, sizeof(*s->hdr));
         s->hdr->region_bytes = s->bytes;
-        s->hdr->slot_count   = SASH_MAX_SLOTS;
-        s->hdr->version      = SASH_SHM_VERSION;
+        s->hdr->slot_count   = VYPR_MAX_SLOTS;
+        s->hdr->version      = VYPR_SHM_VERSION;
         RELEASE(&s->hdr->generation, generation);
         /* Magic last: a guest polling for a formatted region must not see a
          * half-written header. */
-        __atomic_store_n(&s->hdr->magic, SASH_SHM_MAGIC, __ATOMIC_RELEASE);
+        __atomic_store_n(&s->hdr->magic, VYPR_SHM_MAGIC, __ATOMIC_RELEASE);
     } else {
-        if (ACQUIRE(&s->hdr->magic) != SASH_SHM_MAGIC) {
-            fprintf(stderr, "sash: %s holds no sash region (magic 0x%08x)\n",
+        if (ACQUIRE(&s->hdr->magic) != VYPR_SHM_MAGIC) {
+            fprintf(stderr, "vypr: %s holds no vypr region (magic 0x%08x)\n",
                     path, s->hdr->magic);
-            sash_shm_close(s);
+            vypr_shm_close(s);
             return -1;
         }
-        if (s->hdr->version != SASH_SHM_VERSION) {
-            fprintf(stderr, "sash: region is version %u, this build speaks %u\n",
-                    s->hdr->version, SASH_SHM_VERSION);
-            sash_shm_close(s);
+        if (s->hdr->version != VYPR_SHM_VERSION) {
+            fprintf(stderr, "vypr: region is version %u, this build speaks %u\n",
+                    s->hdr->version, VYPR_SHM_VERSION);
+            vypr_shm_close(s);
             return -1;
         }
     }
     return 0;
 }
 
-void sash_shm_close(struct sash_shm *s)
+void vypr_shm_close(struct vypr_shm *s)
 {
     if (s->base && s->base != MAP_FAILED) munmap(s->base, s->bytes);
     if (s->fd > 0) close(s->fd);
     memset(s, 0, sizeof(*s));
 }
 
-int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
-                   uint32_t max_w, uint32_t max_h, struct sash_msg_attach *out)
+int vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
+                   uint32_t max_w, uint32_t max_h, struct vypr_msg_attach *out)
 {
     uint32_t i;
-    for (i = 0; i < SASH_MAX_SLOTS; i++)
-        if (s->hdr->slots[i].state == SASH_SLOT_FREE) break;
-    if (i == SASH_MAX_SLOTS) {
-        fprintf(stderr, "sash: all %u slots in use\n", SASH_MAX_SLOTS);
+    for (i = 0; i < VYPR_MAX_SLOTS; i++)
+        if (s->hdr->slots[i].state == VYPR_SLOT_FREE) break;
+    if (i == VYPR_MAX_SLOTS) {
+        fprintf(stderr, "vypr: all %u slots in use\n", VYPR_MAX_SLOTS);
         return -1;
     }
 
@@ -101,8 +101,8 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     max_h = (uint32_t)align_up(max_h, 64);
 
     uint64_t stride      = align_up((uint64_t)max_w * 4, 256);
-    uint64_t frame_bytes = align_up(stride * max_h, SASH_DATA_ALIGN);
-    uint64_t need        = frame_bytes * SASH_RING_FRAMES;
+    uint64_t frame_bytes = align_up(stride * max_h, VYPR_DATA_ALIGN);
+    uint64_t need        = frame_bytes * VYPR_RING_FRAMES;
 
     /* Reuse a range a closed window gave back before taking new ground.
      * Without this the region is consumed at roughly 114 MiB per 4K window and
@@ -128,31 +128,31 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
         s->alloc_cursor += need;
     } else {
         fprintf(stderr,
-                "sash: need %.1f MiB for %ux%u but only %.1f MiB unused and no "
+                "vypr: need %.1f MiB for %ux%u but only %.1f MiB unused and no "
                 "freed range big enough (%d free)\n",
                 need / 1048576.0, max_w, max_h,
                 (s->bytes - s->alloc_cursor) / 1048576.0, s->freed_count);
         return -1;
     }
 
-    struct sash_slot *slot = &s->hdr->slots[i];
+    struct vypr_slot *slot = &s->hdr->slots[i];
     /* Survives the wipe: the whole point is that it never repeats. */
     const uint32_t epoch = slot->epoch + 1;
     memset(slot, 0, sizeof(*slot));
     slot->epoch        = epoch;
-    slot->format       = SASH_FMT_BGRA8;
+    slot->format       = VYPR_FMT_BGRA8;
     slot->window_id    = window_id;
     slot->ring_offset  = offset;
     slot->frame_bytes  = frame_bytes;
     slot->max_width    = max_w;
     slot->max_height   = max_h;
     slot->frame_stride = (uint32_t)stride;
-    RELEASE(&slot->state, (uint32_t)SASH_SLOT_ARMED);
+    RELEASE(&slot->state, (uint32_t)VYPR_SLOT_ARMED);
 
     memset(out, 0, sizeof(*out));
     out->window_id    = window_id;
     out->slot         = i;
-    out->format       = SASH_FMT_BGRA8;
+    out->format       = VYPR_FMT_BGRA8;
     out->ring_offset  = slot->ring_offset;
     out->frame_bytes  = frame_bytes;
     out->max_width    = max_w;
@@ -162,10 +162,10 @@ int sash_shm_alloc(struct sash_shm *s, uint64_t window_id,
     return 0;
 }
 
-void sash_shm_free(struct sash_shm *s, uint32_t slot)
+void vypr_shm_free(struct vypr_shm *s, uint32_t slot)
 {
-    if (slot >= SASH_MAX_SLOTS) return;
-    struct sash_slot *sl = &s->hdr->slots[slot];
+    if (slot >= VYPR_MAX_SLOTS) return;
+    struct vypr_slot *sl = &s->hdr->slots[slot];
 
     /*
      * Bump the epoch before anything else.
@@ -177,9 +177,9 @@ void sash_shm_free(struct sash_shm *s, uint32_t slot)
      * turning up in another's ring.
      */
     RELEASE(&sl->epoch, sl->epoch + 1);
-    RELEASE(&sl->state, (uint32_t)SASH_SLOT_FREE);
+    RELEASE(&sl->state, (uint32_t)VYPR_SLOT_FREE);
 
-    const uint64_t bytes = sl->frame_bytes * SASH_RING_FRAMES;
+    const uint64_t bytes = sl->frame_bytes * VYPR_RING_FRAMES;
     if (bytes == 0) return;
 
     /* Give the range back. Adjacent ranges are merged where they meet, so a
@@ -198,25 +198,25 @@ void sash_shm_free(struct sash_shm *s, uint32_t slot)
         }
     }
 
-    if (s->freed_count < SASH_MAX_FREE_RANGES) {
+    if (s->freed_count < VYPR_MAX_FREE_RANGES) {
         s->freed[s->freed_count].offset = offset;
         s->freed[s->freed_count].bytes  = bytes;
         s->freed_count++;
     }
 }
 
-uint32_t sash_slot_state(struct sash_shm *s, uint32_t slot)
+uint32_t vypr_slot_state(struct vypr_shm *s, uint32_t slot)
 {
-    if (slot >= SASH_MAX_SLOTS) return (uint32_t)SASH_SLOT_FREE;
+    if (slot >= VYPR_MAX_SLOTS) return (uint32_t)VYPR_SLOT_FREE;
     return ACQUIRE(&s->hdr->slots[slot].state);
 }
 
-int sash_shm_acquire(struct sash_shm *s, uint32_t slot_index, uint32_t since,
-                     struct sash_frame_view *out)
+int vypr_shm_acquire(struct vypr_shm *s, uint32_t slot_index, uint32_t since,
+                     struct vypr_frame_view *out)
 {
-    if (slot_index >= SASH_MAX_SLOTS) return -1;
-    struct sash_slot *slot = &s->hdr->slots[slot_index];
-    if (ACQUIRE(&slot->state) != SASH_SLOT_LIVE) return -1;
+    if (slot_index >= VYPR_MAX_SLOTS) return -1;
+    struct vypr_slot *slot = &s->hdr->slots[slot_index];
+    if (ACQUIRE(&slot->state) != VYPR_SLOT_LIVE) return -1;
 
     /* Seqlock read. A torn record means the guest published mid-read, so retry;
      * a handful of attempts is plenty, since the guest's write window is a few
@@ -225,7 +225,7 @@ int sash_shm_acquire(struct sash_shm *s, uint32_t slot_index, uint32_t since,
         uint32_t seq0 = ACQUIRE(&slot->pub.seq);
         if (seq0 & 1u) continue;
 
-        struct sash_publish p = slot->pub;
+        struct vypr_publish p = slot->pub;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
         if (ACQUIRE(&slot->pub.seq) != seq0) continue;
@@ -234,7 +234,7 @@ int sash_shm_acquire(struct sash_shm *s, uint32_t slot_index, uint32_t since,
 
         /* Everything below is guest-supplied. A guest bug should drop a frame,
          * not walk the host off the end of the mapping. */
-        if (p.index >= SASH_RING_FRAMES) return -1;
+        if (p.index >= VYPR_RING_FRAMES) return -1;
         if (p.width == 0 || p.height == 0) return -1;
         if (p.width > slot->max_width || p.height > slot->max_height) return -1;
         if (p.stride < (uint64_t)p.width * 4) return -1;

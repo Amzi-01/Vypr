@@ -8,10 +8,10 @@
 #include <vector>
 
 extern "C" {
-#include "sash_proto.h"
+#include "vypr_proto.h"
 }
 
-namespace sash {
+namespace vypr {
 
 class Control {
 public:
@@ -29,7 +29,7 @@ public:
     void run(const Handler& on_message);
 
     bool send(std::uint16_t type, const void* payload, std::uint32_t bytes);
-    bool send_window(std::uint16_t type, const sash_msg_window& w, const std::string& title);
+    bool send_window(std::uint16_t type, const vypr_msg_window& w, const std::string& title);
 
 private:
     bool recv_exact(void* dst, std::uint32_t bytes);
@@ -38,4 +38,4 @@ private:
     std::vector<std::uint8_t> rx_;
 };
 
-}  // namespace sash
+}  // namespace vypr

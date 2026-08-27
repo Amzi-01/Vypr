@@ -1,7 +1,7 @@
 /* Backend contract. Two implementations link side by side so they can be
  * compared on the same frames rather than across separate builds. */
-#ifndef SASH_HOST_PRESENT_INTERNAL_H
-#define SASH_HOST_PRESENT_INTERNAL_H
+#ifndef VYPR_HOST_PRESENT_INTERNAL_H
+#define VYPR_HOST_PRESENT_INTERNAL_H
 
 #include "present.h"
 
@@ -10,7 +10,7 @@ struct present_ops {
     void       *(*create)(SDL_Window *win, void *share_impl);
     void        (*destroy)(void *impl);
     const char *(*driver)(void *impl);
-    bool        (*upload)(void *impl, const struct sash_frame_view *f);
+    bool        (*upload)(void *impl, const struct vypr_frame_view *f);
     void        (*present)(void *impl);
     void        (*take_timings)(void *impl, uint64_t *upload_ns, uint64_t *present_ns);
 };

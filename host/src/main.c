@@ -1,5 +1,5 @@
 /*
- * sash-host - presents one shared-memory slot as one native window.
+ * vypr-window - presents one shared-memory slot as one native window.
  *
  * One process per window. A crashed or wedged stream then takes down a single
  * window instead of the whole session, and the compositor treats each app as
@@ -27,7 +27,7 @@
 struct options {
     const char *shm_path;
     const char *title;
-    const char *sock_path;   /* unix socket back to sashd; NULL = no input path */
+    const char *sock_path;   /* unix socket back to vyprd; NULL = no input path */
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
     uint32_t    chrome_top;  /* guest title-bar height, in guest pixels */
@@ -38,13 +38,13 @@ struct options {
 
 static void usage(void)
 {
-    fputs("usage: sash-host --shm PATH --slot N [--title NAME] [--stats]\n"
+    fputs("usage: vypr-window --shm PATH --slot N [--title NAME] [--stats]\n"
           "                 [--sock PATH --window-id ID] [--present gpu|render]\n"
-          "\nRun standalone it presents a slot. sashd additionally passes --sock\n"
+          "\nRun standalone it presents a slot. vyprd additionally passes --sock\n"
           "and --window-id, which is what turns input back on.\n", stderr);
 }
 
-/* Input goes back to sashd rather than straight to the guest: one process owns
+/* Input goes back to vyprd rather than straight to the guest: one process owns
  * the link to the agent, so window identity and reconnect are decided in one
  * place. Returns -1 when there is no daemon, which is the standalone case. */
 static int connect_daemon(const char *path, uint64_t window_id)
@@ -59,13 +59,13 @@ static int connect_daemon(const char *path, uint64_t window_id)
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "sash: cannot reach sashd at %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "vypr: cannot reach vyprd at %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
 
-    struct sash_msg_window_id hello = { .window_id = window_id };
-    if (msg_send(fd, SASH_MSG_CLIENT_HELLO, &hello, sizeof(hello)) < 0) {
+    struct vypr_msg_window_id hello = { .window_id = window_id };
+    if (msg_send(fd, VYPR_MSG_CLIENT_HELLO, &hello, sizeof(hello)) < 0) {
         close(fd);
         return -1;
     }
@@ -80,8 +80,8 @@ static int connect_daemon(const char *path, uint64_t window_id)
 
 static int parse_args(int argc, char **argv, struct options *o)
 {
-    o->shm_path  = "/dev/shm/sash";
-    o->title     = "sash";
+    o->shm_path  = "/dev/shm/vypr";
+    o->title     = "vypr";
     o->sock_path = NULL;
     o->backend   = NULL;
     o->capture   = 0;
@@ -198,12 +198,12 @@ struct view {
 static void set_capture(SDL_Window *win, bool want, bool announce)
 {
     if (!SDL_SetWindowRelativeMouseMode(win, want)) {
-        fprintf(stderr, "sash: relative mouse mode %s refused: %s\n",
+        fprintf(stderr, "vypr: relative mouse mode %s refused: %s\n",
                 want ? "on" : "off", SDL_GetError());
         return;
     }
     if (announce) {
-        printf("sash: mouse capture %s\n",
+        printf("vypr: mouse capture %s\n",
                want ? "ON - relative motion" : "OFF - absolute");
         fflush(stdout);
     }
@@ -301,7 +301,7 @@ static void pointer_flush(int fd, uint64_t window_id, struct pointer_accum *a)
 {
     if (!a->pending || fd < 0) return;
 
-    struct sash_msg_pointer msg = {0};
+    struct vypr_msg_pointer msg = {0};
     msg.window_id = window_id;
     msg.x       = a->x;
     msg.y       = a->y;
@@ -309,11 +309,11 @@ static void pointer_flush(int fd, uint64_t window_id, struct pointer_accum *a)
     msg.wheel   = a->wheel;
     msg.hwheel  = a->hwheel;
     msg.flags   = a->flags;
-    msg_send(fd, SASH_MSG_POINTER, &msg, sizeof(msg));
+    msg_send(fd, VYPR_MSG_POINTER, &msg, sizeof(msg));
 
     a->pending = false;
     a->wheel = a->hwheel = 0;
-    if (a->flags & SASH_PTR_RELATIVE) { a->x = 0; a->y = 0; }
+    if (a->flags & VYPR_PTR_RELATIVE) { a->x = 0; a->y = 0; }
 }
 
 static bool capture_forced_initial(const struct options *o) { return o->capture != 0; }
@@ -344,8 +344,8 @@ static void to_guest_coords(int win_w, int win_h, uint32_t src_w, uint32_t src_h
 /* A popup the daemon handed us: a real popup surface anchored to the owner's
  * window, so the compositor treats it as a menu rather than a floating
  * top-level - it stacks correctly and does not take focus. */
-static bool view_open_popup(struct view *views, int *count, struct sash_shm *shm,
-                            const struct sash_msg_client_popup *msg,
+static bool view_open_popup(struct view *views, int *count, struct vypr_shm *shm,
+                            const struct vypr_msg_client_popup *msg,
                             const char *backend)
 {
     if (*count >= MAX_VIEWS) return false;
@@ -367,7 +367,7 @@ static bool view_open_popup(struct view *views, int *count, struct sash_shm *shm
                                    (int)msg->width, (int)msg->height,
                                    SDL_WINDOW_POPUP_MENU);
     if (!v->win) {
-        fprintf(stderr, "sash: SDL_CreatePopupWindow: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: SDL_CreatePopupWindow: %s\n", SDL_GetError());
         return false;
     }
 
@@ -400,19 +400,19 @@ int main(int argc, char **argv)
     struct options opt;
     if (parse_args(argc, argv, &opt) < 0) return 2;
 
-    struct sash_shm shm;
-    if (sash_shm_open(&shm, opt.shm_path, 0) < 0) return 1;
+    struct vypr_shm shm;
+    if (vypr_shm_open(&shm, opt.shm_path, 0) < 0) return 1;
 
     const int daemon_fd = connect_daemon(opt.sock_path, opt.window_id);
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
-        fprintf(stderr, "sash: SDL_Init: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
 
     /* Start at the slot's maximum and resize down once a frame says otherwise;
      * opening at the wrong size and snapping is uglier than one late resize. */
-    const struct sash_slot *slot = &shm.hdr->slots[opt.slot];
+    const struct vypr_slot *slot = &shm.hdr->slots[opt.slot];
     int win_w = (int)(slot->max_width  ? slot->max_width  : 1280);
     int win_h = (int)(slot->max_height ? slot->max_height : 720);
 
@@ -431,15 +431,15 @@ int main(int argc, char **argv)
     views[0].win = SDL_CreateWindow(opt.title, win_w, win_h,
                                     SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
     if (!views[0].win) {
-        fprintf(stderr, "sash: SDL_CreateWindow: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
     }
 
     views[0].pres = presenter_create(views[0].win, opt.backend, NULL);
-    if (!views[0].pres) { fprintf(stderr, "sash: no usable present backend\n"); return 1; }
+    if (!views[0].pres) { fprintf(stderr, "vypr: no usable present backend\n"); return 1; }
 
     if (opt.stats)
-        printf("sash: present backend '%s'\n", presenter_name(views[0].pres));
+        printf("vypr: present backend '%s'\n", presenter_name(views[0].pres));
 
     if (capture_forced_initial(&opt))
         set_capture(views[0].win, true, true);
@@ -530,8 +530,8 @@ int main(int argc, char **argv)
                 const uint64_t id = (ev.type == SDL_EVENT_QUIT)
                                   ? opt.window_id : v->window_id;
                 if (daemon_fd >= 0) {
-                    struct sash_msg_window_id msg = { .window_id = id };
-                    msg_send(daemon_fd, SASH_MSG_CLOSE, &msg, sizeof(msg));
+                    struct vypr_msg_window_id msg = { .window_id = id };
+                    msg_send(daemon_fd, VYPR_MSG_CLOSE, &msg, sizeof(msg));
                 }
                 if (ev.type == SDL_EVENT_QUIT || !v->is_popup) running = 0;
                 break;
@@ -550,7 +550,7 @@ int main(int argc, char **argv)
 
                 SDL_GetWindowSize(v->win, &win_w, &win_h);
 
-                struct sash_msg_pointer msg = {0};
+                struct vypr_msg_pointer msg = {0};
                 msg.window_id = v->window_id;
 
                 if (pointer_locked || capture_forced) {
@@ -576,7 +576,7 @@ int main(int argc, char **argv)
                         if (msg.y == 0 && ev.motion.yrel != 0.0f)
                             msg.y = ev.motion.yrel > 0 ? 1 : -1;
                     }
-                    msg.flags |= SASH_PTR_RELATIVE;
+                    msg.flags |= VYPR_PTR_RELATIVE;
                 } else {
                     to_guest_coords(win_w, win_h, v->src_w, v->src_h, hx, hy,
                                     &msg.x, &msg.y);
@@ -593,7 +593,7 @@ int main(int argc, char **argv)
                     msg.hwheel = (int32_t)(ev.wheel.x * 120.0f);
                 }
 
-                if (msg.flags & SASH_PTR_RELATIVE) {
+                if (msg.flags & VYPR_PTR_RELATIVE) {
                     pointer.x += msg.x;          /* deltas sum exactly */
                     pointer.y += msg.y;
                 } else {
@@ -652,11 +652,11 @@ int main(int argc, char **argv)
                             0x38, 0xE038       /* alt, for the Moonlight chord */
                         };
                         for (size_t k = 0; k < sizeof(mods) / sizeof(mods[0]); k++) {
-                            struct sash_msg_key up = {0};
+                            struct vypr_msg_key up = {0};
                             up.window_id = v->window_id;
                             up.scancode  = mods[k];
                             up.down      = 0;
-                            msg_send(daemon_fd, SASH_MSG_KEY, &up, sizeof(up));
+                            msg_send(daemon_fd, VYPR_MSG_KEY, &up, sizeof(up));
                         }
                     }
 
@@ -664,7 +664,7 @@ int main(int argc, char **argv)
                 }
                 if (daemon_fd < 0) break;
 
-                struct sash_msg_key msg = {0};
+                struct vypr_msg_key msg = {0};
                 msg.window_id = v->window_id;
                 /* SDL scancodes are USB HID usage ids; the guest wants PS/2
                  * set 1, which is what SendInput takes. */
@@ -672,7 +672,7 @@ int main(int argc, char **argv)
                 msg.down      = (ev.type == SDL_EVENT_KEY_DOWN);
                 msg.modifiers = ev.key.mod;
                 if (msg.scancode)
-                    msg_send(daemon_fd, SASH_MSG_KEY, &msg, sizeof(msg));
+                    msg_send(daemon_fd, VYPR_MSG_KEY, &msg, sizeof(msg));
                 break;
             }
 
@@ -687,17 +687,17 @@ int main(int argc, char **argv)
                  * otherwise left rendering a window nobody can see. Restoring
                  * has to bring it back, or the window returns showing whatever
                  * frame it had when it stopped. */
-                struct sash_msg_window_state st = {0};
+                struct vypr_msg_window_state st = {0};
                 st.window_id = v->window_id;
                 st.minimized = mini ? 1u : 0u;
-                msg_send(daemon_fd, SASH_MSG_WINDOW_STATE, &st, sizeof(st));
+                msg_send(daemon_fd, VYPR_MSG_WINDOW_STATE, &st, sizeof(st));
                 break;
             }
 
             case SDL_EVENT_WINDOW_FOCUS_GAINED: {
                 if (daemon_fd < 0 || v->is_popup) break;
-                struct sash_msg_window_id msg = { .window_id = v->window_id };
-                msg_send(daemon_fd, SASH_MSG_FOCUS, &msg, sizeof(msg));
+                struct vypr_msg_window_id msg = { .window_id = v->window_id };
+                msg_send(daemon_fd, VYPR_MSG_FOCUS, &msg, sizeof(msg));
                 break;
             }
 
@@ -723,11 +723,11 @@ int main(int argc, char **argv)
 
         /* Settled? Then ask the guest to match. */
         if (resize_at && SDL_GetTicks() - resize_at > 200) {
-            struct sash_msg_resize rs = {0};
+            struct vypr_msg_resize rs = {0};
             rs.window_id = views[0].window_id;
             rs.width  = resize_w;
             rs.height = resize_h;
-            msg_send(daemon_fd, SASH_MSG_RESIZE, &rs, sizeof(rs));
+            msg_send(daemon_fd, VYPR_MSG_RESIZE, &rs, sizeof(rs));
             resize_at = 0;
         }
 
@@ -743,17 +743,17 @@ int main(int argc, char **argv)
         if (daemon_fd >= 0) {
             int rc = msg_reader_fill(&daemon_rx, daemon_fd);
             if (rc > 0) {
-                struct sash_msg_head head;
+                struct vypr_msg_head head;
                 const uint8_t *payload;
                 while (msg_reader_next(&daemon_rx, &head, &payload) == 1) {
-                    if (head.type == SASH_MSG_CLIENT_POPUP &&
-                        head.bytes >= sizeof(struct sash_msg_client_popup)) {
+                    if (head.type == VYPR_MSG_CLIENT_POPUP &&
+                        head.bytes >= sizeof(struct vypr_msg_client_popup)) {
                         view_open_popup(views, &view_count, &shm,
-                                        (const struct sash_msg_client_popup *)payload,
+                                        (const struct vypr_msg_client_popup *)payload,
                                         opt.backend);
-                    } else if (head.type == SASH_MSG_CLIENT_AUDIO &&
-                               head.bytes >= sizeof(struct sash_msg_audio)) {
-                        const struct sash_msg_audio *a = (const void *)payload;
+                    } else if (head.type == VYPR_MSG_CLIENT_AUDIO &&
+                               head.bytes >= sizeof(struct vypr_msg_audio)) {
+                        const struct vypr_msg_audio *a = (const void *)payload;
                         const uint32_t want = a->frames * a->channels * sizeof(float);
                         if (a->channels && a->sample_rate &&
                             head.bytes >= sizeof(*a) + want) {
@@ -771,11 +771,11 @@ int main(int argc, char **argv)
                                     SDL_ResumeAudioStreamDevice(audio);
                                     audio_rate = a->sample_rate;
                                     audio_channels = a->channels;
-                                    printf("sash: audio %u Hz, %u channels\n",
+                                    printf("vypr: audio %u Hz, %u channels\n",
                                            a->sample_rate, a->channels);
                                     fflush(stdout);
                                 } else {
-                                    fprintf(stderr, "sash: audio device: %s\n",
+                                    fprintf(stderr, "vypr: audio device: %s\n",
                                             SDL_GetError());
                                 }
                             }
@@ -843,22 +843,22 @@ int main(int argc, char **argv)
                                 if (SDL_GetTicks() - audio_logged_at > 10000) {
                                     audio_logged_at = SDL_GetTicks();
                                     if (audio_dropped)
-                                        printf("sash: audio queued %.0f ms, dropped %llu of "
+                                        printf("vypr: audio queued %.0f ms, dropped %llu of "
                                                "%llu packets\n",
                                                queued * 1000.0 / per_second,
                                                (unsigned long long)audio_dropped,
                                                (unsigned long long)(audio_dropped + audio_taken));
                                     else
-                                        printf("sash: audio queued %.0f ms, no drops\n",
+                                        printf("vypr: audio queued %.0f ms, no drops\n",
                                                queued * 1000.0 / per_second);
                                     fflush(stdout);
                                     audio_dropped = audio_taken = 0;
                                 }
                             }
                         }
-                    } else if (head.type == SASH_MSG_CLIENT_STATE &&
-                               head.bytes >= sizeof(struct sash_msg_window_state)) {
-                        const struct sash_msg_window_state *m = (const void *)payload;
+                    } else if (head.type == VYPR_MSG_CLIENT_STATE &&
+                               head.bytes >= sizeof(struct vypr_msg_window_state)) {
+                        const struct vypr_msg_window_state *m = (const void *)payload;
                         if (m->window_id == opt.window_id) {
                             const bool mini = m->minimized != 0;
                             const bool have =
@@ -880,23 +880,23 @@ int main(int argc, char **argv)
                             if (want_fs != is_fs)
                                 SDL_SetWindowFullscreen(views[0].win, want_fs);
                         }
-                    } else if (head.type == SASH_MSG_CLIENT_GEOM &&
-                               head.bytes >= sizeof(struct sash_msg_client_geom)) {
-                        const struct sash_msg_client_geom *m = (const void *)payload;
+                    } else if (head.type == VYPR_MSG_CLIENT_GEOM &&
+                               head.bytes >= sizeof(struct vypr_msg_client_geom)) {
+                        const struct vypr_msg_client_geom *m = (const void *)payload;
                         if (m->window_id == opt.window_id)
                             chrome_reported = m->chrome_top;
-                    } else if (head.type == SASH_MSG_CLIENT_LOCK &&
-                               head.bytes >= sizeof(struct sash_msg_pointer_lock)) {
-                        const struct sash_msg_pointer_lock *m = (const void *)payload;
+                    } else if (head.type == VYPR_MSG_CLIENT_LOCK &&
+                               head.bytes >= sizeof(struct vypr_msg_pointer_lock)) {
+                        const struct vypr_msg_pointer_lock *m = (const void *)payload;
                         pointer_locked = m->locked != 0;
                         set_capture(views[0].win, pointer_locked || capture_forced, false);
-                        printf("sash: guest %s the pointer%s\n",
+                        printf("vypr: guest %s the pointer%s\n",
                                pointer_locked ? "captured" : "released",
                                capture_forced ? " (manual capture still on)" : "");
                         fflush(stdout);
-                    } else if (head.type == SASH_MSG_CLIENT_POPUP_END &&
-                               head.bytes >= sizeof(struct sash_msg_window_id)) {
-                        const struct sash_msg_window_id *m = (const void *)payload;
+                    } else if (head.type == VYPR_MSG_CLIENT_POPUP_END &&
+                               head.bytes >= sizeof(struct vypr_msg_window_id)) {
+                        const struct vypr_msg_window_id *m = (const void *)payload;
                         view_close(views, &view_count, m->window_id);
                     }
                 }
@@ -905,9 +905,9 @@ int main(int argc, char **argv)
 
         for (int i = 0; i < view_count; i++) {
             struct view *v = &views[i];
-            struct sash_frame_view f;
+            struct vypr_frame_view f;
 
-            int rc = sash_shm_acquire(&shm, v->slot, v->last_serial, &f);
+            int rc = vypr_shm_acquire(&shm, v->slot, v->last_serial, &f);
             if (rc == 0) {
                 if (f.width != v->src_w || f.height != v->src_h) {
                     v->src_w = f.width;
@@ -944,7 +944,7 @@ int main(int argc, char **argv)
                 presenter_upload(v->pres, &f);
                 if (i == 0) presented++;
             } else if (rc == -1 && !v->is_popup &&
-                       sash_slot_state(&shm, v->slot) == SASH_SLOT_CLOSED) {
+                       vypr_slot_state(&shm, v->slot) == VYPR_SLOT_CLOSED) {
                 running = 0;
             }
 
@@ -982,6 +982,6 @@ int main(int argc, char **argv)
     msg_reader_free(&daemon_rx);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
-    sash_shm_close(&shm);
+    vypr_shm_close(&shm);
     return 0;
 }

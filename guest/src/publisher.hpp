@@ -1,4 +1,4 @@
-// Publishing frames into a sash slot.
+// Publishing frames into a vypr slot.
 //
 // Deliberately free of Windows headers. The seqlock ordering and the ring
 // arithmetic are the parts that are hardest to get right and worst to debug
@@ -12,10 +12,10 @@
 #include <cstdint>
 
 extern "C" {
-#include "sash_shm.h"
+#include "vypr_shm.h"
 }
 
-namespace sash {
+namespace vypr {
 
 // A slot the host has assigned to one window. Non-owning: the region belongs to
 // the mapping, and the header belongs to the host.
@@ -52,11 +52,11 @@ public:
 private:
     std::uint8_t*     base_   = nullptr;
     std::size_t       bytes_  = 0;
-    struct sash_slot* slot_   = nullptr;
+    struct vypr_slot* slot_   = nullptr;
     std::uint8_t*     ring_   = nullptr;
     std::uint32_t     index_  = 0;   // buffer begin_frame is currently lending
     std::uint32_t     serial_ = 0;
     std::uint32_t     epoch_  = 0;   // the allocation this binding belongs to
 };
 
-}  // namespace sash
+}  // namespace vypr

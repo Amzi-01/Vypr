@@ -46,7 +46,7 @@ static void *render_create(SDL_Window *win, void *share_impl)
 
     p->ren = SDL_CreateRenderer(win, NULL);
     if (!p->ren) {
-        fprintf(stderr, "sash: SDL_CreateRenderer: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: SDL_CreateRenderer: %s\n", SDL_GetError());
         SDL_free(p);
         return NULL;
     }
@@ -64,7 +64,7 @@ static void render_destroy(void *impl)
     SDL_free(p);
 }
 
-static bool render_upload(void *impl, const struct sash_frame_view *f)
+static bool render_upload(void *impl, const struct vypr_frame_view *f)
 {
     struct render_state *p = impl;
     const uint64_t t0 = SDL_GetTicksNS();
@@ -76,7 +76,7 @@ static bool render_upload(void *impl, const struct sash_frame_view *f)
                                           SDL_TEXTUREACCESS_STREAMING,
                                           (int)f->width, (int)f->height);
             if (!p->tex[i]) {
-                fprintf(stderr, "sash: SDL_CreateTexture: %s\n", SDL_GetError());
+                fprintf(stderr, "vypr: SDL_CreateTexture: %s\n", SDL_GetError());
                 return false;
             }
             SDL_SetTextureScaleMode(p->tex[i], SDL_SCALEMODE_LINEAR);

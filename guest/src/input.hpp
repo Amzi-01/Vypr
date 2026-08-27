@@ -4,19 +4,19 @@
 #include <cstdint>
 
 extern "C" {
-#include "sash_proto.h"
+#include "vypr_proto.h"
 }
 
-namespace sash {
+namespace vypr {
 
 // Coordinates arrive already converted to the target window's client area, so
 // this only has to map client -> screen -> the normalised space SendInput uses.
-void inject_pointer(const sash_msg_pointer& msg);
-void inject_key(const sash_msg_key& msg);
+void inject_pointer(const vypr_msg_pointer& msg);
+void inject_key(const vypr_msg_key& msg);
 void inject_text(std::uint64_t window_id, const char* utf8, std::uint32_t bytes);
 void focus_window(std::uint64_t window_id);
 void close_window(std::uint64_t window_id);
-void resize_window(const sash_msg_resize& msg);
+void resize_window(const vypr_msg_resize& msg);
 
 /*
  * Windows applies a pointer-acceleration curve to injected relative motion, so
@@ -32,4 +32,4 @@ void set_window_minimized(std::uint64_t window_id, bool minimized);
 void suspend_pointer_acceleration();
 void restore_pointer_acceleration();
 
-}  // namespace sash
+}  // namespace vypr

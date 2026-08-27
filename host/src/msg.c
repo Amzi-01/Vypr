@@ -12,9 +12,9 @@
 int msg_send(int fd, uint16_t type, const void *payload, uint32_t bytes)
 {
     if (fd < 0) return -1;
-    if (bytes > SASH_MAX_MSG_BYTES) return -1;
+    if (bytes > VYPR_MAX_MSG_BYTES) return -1;
 
-    struct sash_msg_head head = { .bytes = bytes, .type = type, .flags = 0 };
+    struct vypr_msg_head head = { .bytes = bytes, .type = type, .flags = 0 };
     struct iovec iov[2] = {
         { .iov_base = &head, .iov_len = sizeof(head) },
         { .iov_base = (void *)payload, .iov_len = bytes },
@@ -63,7 +63,7 @@ int msg_reader_fill(struct msg_reader *r, int fd)
 
     if (r->cap - r->len < 8192) {
         size_t want = r->cap ? r->cap * 2 : 16384;
-        if (want > SASH_MAX_MSG_BYTES * 4u) want = SASH_MAX_MSG_BYTES * 4u;
+        if (want > VYPR_MAX_MSG_BYTES * 4u) want = VYPR_MAX_MSG_BYTES * 4u;
         uint8_t *grown = realloc(r->buf, want);
         if (!grown) return -1;
         r->buf = grown;
@@ -81,7 +81,7 @@ int msg_reader_fill(struct msg_reader *r, int fd)
     return 1;
 }
 
-int msg_reader_next(struct msg_reader *r, struct sash_msg_head *head,
+int msg_reader_next(struct msg_reader *r, struct vypr_msg_head *head,
                     const uint8_t **payload)
 {
     msg_reader_compact(r);
@@ -89,8 +89,8 @@ int msg_reader_next(struct msg_reader *r, struct sash_msg_head *head,
     if (r->len < sizeof(*head)) return 0;
     memcpy(head, r->buf, sizeof(*head));
 
-    if (head->bytes > SASH_MAX_MSG_BYTES) {
-        fprintf(stderr, "sashd: peer framed a %u byte message; dropping link\n",
+    if (head->bytes > VYPR_MAX_MSG_BYTES) {
+        fprintf(stderr, "vyprd: peer framed a %u byte message; dropping link\n",
                 head->bytes);
         return -1;
     }

@@ -1,4 +1,4 @@
-# sash
+# Vypr
 
 Per-application native windows from a Windows VM, over shared memory.
 
@@ -31,7 +31,7 @@ that property.
 ```
 guest (Windows, C++)                       host (Linux, C)
 ┌───────────────────────────┐              ┌─────────────────────────────┐
-│ WGC capture per HWND      │── IVSHMEM ──▶│ sash-host, one per window   │
+│ WGC capture per HWND      │── IVSHMEM ──▶│ vypr-window, one per window   │
 │ publish under a seqlock   │   (pixels)   │ SDL3 present, native window │
 │ SendInput injection       │◀── TCP ──────│ input, window lifecycle     │
 └───────────────────────────┘  (control)   └─────────────────────────────┘
@@ -61,13 +61,13 @@ counter to odd, write the record, counter to even. A host that reads an odd
 counter, or a different one before and after, saw a torn record and retries.
 Two stores per frame, and no lock spanning the VM boundary.
 
-`tools/sash-testsrc.c` is the reference implementation of that publish path. If
+`tools/vypr-testsrc.c` is the reference implementation of that publish path. If
 it and the guest agent ever disagree about ordering, the tool is right — the
 host is verified against it.
 
 ## Measured
 
-Host presenting `sash-testsrc` on an RTX 3060, SDL3 `gpu` backend:
+Host presenting `vypr-testsrc` on an RTX 3060, SDL3 `gpu` backend:
 
 | Source | Presented | Dropped | Upload | Present |
 |---|---|---|---|---|
@@ -91,9 +91,9 @@ A Windows Notepad window from the guest, presented as an ordinary window on the
 Linux desktop, at 60 fps with no codec anywhere in the path:
 
 ```
-sashd: guest window 'Untitled - Notepad' 2858x1460
-sashd: window 'Untitled - Notepad' -> slot 0, pid 190725
-sash:  streaming HWND 00000000000801FC into slot 0
+vyprd: guest window 'Untitled - Notepad' 2858x1460
+vyprd: window 'Untitled - Notepad' -> slot 0, pid 190725
+vypr:  streaming HWND 00000000000801FC into slot 0
 
 slot 0 state   : LIVE      frame size : 2860x1536  stride 12544
 serial         : 1947 -> 2067   (60.0 fps)
@@ -146,9 +146,9 @@ nothing; the readback is the thing to attack.
 
 ## Launching
 
-`launcher/sash-fivem` brings up whatever is not already running - the VM, the
+`launcher/vypr-fivem` brings up whatever is not already running - the VM, the
 session daemon, the guest agent - and then starts the game, skipping any step
-that is already done. `launcher/sash-fivem.desktop` puts it on the desktop with
+that is already done. `launcher/vypr-fivem.desktop` puts it on the desktop with
 the game's own icon, extracted at 256x256 from the guest's executable.
 
 It matches every window the game puts up - the FiveM splash, the Rockstar
@@ -311,12 +311,12 @@ deltas a physical mouse produces - it reads the cursor as (0,0), computes a
 huge negative delta every frame, and throws the camera into a corner. FiveM and
 GTA V both do this; so do Sunshine and Apollo, for the same reason.
 
-Until sash injects through a virtual HID device of its own, **Parsec running in
+Until vypr injects through a virtual HID device of its own, **Parsec running in
 the tray** supplies one: its `parsecvusba` driver injects at the kernel level
 where the deltas are real. See `docs/vm-setup.md`.
 
 This is worth knowing before debugging anything else about mouse behaviour in a
-game - it is not fixable at the level sash currently operates, and every
+game - it is not fixable at the level vypr currently operates, and every
 plausible-looking fix above it (relative mode, acceleration, re-centring) is
 treating a symptom.
 
@@ -400,13 +400,13 @@ past 2560x1440 mapped out of range.
 
 | Component | State |
 |---|---|
-| `include/sash_shm.h` — region layout | done |
-| `include/sash_proto.h` — control protocol v1 | defined, not yet spoken |
+| `include/vypr_shm.h` — region layout | done |
+| `include/vypr_proto.h` — control protocol v1 | defined, not yet spoken |
 | `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
 | `host/src/main.c` — present a slot as a native window | working |
 | `host/src/present_gpu.c` — SDL_GPU upload path | working, 4x faster at 4K |
 | `host/src/present_render.c` — SDL_Renderer path | kept for comparison |
-| `tools/sash-testsrc.c` — reference producer | working |
+| `tools/vypr-testsrc.c` — reference producer | working |
 | Guest agent — publish path (`guest/src/publisher.cpp`) | verified on Linux, 1080p60, 0 drops |
 | Guest agent — WGC capture | **working** — Notepad at 60 fps |
 | Guest agent — IVSHMEM mapping | **working** — self-identifies by magic |
@@ -414,7 +414,7 @@ past 2560x1440 mapped out of range.
 | Popups and menus | **working** — real popup surfaces, GDI fallback for menus |
 | IVSHMEM device on the VM | added — 512 MB, PCI 08:02 |
 | IVSHMEM driver in the guest | installed with Looking Glass |
-| `host/src/sashd.c` — session daemon | working, verified end to end |
+| `host/src/vyprd.c` — session daemon | working, verified end to end |
 | `host/src/msg.c` — framing, shared by both host processes | done |
 | Input path — pointer, keys, focus, resize, close | working, verified |
 | Launcher / `.desktop` integration | not started |
@@ -432,10 +432,10 @@ Needs SDL3.
 ## Running
 
 ```bash
-./build/sashd --match Notepad --launch 'C:\\Windows\\System32\\notepad.exe'
+./build/vyprd --match Notepad --launch 'C:\\Windows\\System32\\notepad.exe'
 ```
 
-`sashd` formats the region, waits for the agent, and spawns one `sash-host` per
+`vyprd` formats the region, waits for the agent, and spawns one `vypr-window` per
 matching guest window. `--all` streams every window, which is the way to see what
 the guest is actually offering.
 
@@ -444,12 +444,12 @@ the guest is actually offering.
 The whole system runs with the guest powered off, daemon included:
 
 ```bash
-truncate -s 256M /dev/shm/sash-test
-./build/sashd --shm /dev/shm/sash-test --match "test window" --port 47899 &
-./build/sash-testagent --connect 127.0.0.1 --port 47899 --shm /dev/shm/sash-test
+truncate -s 256M /dev/shm/vypr-test
+./build/vyprd --shm /dev/shm/vypr-test --match "test window" --port 47899 &
+./build/vypr-testagent --connect 127.0.0.1 --port 47899 --shm /dev/shm/vypr-test
 ```
 
-`sash-testagent` speaks the real control protocol and links the real
+`vypr-testagent` speaks the real control protocol and links the real
 `publisher.cpp`, so this covers slot allocation, attach, client spawning, the
 frame handoff and the input return path. Verified: window appears, streams at
 60fps, and pointer/focus/resize events arrive at the agent in guest coordinates.
@@ -457,8 +457,8 @@ frame handoff and the input return path. Verified: window appears, streams at
 For the presenter alone, without the daemon:
 
 ```bash
-./build/sash-testsrc --shm /dev/shm/sash-test --size 1920x1080 --fps 60 &
-./build/sash-host --shm /dev/shm/sash-test --slot 0 --stats
+./build/vypr-testsrc --shm /dev/shm/vypr-test --size 1920x1080 --fps 60 &
+./build/vypr-window --shm /dev/shm/vypr-test --slot 0 --stats
 ```
 
 ## Known hard problems

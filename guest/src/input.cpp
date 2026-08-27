@@ -9,7 +9,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace sash {
+namespace vypr {
 
 namespace {
 
@@ -29,7 +29,7 @@ ULONGLONG     g_cap_at = 0;
 RECT cached_capture_rect(HWND hwnd) {
     const ULONGLONG now = GetTickCount64();
     if (hwnd != g_cap_hwnd || now - g_cap_at > 100) {
-        g_cap_cache = sash_capture_rect(hwnd);
+        g_cap_cache = vypr_capture_rect(hwnd);
         g_cap_hwnd  = hwnd;
         g_cap_at    = now;
     }
@@ -37,7 +37,7 @@ RECT cached_capture_rect(HWND hwnd) {
 }
 
 bool trace_input() {
-    static const bool on = std::getenv("SASH_TRACE") != nullptr;
+    static const bool on = std::getenv("VYPR_TRACE") != nullptr;
     return on;
 }
 
@@ -116,7 +116,7 @@ void suspend_pointer_acceleration() {
     g_accel_saved = true;
     int linear[3] = { 0, 0, 0 };
     SystemParametersInfoW(SPI_SETMOUSE, 0, linear, SPIF_SENDCHANGE);
-    std::fprintf(stderr, "sash: pointer acceleration suspended (was %d/%d/%d)\n",
+    std::fprintf(stderr, "vypr: pointer acceleration suspended (was %d/%d/%d)\n",
                  g_saved_accel[0], g_saved_accel[1], g_saved_accel[2]);
 }
 
@@ -124,10 +124,10 @@ void restore_pointer_acceleration() {
     if (!g_accel_saved) return;
     SystemParametersInfoW(SPI_SETMOUSE, 0, g_saved_accel, SPIF_SENDCHANGE);
     g_accel_saved = false;
-    std::fprintf(stderr, "sash: pointer acceleration restored\n");
+    std::fprintf(stderr, "vypr: pointer acceleration restored\n");
 }
 
-void inject_pointer(const sash_msg_pointer& msg) {
+void inject_pointer(const vypr_msg_pointer& msg) {
     HWND hwnd = to_hwnd(msg.window_id);
     if (!IsWindow(hwnd)) return;
 
@@ -143,14 +143,14 @@ void inject_pointer(const sash_msg_pointer& msg) {
      */
     if (msg.buttons & ~g_buttons) ensure_foreground(hwnd);
 
-    // Periodic summary of what is being injected. Off unless SASH_TRACE is
+    // Periodic summary of what is being injected. Off unless VYPR_TRACE is
     // set: it costs GetCursorPos and GetClipCursor on every single event, which
     // is thousands of calls a second while the mouse is moving.
     if (trace_input()) {
         static unsigned n = 0;
         static double sum_x = 0, sum_y = 0;
         static unsigned rel = 0, abs_ = 0;
-        (msg.flags & SASH_PTR_RELATIVE) ? rel++ : abs_++;
+        (msg.flags & VYPR_PTR_RELATIVE) ? rel++ : abs_++;
         sum_x += std::abs((double)msg.x);
         sum_y += std::abs((double)msg.y);
         if (++n >= 120) {
@@ -162,7 +162,7 @@ void inject_pointer(const sash_msg_pointer& msg) {
             ci.cbSize = sizeof(ci);
             const bool showing = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING);
             std::fprintf(stderr,
-                "sash: pointer %u rel / %u abs, mean |dx|=%.1f |dy|=%.1f, "
+                "vypr: pointer %u rel / %u abs, mean |dx|=%.1f |dy|=%.1f, "
                 "cursor %ld,%ld visible=%d, clip %ldx%ld at %ld,%ld\n",
                 rel, abs_, sum_x / n, sum_y / n, cur.x, cur.y, showing ? 1 : 0,
                 clip.right - clip.left, clip.bottom - clip.top, clip.left, clip.top);
@@ -172,7 +172,7 @@ void inject_pointer(const sash_msg_pointer& msg) {
 
     std::vector<INPUT> batch;
 
-    if (msg.flags & SASH_PTR_RELATIVE) {
+    if (msg.flags & VYPR_PTR_RELATIVE) {
         /*
          * Keep the cursor away from the screen edges.
          *
@@ -251,7 +251,7 @@ void inject_pointer(const sash_msg_pointer& msg) {
         SendInput(static_cast<UINT>(batch.size()), batch.data(), sizeof(INPUT));
 }
 
-void inject_key(const sash_msg_key& msg) {
+void inject_key(const vypr_msg_key& msg) {
     ensure_foreground(to_hwnd(msg.window_id));
 
     INPUT in{};
@@ -311,7 +311,7 @@ void close_window(std::uint64_t window_id) {
     if (IsWindow(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
-void resize_window(const sash_msg_resize& msg) {
+void resize_window(const vypr_msg_resize& msg) {
     HWND hwnd = to_hwnd(msg.window_id);
     if (!IsWindow(hwnd)) return;
 
@@ -320,7 +320,7 @@ void resize_window(const sash_msg_resize& msg) {
     // difference across rather than resizing to the wrong thing.
     RECT outer{};
     GetWindowRect(hwnd, &outer);
-    const RECT cap = sash_capture_rect(hwnd);
+    const RECT cap = vypr_capture_rect(hwnd);
 
     const LONG pad_w = (outer.right - outer.left) - (cap.right - cap.left);
     const LONG pad_h = (outer.bottom - outer.top) - (cap.bottom - cap.top);
@@ -331,4 +331,4 @@ void resize_window(const sash_msg_resize& msg) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-}  // namespace sash
+}  // namespace vypr

@@ -1,11 +1,11 @@
 /*
- * sashd - the host session daemon.
+ * vyprd - the host session daemon.
  *
  * Owns three things the per-window clients must not each own separately:
  * the shared region and its allocation, the single control link to the guest
  * agent, and the decision about which guest windows become host windows.
  *
- *   agent (TCP 47820) ──▶ sashd ──▶ spawns sash-host per window
+ *   agent (TCP 47820) ──▶ vyprd ──▶ spawns vypr-window per window
  *                          ▲                    │
  *                          └──── unix socket ───┘  (input travels back up)
  *
@@ -35,7 +35,7 @@
 #include "msg.h"
 #include "shm.h"
 
-#define MAX_WINDOWS ((int)SASH_MAX_SLOTS)
+#define MAX_WINDOWS ((int)VYPR_MAX_SLOTS)
 
 /*
  * Clock samples, kept so the offset can come from the *best* exchange rather
@@ -74,7 +74,7 @@ struct window {
 };
 
 struct daemon {
-    struct sash_shm shm;
+    struct vypr_shm shm;
     const char     *shm_path;
 
     int  tcp_listen;
@@ -201,10 +201,10 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
     }
     w->client_fd = -1;
     if (tell_agent && d->agent_fd >= 0 && w->attached) {
-        struct sash_msg_window_id gone = { .window_id = w->id };
-        msg_send(d->agent_fd, SASH_MSG_DETACH, &gone, sizeof(gone));
+        struct vypr_msg_window_id gone = { .window_id = w->id };
+        msg_send(d->agent_fd, VYPR_MSG_DETACH, &gone, sizeof(gone));
     }
-    if (w->has_slot) sash_shm_free(&d->shm, w->slot);
+    if (w->has_slot) vypr_shm_free(&d->shm, w->slot);
     memset(w, 0, sizeof(*w));
     w->client_fd = -1;
 }
@@ -214,7 +214,7 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
 static int spawn_client(struct daemon *d, struct window *w)
 {
     char exe[640], slot[16], id[32], chrome[16];
-    snprintf(exe, sizeof(exe), "%s/sash-host", d->self_dir);
+    snprintf(exe, sizeof(exe), "%s/vypr-window", d->self_dir);
     snprintf(slot, sizeof(slot), "%u", w->slot);
     snprintf(id, sizeof(id), "%" PRIu64, w->id);
     snprintf(chrome, sizeof(chrome), "%u", w->chrome_top);
@@ -236,7 +236,7 @@ static int spawn_client(struct daemon *d, struct window *w)
             exe,
             "--shm",       (char *)d->shm_path,
             "--slot",      slot,
-            "--title",     w->title[0] ? w->title : (char *)"sash",
+            "--title",     w->title[0] ? w->title : (char *)"vypr",
             "--window-id", id,
             "--sock",       d->unix_path,
             "--chrome-top", chrome,
@@ -249,26 +249,26 @@ static int spawn_client(struct daemon *d, struct window *w)
             NULL
         };
         execv(exe, argv);
-        fprintf(stderr, "sashd: cannot exec %s: %s\n", exe, strerror(errno));
+        fprintf(stderr, "vyprd: cannot exec %s: %s\n", exe, strerror(errno));
         _exit(127);
     }
 
     w->child = pid;
-    fprintf(stderr, "sashd: window '%s' -> slot %u, pid %d\n",
+    fprintf(stderr, "vyprd: window '%s' -> slot %u, pid %d\n",
             w->title, w->slot, (int)pid);
     return 0;
 }
 
 /* --------------------------------------------------------------- agent input */
 
-static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
+static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
                           const char *title)
 {
     struct window *w = window_find(d, desc->window_id);
     if (w && w->has_slot) return;
     if (!w) w = window_alloc(d, desc->window_id);
     if (!w) {
-        fprintf(stderr, "sashd: no window slots left; ignoring '%s'\n", title);
+        fprintf(stderr, "vyprd: no window slots left; ignoring '%s'\n", title);
         return;
     }
 
@@ -278,8 +278,8 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     w->gx       = desc->x;
     w->gy       = desc->y;
     w->owner_id = desc->owner_id;
-    w->is_popup = (desc->flags & SASH_WIN_POPUP) != 0 && desc->owner_id != 0;
-    w->fullscreen = (desc->flags & SASH_WIN_FULLSCREEN) != 0;
+    w->is_popup = (desc->flags & VYPR_WIN_POPUP) != 0 && desc->owner_id != 0;
+    w->fullscreen = (desc->flags & VYPR_WIN_FULLSCREEN) != 0;
     w->chrome_top = desc->chrome_top;
 
     /* Headroom, so an ordinary resize does not force a re-attach. The bump
@@ -289,9 +289,9 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     uint32_t alloc_w = desc->width  + 256;
     uint32_t alloc_h = desc->height + 256;
 
-    struct sash_msg_attach at;
-    if (sash_shm_alloc(&d->shm, w->id, alloc_w, alloc_h, &at) < 0) {
-        fprintf(stderr, "sashd: no region left for '%s'\n", title);
+    struct vypr_msg_attach at;
+    if (vypr_shm_alloc(&d->shm, w->id, alloc_w, alloc_h, &at) < 0) {
+        fprintf(stderr, "vyprd: no region left for '%s'\n", title);
         memset(w, 0, sizeof(*w));
         w->client_fd = -1;
         return;
@@ -300,36 +300,36 @@ static void attach_window(struct daemon *d, const struct sash_msg_window *desc,
     w->slot = at.slot;
     w->has_slot = 1;
 
-    if (msg_send(d->agent_fd, SASH_MSG_ATTACH, &at, sizeof(at)) < 0)
-        fprintf(stderr, "sashd: failed to send ATTACH for '%s'\n", title);
+    if (msg_send(d->agent_fd, VYPR_MSG_ATTACH, &at, sizeof(at)) < 0)
+        fprintf(stderr, "vyprd: failed to send ATTACH for '%s'\n", title);
 }
 
 static void on_agent_message(struct daemon *d, uint16_t type,
                              const uint8_t *payload, uint32_t bytes)
 {
     switch (type) {
-    case SASH_MSG_HELLO: {
-        if (bytes < sizeof(struct sash_msg_hello)) break;
-        const struct sash_msg_hello *h = (const void *)payload;
-        fprintf(stderr, "sashd: agent up, protocol %u, pid %u, %.0f MiB region\n",
+    case VYPR_MSG_HELLO: {
+        if (bytes < sizeof(struct vypr_msg_hello)) break;
+        const struct vypr_msg_hello *h = (const void *)payload;
+        fprintf(stderr, "vyprd: agent up, protocol %u, pid %u, %.0f MiB region\n",
                 h->version, h->agent_pid, h->shm_bytes / 1048576.0);
-        if (h->version != SASH_PROTO_VERSION)
-            fprintf(stderr, "sashd: WARNING agent speaks %u, host speaks %u\n",
-                    h->version, SASH_PROTO_VERSION);
+        if (h->version != VYPR_PROTO_VERSION)
+            fprintf(stderr, "vyprd: WARNING agent speaks %u, host speaks %u\n",
+                    h->version, VYPR_PROTO_VERSION);
         if (d->launch)
-            msg_send(d->agent_fd, SASH_MSG_LAUNCH, d->launch, (uint32_t)strlen(d->launch));
+            msg_send(d->agent_fd, VYPR_MSG_LAUNCH, d->launch, (uint32_t)strlen(d->launch));
 
         /* Line the clocks up straight away, so the first frames can already be
          * given an age. */
-        struct sash_msg_ping ping = { .token = now_ns() };
-        msg_send(d->agent_fd, SASH_MSG_PING, &ping, sizeof(ping));
+        struct vypr_msg_ping ping = { .token = now_ns() };
+        msg_send(d->agent_fd, VYPR_MSG_PING, &ping, sizeof(ping));
         break;
     }
 
-    case SASH_MSG_WINDOW_ADDED:
-    case SASH_MSG_WINDOW_CHANGED: {
-        if (bytes < sizeof(struct sash_msg_window)) break;
-        const struct sash_msg_window *desc = (const void *)payload;
+    case VYPR_MSG_WINDOW_ADDED:
+    case VYPR_MSG_WINDOW_CHANGED: {
+        if (bytes < sizeof(struct vypr_msg_window)) break;
+        const struct vypr_msg_window *desc = (const void *)payload;
 
         char title[192] = {0};
         uint32_t tlen = desc->title_bytes;
@@ -337,8 +337,8 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (tlen > sizeof(title) - 1) tlen = sizeof(title) - 1;
         memcpy(title, payload + sizeof(*desc), tlen);
 
-        if (type == SASH_MSG_WINDOW_ADDED)
-            fprintf(stderr, "sashd: guest window '%s' %ux%u at %d,%d "
+        if (type == VYPR_MSG_WINDOW_ADDED)
+            fprintf(stderr, "vyprd: guest window '%s' %ux%u at %d,%d "
                             "flags=0x%x owner=0x%llx%s\n", title,
                     desc->width, desc->height, desc->x, desc->y,
                     desc->flags, (unsigned long long)desc->owner_id,
@@ -347,7 +347,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         /* A popup is streamed because its owner is, not because of its title -
          * menus have no title to match against. */
         int wanted = title_matches(d, title);
-        if (!wanted && (desc->flags & SASH_WIN_POPUP) && desc->owner_id) {
+        if (!wanted && (desc->flags & VYPR_WIN_POPUP) && desc->owner_id) {
             struct window *owner = window_find(d, desc->owner_id);
             wanted = owner && owner->has_slot && owner->client_fd >= 0;
         }
@@ -359,16 +359,16 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         /* Mirror the guest's minimised state onto the host window, so a window
          * that stops producing frames is not left on screen looking frozen. */
         if (w && w->has_slot && w->client_fd >= 0) {
-            const int mini = (desc->flags & SASH_WIN_MINIMIZED) != 0;
-            const int fs   = (desc->flags & SASH_WIN_FULLSCREEN) != 0;
+            const int mini = (desc->flags & VYPR_WIN_MINIMIZED) != 0;
+            const int fs   = (desc->flags & VYPR_WIN_FULLSCREEN) != 0;
             if (mini != w->minimized || fs != w->is_fullscreen) {
                 w->minimized     = mini;
                 w->is_fullscreen = fs;
-                struct sash_msg_window_state st = {0};
+                struct vypr_msg_window_state st = {0};
                 st.window_id  = w->id;
                 st.minimized  = (uint32_t)mini;
                 st.fullscreen = (uint32_t)fs;
-                msg_send(w->client_fd, SASH_MSG_CLIENT_STATE, &st, sizeof(st));
+                msg_send(w->client_fd, VYPR_MSG_CLIENT_STATE, &st, sizeof(st));
             }
         }
 
@@ -376,18 +376,18 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (w && w->has_slot && w->client_fd >= 0 &&
             desc->chrome_top != w->chrome_top) {
             w->chrome_top = desc->chrome_top;
-            struct sash_msg_client_geom geom = {0};
+            struct vypr_msg_client_geom geom = {0};
             geom.window_id  = w->id;
             geom.chrome_top = desc->chrome_top;
-            msg_send(w->client_fd, SASH_MSG_CLIENT_GEOM, &geom, sizeof(geom));
+            msg_send(w->client_fd, VYPR_MSG_CLIENT_GEOM, &geom, sizeof(geom));
         }
 
         if (w && w->has_slot) {
             /* Outgrew its ring: tear the stream down and re-attach bigger. The
              * alternative, resizing under a live writer, shows a torn frame. */
-            const struct sash_slot *slot = &d->shm.hdr->slots[w->slot];
+            const struct vypr_slot *slot = &d->shm.hdr->slots[w->slot];
             if (desc->width > slot->max_width || desc->height > slot->max_height) {
-                fprintf(stderr, "sashd: '%s' grew to %ux%u; re-attaching\n",
+                fprintf(stderr, "vyprd: '%s' grew to %ux%u; re-attaching\n",
                         title, desc->width, desc->height);
                 window_release(d, w, 1);
                 attach_window(d, desc, title);
@@ -398,34 +398,34 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
-    case SASH_MSG_WINDOW_REMOVED: {
-        if (bytes < sizeof(struct sash_msg_window_id)) break;
-        const struct sash_msg_window_id *m = (const void *)payload;
+    case VYPR_MSG_WINDOW_REMOVED: {
+        if (bytes < sizeof(struct vypr_msg_window_id)) break;
+        const struct vypr_msg_window_id *m = (const void *)payload;
         forget_dismissed(d, m->window_id);
         struct window *w = window_find(d, m->window_id);
         if (w) {
             if (w->is_popup) {
                 struct window *owner = window_find(d, w->owner_id);
                 if (owner && owner->client_fd >= 0) {
-                    struct sash_msg_window_id gone = { .window_id = w->id };
-                    msg_send(owner->client_fd, SASH_MSG_CLIENT_POPUP_END,
+                    struct vypr_msg_window_id gone = { .window_id = w->id };
+                    msg_send(owner->client_fd, VYPR_MSG_CLIENT_POPUP_END,
                              &gone, sizeof(gone));
                 }
             } else {
-                fprintf(stderr, "sashd: guest closed '%s'\n", w->title);
+                fprintf(stderr, "vyprd: guest closed '%s'\n", w->title);
             }
             window_release(d, w, 0);
         }
         break;
     }
 
-    case SASH_MSG_ATTACH_RESULT: {
-        if (bytes < sizeof(struct sash_msg_attach_result)) break;
-        const struct sash_msg_attach_result *r = (const void *)payload;
+    case VYPR_MSG_ATTACH_RESULT: {
+        if (bytes < sizeof(struct vypr_msg_attach_result)) break;
+        const struct vypr_msg_attach_result *r = (const void *)payload;
         struct window *w = window_find(d, r->window_id);
         if (!w) break;
         if (r->status != 0) {
-            fprintf(stderr, "sashd: agent refused '%s' (status %d)\n", w->title, r->status);
+            fprintf(stderr, "vyprd: agent refused '%s' (status %d)\n", w->title, r->status);
             window_release(d, w, 0);
             break;
         }
@@ -436,11 +436,11 @@ static void on_agent_message(struct daemon *d, uint16_t type,
              * to its owner, which only that process can do. */
             struct window *owner = window_find(d, w->owner_id);
             if (!owner || owner->client_fd < 0) {
-                fprintf(stderr, "sashd: popup for a window with no client; dropping\n");
+                fprintf(stderr, "vyprd: popup for a window with no client; dropping\n");
                 window_release(d, w, 1);
                 break;
             }
-            struct sash_msg_client_popup msg = {0};
+            struct vypr_msg_client_popup msg = {0};
             msg.window_id = w->id;
             msg.owner_id  = owner->id;
             msg.slot      = w->slot;
@@ -448,8 +448,8 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             msg.dy        = w->gy - owner->gy;
             msg.width     = w->width;
             msg.height    = w->height;
-            msg_send(owner->client_fd, SASH_MSG_CLIENT_POPUP, &msg, sizeof(msg));
-            fprintf(stderr, "sashd: popup %ux%u at +%d,+%d of '%s' -> slot %u\n",
+            msg_send(owner->client_fd, VYPR_MSG_CLIENT_POPUP, &msg, sizeof(msg));
+            fprintf(stderr, "vyprd: popup %ux%u at +%d,+%d of '%s' -> slot %u\n",
                     w->width, w->height, msg.dx, msg.dy, owner->title, w->slot);
             break;
         }
@@ -458,9 +458,9 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
-    case SASH_MSG_PONG: {
-        if (bytes < sizeof(struct sash_msg_pong)) break;
-        const struct sash_msg_pong *p = (const void *)payload;
+    case VYPR_MSG_PONG: {
+        if (bytes < sizeof(struct vypr_msg_pong)) break;
+        const struct vypr_msg_pong *p = (const void *)payload;
         if (p->guest_qpc_freq == 0) break;
 
         const uint64_t t3 = now_ns();
@@ -493,7 +493,7 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         __atomic_store_n(&d->shm.hdr->offset_valid, 1u, __ATOMIC_RELEASE);
 
         if (!d->clock_logged || best->rtt_ns != d->clock_best_rtt) {
-            fprintf(stderr, "sashd: clock offset from a %.2f ms round trip "
+            fprintf(stderr, "vyprd: clock offset from a %.2f ms round trip "
                             "(this sample %.2f ms)\n",
                     best->rtt_ns / 1e6, slot->rtt_ns / 1e6);
             d->clock_logged  = 1;
@@ -502,9 +502,9 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
-    case SASH_MSG_POINTER_LOCK: {
-        if (bytes < sizeof(struct sash_msg_pointer_lock)) break;
-        const struct sash_msg_pointer_lock *m = (const void *)payload;
+    case VYPR_MSG_POINTER_LOCK: {
+        if (bytes < sizeof(struct vypr_msg_pointer_lock)) break;
+        const struct vypr_msg_pointer_lock *m = (const void *)payload;
 
         /* Goes to whichever client is presenting that window - a popup's input
          * belongs to its owner's process. */
@@ -514,28 +514,28 @@ static void on_agent_message(struct daemon *d, uint16_t type,
             if (owner) w = owner;
         }
         if (w && w->client_fd >= 0)
-            msg_send(w->client_fd, SASH_MSG_CLIENT_LOCK, m, sizeof(*m));
-        fprintf(stderr, "sashd: guest %s the pointer\n",
+            msg_send(w->client_fd, VYPR_MSG_CLIENT_LOCK, m, sizeof(*m));
+        fprintf(stderr, "vyprd: guest %s the pointer\n",
                 m->locked ? "captured" : "released");
         break;
     }
 
-    case SASH_MSG_AUDIO: {
+    case VYPR_MSG_AUDIO: {
         /* One endpoint's worth of audio, so it goes to one window - the first
          * top-level with a client. Handing it to every client would play the
          * same sound several times over. */
         for (int i = 0; i < MAX_WINDOWS; i++) {
             struct window *w = &d->windows[i];
             if (w->id && !w->is_popup && w->client_fd >= 0) {
-                msg_send(w->client_fd, SASH_MSG_CLIENT_AUDIO, payload, bytes);
+                msg_send(w->client_fd, VYPR_MSG_CLIENT_AUDIO, payload, bytes);
                 break;
             }
         }
         break;
     }
 
-    case SASH_MSG_LOG:
-        fprintf(stderr, "sashd: agent: %.*s\n", (int)bytes, payload);
+    case VYPR_MSG_LOG:
+        fprintf(stderr, "vyprd: agent: %.*s\n", (int)bytes, payload);
         break;
 
     default:
@@ -548,9 +548,9 @@ static void on_agent_message(struct daemon *d, uint16_t type,
 static void on_client_message(struct daemon *d, struct window **owner, int fd,
                               uint16_t type, const uint8_t *payload, uint32_t bytes)
 {
-    if (type == SASH_MSG_CLIENT_HELLO) {
-        if (bytes < sizeof(struct sash_msg_window_id)) return;
-        const struct sash_msg_window_id *m = (const void *)payload;
+    if (type == VYPR_MSG_CLIENT_HELLO) {
+        if (bytes < sizeof(struct vypr_msg_window_id)) return;
+        const struct vypr_msg_window_id *m = (const void *)payload;
         struct window *w = window_find(d, m->window_id);
         if (!w) return;
         w->client_fd = fd;
@@ -558,14 +558,14 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         return;
     }
 
-    if (type == SASH_MSG_CLOSE && bytes >= sizeof(struct sash_msg_window_id)) {
-        const struct sash_msg_window_id *m = (const void *)payload;
+    if (type == VYPR_MSG_CLOSE && bytes >= sizeof(struct vypr_msg_window_id)) {
+        const struct vypr_msg_window_id *m = (const void *)payload;
         if (!is_dismissed(d, m->window_id) && d->dismissed_count < MAX_WINDOWS)
             d->dismissed[d->dismissed_count++] = m->window_id;
-        fprintf(stderr, "sashd: closing guest window on request\n");
+        fprintf(stderr, "vyprd: closing guest window on request\n");
     }
 
-    /* Everything else is input, and goes straight through. sashd does not
+    /* Everything else is input, and goes straight through. vyprd does not
      * interpret it: the client already converted to guest client-area pixels,
      * which is the only place the host window's geometry is known. */
     if (d->agent_fd >= 0)
@@ -588,13 +588,13 @@ static int listen_tcp(const char *bind_addr, uint16_t port)
     if (!bind_addr || !strcmp(bind_addr, "any")) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
-        fprintf(stderr, "sashd: '%s' is not an address\n", bind_addr);
+        fprintf(stderr, "vyprd: '%s' is not an address\n", bind_addr);
         close(fd);
         return -1;
     }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "sashd: bind :%u: %s\n", port, strerror(errno));
+        fprintf(stderr, "vyprd: bind :%u: %s\n", port, strerror(errno));
         close(fd);
         return -1;
     }
@@ -613,7 +613,7 @@ static int listen_unix(const char *path)
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "sashd: bind %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "vyprd: bind %s: %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -632,7 +632,7 @@ static void find_self_dir(struct daemon *d)
 
 static void usage(void)
 {
-    fputs("usage: sashd [--shm PATH] [--bind ADDR] [--port N] [--match SUBSTR]... [--all]\n"
+    fputs("usage: vyprd [--shm PATH] [--bind ADDR] [--port N] [--match SUBSTR]... [--all]\n"
           "             [--launch 'C:\\path\\app.exe']\n"
           "\n"
           "  --match  stream guest windows whose title contains SUBSTR (repeatable)\n"
@@ -645,12 +645,12 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     struct daemon d = {0};
-    d.shm_path   = "/dev/shm/sash";
+    d.shm_path   = "/dev/shm/vypr";
     d.agent_fd   = -1;
     d.audio_fd   = -1;
     for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++)
         d.pending[i].fd = -1;
-    uint16_t port = SASH_CONTROL_PORT;
+    uint16_t port = VYPR_CONTROL_PORT;
     /* The guest reaches the host across the virtual bridge, so that is the only
      * interface the control port ever needs to exist on. Listening on every
      * interface would put it on the real network too. */
@@ -671,7 +671,7 @@ int main(int argc, char **argv)
     }
 
     if (!d.match_all && d.match_count == 0) {
-        fputs("sashd: nothing would be streamed; pass --match or --all\n", stderr);
+        fputs("vyprd: nothing would be streamed; pass --match or --all\n", stderr);
         usage();
         return 2;
     }
@@ -683,18 +683,18 @@ int main(int argc, char **argv)
     find_self_dir(&d);
 
     const char *runtime = getenv("XDG_RUNTIME_DIR");
-    snprintf(d.unix_path, sizeof(d.unix_path), "%s/sash.sock",
+    snprintf(d.unix_path, sizeof(d.unix_path), "%s/vypr.sock",
              runtime ? runtime : "/tmp");
 
     /* Format before listening: the agent looks for the magic to tell our region
      * from Looking Glass's, so it must already be there when it connects. */
-    if (sash_shm_open(&d.shm, d.shm_path, 1) < 0) return 1;
+    if (vypr_shm_open(&d.shm, d.shm_path, 1) < 0) return 1;
 
     d.tcp_listen  = listen_tcp(bind_addr, port);
     d.unix_listen = listen_unix(d.unix_path);
     if (d.tcp_listen < 0 || d.unix_listen < 0) return 1;
 
-    fprintf(stderr, "sashd: region %s (%.0f MiB), waiting for agent on %s:%u\n",
+    fprintf(stderr, "vyprd: region %s (%.0f MiB), waiting for agent on %s:%u\n",
             d.shm_path, d.shm.bytes / 1048576.0, bind_addr, port);
 
     struct msg_reader client_rx[MAX_WINDOWS] = {0};
@@ -745,9 +745,9 @@ int main(int argc, char **argv)
             const uint64_t t = now_ns();
             if (t - d.last_ping_ns > 2000000000ull) {
                 d.last_ping_ns = t;
-                struct sash_msg_ping ping = { .token = t };
-                if (msg_send(d.agent_fd, SASH_MSG_PING, &ping, sizeof(ping)) < 0)
-                    fprintf(stderr, "sashd: ping send failed\n");
+                struct vypr_msg_ping ping = { .token = t };
+                if (msg_send(d.agent_fd, VYPR_MSG_PING, &ping, sizeof(ping)) < 0)
+                    fprintf(stderr, "vyprd: ping send failed\n");
             }
         }
 
@@ -773,22 +773,22 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            struct sash_msg_head head;
+            struct vypr_msg_head head;
             const uint8_t *payload;
             if (msg_reader_next(&d.pending[i].rx, &head, &payload) != 1) continue;
 
-            if (head.type == SASH_MSG_AUDIO_HELLO) {
+            if (head.type == VYPR_MSG_AUDIO_HELLO) {
                 if (d.audio_fd >= 0) { close(d.audio_fd); msg_reader_free(&d.audio_rx); }
                 d.audio_fd = d.pending[i].fd;
                 d.audio_rx = d.pending[i].rx;      /* keep anything already buffered */
                 memset(&d.pending[i].rx, 0, sizeof(d.pending[i].rx));
                 d.pending[i].fd = -1;
-                fprintf(stderr, "sashd: audio channel connected\n");
-            } else if (head.type == SASH_MSG_HELLO) {
+                fprintf(stderr, "vyprd: audio channel connected\n");
+            } else if (head.type == VYPR_MSG_HELLO) {
                 if (d.agent_fd >= 0) {
                     /* One agent per session. A second is a stale agent from a
                      * previous VM boot; the newest wins. */
-                    fprintf(stderr, "sashd: replacing existing agent link\n");
+                    fprintf(stderr, "vyprd: replacing existing agent link\n");
                     close(d.agent_fd);
                     msg_reader_free(&d.agent_rx);
                     for (int w = 0; w < MAX_WINDOWS; w++)
@@ -798,7 +798,7 @@ int main(int argc, char **argv)
                 d.agent_rx = d.pending[i].rx;
                 memset(&d.pending[i].rx, 0, sizeof(d.pending[i].rx));
                 d.pending[i].fd = -1;
-                fprintf(stderr, "sashd: agent connected\n");
+                fprintf(stderr, "vyprd: agent connected\n");
                 on_agent_message(&d, head.type, payload, head.bytes);
             } else {
                 close(d.pending[i].fd);
@@ -810,12 +810,12 @@ int main(int argc, char **argv)
         /* Audio, on its own connection so nothing queues in front of it. */
         if (audio_slot >= 0 && (pfd[audio_slot].revents & (POLLIN | POLLHUP))) {
             if (msg_reader_fill(&d.audio_rx, d.audio_fd) < 0) {
-                fprintf(stderr, "sashd: audio channel closed\n");
+                fprintf(stderr, "vyprd: audio channel closed\n");
                 close(d.audio_fd);
                 d.audio_fd = -1;
                 msg_reader_free(&d.audio_rx);
             } else {
-                struct sash_msg_head head;
+                struct vypr_msg_head head;
                 const uint8_t *payload;
                 while (msg_reader_next(&d.audio_rx, &head, &payload) == 1)
                     on_agent_message(&d, head.type, payload, head.bytes);
@@ -829,7 +829,7 @@ int main(int argc, char **argv)
             if (gone <= 0) break;
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 if (d.windows[i].child == gone) {
-                    fprintf(stderr, "sashd: '%s' window closed\n", d.windows[i].title);
+                    fprintf(stderr, "vyprd: '%s' window closed\n", d.windows[i].title);
                     d.windows[i].child = 0;
                     window_release(&d, &d.windows[i], 1);
                 }
@@ -869,14 +869,14 @@ int main(int argc, char **argv)
 
         if (agent_slot >= 0 && (pfd[agent_slot].revents & (POLLIN | POLLHUP))) {
             if (msg_reader_fill(&d.agent_rx, d.agent_fd) < 0) {
-                fprintf(stderr, "sashd: agent disconnected\n");
+                fprintf(stderr, "vyprd: agent disconnected\n");
                 close(d.agent_fd);
                 d.agent_fd = -1;
                 msg_reader_free(&d.agent_rx);
                 for (int i = 0; i < MAX_WINDOWS; i++)
                     window_release(&d, &d.windows[i], 0);
             } else {
-                struct sash_msg_head head;
+                struct vypr_msg_head head;
                 const uint8_t *payload;
                 int rc;
                 while ((rc = msg_reader_next(&d.agent_rx, &head, &payload)) == 1)
@@ -898,7 +898,7 @@ int main(int argc, char **argv)
                 msg_reader_free(&client_rx[i]);
                 continue;
             }
-            struct sash_msg_head head;
+            struct vypr_msg_head head;
             const uint8_t *payload;
             while (msg_reader_next(&client_rx[i], &head, &payload) == 1)
                 on_client_message(&d, &client_owner[i], client_fd[i],
@@ -918,6 +918,6 @@ int main(int argc, char **argv)
     close(d.unix_listen);
     unlink(d.unix_path);
     msg_reader_free(&d.agent_rx);
-    sash_shm_close(&d.shm);
+    vypr_shm_close(&d.shm);
     return 0;
 }

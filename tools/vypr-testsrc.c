@@ -1,5 +1,5 @@
 /*
- * sash-testsrc - stands in for the guest agent.
+ * vypr-testsrc - stands in for the guest agent.
  *
  * Publishes an animated pattern into a slot exactly the way the Windows agent
  * will: write pixels into the next ring buffer, then publish under the seqlock.
@@ -77,7 +77,7 @@ static void draw(uint8_t *dst, uint32_t w, uint32_t h, uint32_t stride, uint32_t
 
 int main(int argc, char **argv)
 {
-    const char *path = "/dev/shm/sash-test";
+    const char *path = "/dev/shm/vypr-test";
     uint32_t w = 1280, h = 720, fps = 60;
     size_t region = 256u * 1024u * 1024u;
 
@@ -86,7 +86,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--size") && i + 1 < argc)  { sscanf(argv[++i], "%ux%u", &w, &h); }
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc)   fps = (uint32_t)atoi(argv[++i]);
         else {
-            fputs("usage: sash-testsrc [--shm PATH] [--size WxH] [--fps N]\n", stderr);
+            fputs("usage: vypr-testsrc [--shm PATH] [--size WxH] [--fps N]\n", stderr);
             return 2;
         }
     }
@@ -96,19 +96,19 @@ int main(int argc, char **argv)
 
     if (ensure_region(path, region) < 0) return 1;
 
-    struct sash_shm shm;
-    if (sash_shm_open(&shm, path, 1) < 0) return 1;
+    struct vypr_shm shm;
+    if (vypr_shm_open(&shm, path, 1) < 0) return 1;
 
-    struct sash_msg_attach at;
-    if (sash_shm_alloc(&shm, 0xdeadbeef, w, h, &at) < 0) return 1;
+    struct vypr_msg_attach at;
+    if (vypr_shm_alloc(&shm, 0xdeadbeef, w, h, &at) < 0) return 1;
 
-    struct sash_slot *slot = &shm.hdr->slots[at.slot];
-    printf("sash-testsrc: slot %u, %ux%u, ring at +%" PRIu64 ", %.1f MiB/frame\n",
+    struct vypr_slot *slot = &shm.hdr->slots[at.slot];
+    printf("vypr-testsrc: slot %u, %ux%u, ring at +%" PRIu64 ", %.1f MiB/frame\n",
            at.slot, w, h, at.ring_offset, at.frame_bytes / 1048576.0);
-    printf("present it with:  ./build/sash-host --shm %s --slot %u --stats\n",
+    printf("present it with:  ./build/vypr-window --shm %s --slot %u --stats\n",
            path, at.slot);
 
-    __atomic_store_n(&slot->state, (uint32_t)SASH_SLOT_LIVE, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->state, (uint32_t)VYPR_SLOT_LIVE, __ATOMIC_RELEASE);
 
     uint8_t *ring = (uint8_t *)shm.base + slot->ring_offset;
     uint32_t serial = 0, index = 0;
@@ -133,12 +133,12 @@ int main(int argc, char **argv)
         slot->pub.stride           = slot->frame_stride;
         slot->pub.capture_qpc      = now_ns();
         slot->pub.capture_qpc_freq = 1000000000ull;
-        slot->pub.flags            = SASH_PUB_DAMAGE_FULL;
+        slot->pub.flags            = VYPR_PUB_DAMAGE_FULL;
 
         __atomic_thread_fence(__ATOMIC_RELEASE);
         __atomic_store_n(&slot->pub.seq, seq + 2, __ATOMIC_RELEASE);
 
-        index = (index + 1) % SASH_RING_FRAMES;
+        index = (index + 1) % VYPR_RING_FRAMES;
 
         next += period;
         uint64_t t = now_ns();
@@ -151,8 +151,8 @@ int main(int argc, char **argv)
         }
     }
 
-    __atomic_store_n(&slot->state, (uint32_t)SASH_SLOT_CLOSED, __ATOMIC_RELEASE);
-    printf("\nsash-testsrc: published %u frames\n", serial);
-    sash_shm_close(&shm);
+    __atomic_store_n(&slot->state, (uint32_t)VYPR_SLOT_CLOSED, __ATOMIC_RELEASE);
+    printf("\nvypr-testsrc: published %u frames\n", serial);
+    vypr_shm_close(&shm);
     return 0;
 }

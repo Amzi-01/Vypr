@@ -12,7 +12,7 @@
 #include <functional>
 #include <memory>
 
-namespace sash {
+namespace vypr {
 
 class AudioCapture {
 public:
@@ -38,4 +38,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace sash
+}  // namespace vypr

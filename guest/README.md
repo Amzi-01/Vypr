@@ -1,4 +1,4 @@
-# sash-agent
+# vypr-agent
 
 The guest half. Runs on Windows, captures individual windows, and publishes them
 into the shared region the host carved.
@@ -23,7 +23,7 @@ cmake --build build --config Release
 ## Running
 
 ```
-sash-agent.exe --host 192.168.122.1
+vypr-agent.exe --host 192.168.122.1
 ```
 
 Must run **as the interactive desktop user**, never as a service. Session 0 has
@@ -31,11 +31,11 @@ no DWM to capture from, and `SetForegroundWindow` does not work from it.
 
 ## Two more things that will bite
 
-**Two IVSHMEM devices now exist** on this VM - Looking Glass's and sash's - and
+**Two IVSHMEM devices now exist** on this VM - Looking Glass's and vypr's - and
 the same driver binds both. The agent does not select by device index, which
 would silently stream into Looking Glass's region the first time PCI order
-changed. It maps each device and keeps the one containing the sash magic the
-host wrote. If it reports finding devices but no sash region, the host session
+changed. It maps each device and keeps the one containing the vypr magic the
+host wrote. If it reports finding devices but no vypr region, the host session
 is not running yet.
 
 **A display must be attached to the passthrough GPU.** `<video model='none'/>`
@@ -46,7 +46,7 @@ the problems.
 
 ## Verified working
 
-Built with MSVC 14.44 against Windows SDK 10.0.22621 and run against `sashd`:
+Built with MSVC 14.44 against Windows SDK 10.0.22621 and run against `vyprd`:
 Notepad from the guest presented as a native Linux window at **60 fps**, with
 WGC capture, the IVSHMEM mapping and the control channel all live.
 
@@ -66,11 +66,11 @@ returns false there because the session has no desktop. Launch it in the console
 session instead:
 
 ```
-schtasks /create /tn sash-agent /tr "cmd /c C:\sash\guest\build\sash-agent.exe --host 192.168.122.1 > C:\sash\agent.log 2>&1" /sc once /st 00:00 /it /f
-schtasks /run /tn sash-agent
+schtasks /create /tn vypr-agent /tr "cmd /c C:\vypr\guest\build\vypr-agent.exe --host 192.168.122.1 > C:\vypr\agent.log 2>&1" /sc once /st 00:00 /it /f
+schtasks /run /tn vypr-agent
 ```
 
-Set `SASH_TRACE=1` for step-by-step tracing of capture startup.
+Set `VYPR_TRACE=1` for step-by-step tracing of capture startup.
 
 Input injection is verified too - typing into the host window arrives in the
 guest application, so the PS/2 set 1 scancode table and the AttachThreadInput

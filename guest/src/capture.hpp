@@ -12,7 +12,7 @@
 #include <functional>
 #include <memory>
 
-namespace sash {
+namespace vypr {
 
 class Publisher;
 
@@ -48,4 +48,4 @@ private:
 // with no display DWM has nothing composited to hand out.
 bool capture_supported();
 
-}  // namespace sash
+}  // namespace vypr

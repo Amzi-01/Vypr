@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-namespace sash {
+namespace vypr {
 
 namespace {
 // std::atomic_ref rather than atomics in the struct itself: the layout is a C
@@ -24,20 +24,20 @@ inline void store_relaxed(volatile std::uint32_t& v, std::uint32_t x) {
 
 bool Publisher::bind(void* base, std::size_t region_bytes, std::uint32_t slot_index) {
     slot_ = nullptr;
-    if (!base || slot_index >= SASH_MAX_SLOTS) return false;
+    if (!base || slot_index >= VYPR_MAX_SLOTS) return false;
 
-    auto* hdr = static_cast<sash_shm_header*>(base);
-    if (load_acquire(hdr->magic) != SASH_SHM_MAGIC) return false;
-    if (hdr->version != SASH_SHM_VERSION) return false;
+    auto* hdr = static_cast<vypr_shm_header*>(base);
+    if (load_acquire(hdr->magic) != VYPR_SHM_MAGIC) return false;
+    if (hdr->version != VYPR_SHM_VERSION) return false;
 
-    sash_slot* slot = &hdr->slots[slot_index];
-    if (load_acquire(slot->state) != SASH_SLOT_ARMED) return false;
+    vypr_slot* slot = &hdr->slots[slot_index];
+    if (load_acquire(slot->state) != VYPR_SLOT_ARMED) return false;
 
     // The host computes these, but a mismatch here writes pixels outside the
     // region, so check rather than trust.
     if (slot->frame_bytes == 0 || slot->frame_stride == 0) return false;
     const std::uint64_t span = slot->ring_offset +
-                               slot->frame_bytes * SASH_RING_FRAMES;
+                               slot->frame_bytes * VYPR_RING_FRAMES;
     if (span > region_bytes) return false;
     if (static_cast<std::uint64_t>(slot->frame_stride) * slot->max_height >
         slot->frame_bytes) return false;
@@ -74,7 +74,7 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
     if (width > slot_->max_width || height > slot_->max_height) return false;
     if (static_cast<std::uint64_t>(stride) * height > slot_->frame_bytes) return false;
 
-    sash_publish& pub = slot_->pub;
+    vypr_publish& pub = slot_->pub;
 
     // Seqlock write. Odd marks the record unstable; the release fences keep the
     // pixel writes and the field writes from being seen after the even store
@@ -97,17 +97,17 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
 
     // First publish takes the slot live, so the host starts reading only once
     // there is a whole frame to read.
-    if (load_acquire(slot_->state) == SASH_SLOT_ARMED)
-        store_release(slot_->state, SASH_SLOT_LIVE);
+    if (load_acquire(slot_->state) == VYPR_SLOT_ARMED)
+        store_release(slot_->state, VYPR_SLOT_LIVE);
 
-    index_ = (index_ + 1) % SASH_RING_FRAMES;
+    index_ = (index_ + 1) % VYPR_RING_FRAMES;
     return true;
 }
 
 void Publisher::close() {
     if (!slot_) return;
-    store_release(slot_->state, SASH_SLOT_CLOSED);
+    store_release(slot_->state, VYPR_SLOT_CLOSED);
     slot_ = nullptr;
 }
 
-}  // namespace sash
+}  // namespace vypr

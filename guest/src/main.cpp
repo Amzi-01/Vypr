@@ -1,4 +1,4 @@
-// sash-agent - the guest half.
+// vypr-agent - the guest half.
 //
 // Connects to the host, offers the windows it can see, and streams whichever
 // ones the host attaches. One process handles every window in the session: WGC
@@ -36,8 +36,8 @@
 namespace {
 
 struct Stream {
-    sash::Publisher     pub;
-    sash::WindowCapture capture;
+    vypr::Publisher     pub;
+    vypr::WindowCapture capture;
     std::uint32_t       slot = 0;
 };
 
@@ -47,18 +47,18 @@ public:
 
 private:
     void on_message(std::uint16_t type, const std::uint8_t* payload, std::uint32_t bytes);
-    void handle_attach(const sash_msg_attach& msg);
+    void handle_attach(const vypr_msg_attach& msg);
     void handle_detach(std::uint64_t window_id);
     void watch_windows();
 
-    sash::Region       region_;
-    sash::Control      control_;
-    sash::Control      audio_link_;   /* audio only; written by one thread */
-    sash::AudioCapture audio_;
+    vypr::Region       region_;
+    vypr::Control      control_;
+    vypr::Control      audio_link_;   /* audio only; written by one thread */
+    vypr::AudioCapture audio_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
-    std::map<std::uint64_t, sash::WindowInfo>           known_;
+    std::map<std::uint64_t, vypr::WindowInfo>           known_;
 
     std::atomic<bool> stop_{false};
 
@@ -92,16 +92,16 @@ void Agent::start_audio(unsigned long pid) {
     audio_.start([this](const float* samples, std::uint32_t frames,
                         std::uint32_t rate, std::uint16_t channels) {
         const std::uint32_t bytes = frames * channels * sizeof(float);
-        if (bytes == 0 || sizeof(sash_msg_audio) + bytes > SASH_MAX_MSG_BYTES) return;
+        if (bytes == 0 || sizeof(vypr_msg_audio) + bytes > VYPR_MAX_MSG_BYTES) return;
 
-        std::vector<std::uint8_t> buf(sizeof(sash_msg_audio) + bytes);
-        sash_msg_audio hdr{};
+        std::vector<std::uint8_t> buf(sizeof(vypr_msg_audio) + bytes);
+        vypr_msg_audio hdr{};
         hdr.sample_rate = rate;
         hdr.channels    = channels;
         hdr.frames      = frames;
         std::memcpy(buf.data(), &hdr, sizeof(hdr));
         std::memcpy(buf.data() + sizeof(hdr), samples, bytes);
-        audio_link_.send(SASH_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
+        audio_link_.send(VYPR_MSG_AUDIO, buf.data(), static_cast<std::uint32_t>(buf.size()));
     }, pid);
 }
 
@@ -149,7 +149,7 @@ void Agent::poll_pointer_lock() {
      */
     bool abs_impossible = false;
     if (fg) {
-        const RECT cap = sash_capture_rect(fg);
+        const RECT cap = vypr_capture_rect(fg);
         const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
         const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -178,15 +178,15 @@ void Agent::poll_pointer_lock() {
     lock_state_  = locked;
     lock_window_ = locked ? fg_id : lock_window_;
 
-    if (locked) sash::suspend_pointer_acceleration();
-    else        sash::restore_pointer_acceleration();
+    if (locked) vypr::suspend_pointer_acceleration();
+    else        vypr::restore_pointer_acceleration();
 
-    sash_msg_pointer_lock msg{};
+    vypr_msg_pointer_lock msg{};
     msg.window_id = lock_window_;
     msg.locked    = locked ? 1u : 0u;
-    control_.send(SASH_MSG_POINTER_LOCK, &msg, sizeof(msg));
+    control_.send(VYPR_MSG_POINTER_LOCK, &msg, sizeof(msg));
 
-    std::fprintf(stderr, "sash: pointer %s for HWND %p\n",
+    std::fprintf(stderr, "vypr: pointer %s for HWND %p\n",
                  locked ? "locked" : "released",
                  reinterpret_cast<void*>(static_cast<std::uintptr_t>(lock_window_)));
 }
@@ -198,16 +198,16 @@ const T* as(const std::uint8_t* payload, std::uint32_t bytes) {
     return bytes >= sizeof(T) ? reinterpret_cast<const T*>(payload) : nullptr;
 }
 
-void Agent::handle_attach(const sash_msg_attach& msg) {
+void Agent::handle_attach(const vypr_msg_attach& msg) {
     HWND hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(msg.window_id));
 
-    sash_msg_attach_result result{};
+    vypr_msg_attach_result result{};
     result.window_id = msg.window_id;
     result.slot      = msg.slot;
 
     if (!IsWindow(hwnd)) {
         result.status = -1;
-        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
     }
 
@@ -221,7 +221,7 @@ void Agent::handle_attach(const sash_msg_attach& msg) {
      * recovered from inside the guest, which rather defeats the point.
      */
     if (IsIconic(hwnd)) {
-        std::fprintf(stderr, "sash: HWND %p is minimised; restoring it\n",
+        std::fprintf(stderr, "vypr: HWND %p is minimised; restoring it\n",
                      reinterpret_cast<void*>(hwnd));
         ShowWindow(hwnd, SW_RESTORE);
     }
@@ -230,16 +230,16 @@ void Agent::handle_attach(const sash_msg_attach& msg) {
     stream->slot = msg.slot;
 
     if (!stream->pub.bind(region_.base(), region_.bytes(), msg.slot)) {
-        std::fprintf(stderr, "sash: slot %u not armed for us; host re-carved the region\n",
+        std::fprintf(stderr, "vypr: slot %u not armed for us; host re-carved the region\n",
                      msg.slot);
         result.status = -2;
-        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
     }
 
     if (!stream->capture.start(hwnd, &stream->pub)) {
         result.status = -3;
-        control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
     }
 
@@ -249,8 +249,8 @@ void Agent::handle_attach(const sash_msg_attach& msg) {
     }
 
     result.status = 0;
-    control_.send(SASH_MSG_ATTACH_RESULT, &result, sizeof(result));
-    std::fprintf(stderr, "sash: streaming HWND %p into slot %u\n",
+    control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
+    std::fprintf(stderr, "vypr: streaming HWND %p into slot %u\n",
                  reinterpret_cast<void*>(hwnd), msg.slot);
 
     /* Follow this window's process for audio. */
@@ -276,55 +276,55 @@ void Agent::handle_detach(std::uint64_t window_id) {
 
 void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uint32_t bytes) {
     switch (type) {
-    case SASH_MSG_ATTACH:
-        if (auto* m = as<sash_msg_attach>(payload, bytes)) handle_attach(*m);
+    case VYPR_MSG_ATTACH:
+        if (auto* m = as<vypr_msg_attach>(payload, bytes)) handle_attach(*m);
         break;
-    case SASH_MSG_DETACH:
-        if (auto* m = as<sash_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
+    case VYPR_MSG_DETACH:
+        if (auto* m = as<vypr_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
         break;
-    case SASH_MSG_POINTER:
-        if (auto* m = as<sash_msg_pointer>(payload, bytes)) sash::inject_pointer(*m);
+    case VYPR_MSG_POINTER:
+        if (auto* m = as<vypr_msg_pointer>(payload, bytes)) vypr::inject_pointer(*m);
         break;
-    case SASH_MSG_KEY:
-        if (auto* m = as<sash_msg_key>(payload, bytes)) sash::inject_key(*m);
+    case VYPR_MSG_KEY:
+        if (auto* m = as<vypr_msg_key>(payload, bytes)) vypr::inject_key(*m);
         break;
-    case SASH_MSG_TEXT:
-        if (bytes > sizeof(sash_msg_window_id)) {
-            auto* m = reinterpret_cast<const sash_msg_window_id*>(payload);
-            sash::inject_text(m->window_id,
+    case VYPR_MSG_TEXT:
+        if (bytes > sizeof(vypr_msg_window_id)) {
+            auto* m = reinterpret_cast<const vypr_msg_window_id*>(payload);
+            vypr::inject_text(m->window_id,
                               reinterpret_cast<const char*>(payload + sizeof(*m)),
                               bytes - static_cast<std::uint32_t>(sizeof(*m)));
         }
         break;
-    case SASH_MSG_WINDOW_STATE:
-        if (auto* m = as<sash_msg_window_state>(payload, bytes))
-            sash::set_window_minimized(m->window_id, m->minimized != 0);
+    case VYPR_MSG_WINDOW_STATE:
+        if (auto* m = as<vypr_msg_window_state>(payload, bytes))
+            vypr::set_window_minimized(m->window_id, m->minimized != 0);
         break;
 
-    case SASH_MSG_FOCUS:
-        if (auto* m = as<sash_msg_window_id>(payload, bytes)) sash::focus_window(m->window_id);
+    case VYPR_MSG_FOCUS:
+        if (auto* m = as<vypr_msg_window_id>(payload, bytes)) vypr::focus_window(m->window_id);
         break;
-    case SASH_MSG_CLOSE:
-        if (auto* m = as<sash_msg_window_id>(payload, bytes)) sash::close_window(m->window_id);
+    case VYPR_MSG_CLOSE:
+        if (auto* m = as<vypr_msg_window_id>(payload, bytes)) vypr::close_window(m->window_id);
         break;
-    case SASH_MSG_RESIZE:
-        if (auto* m = as<sash_msg_resize>(payload, bytes)) sash::resize_window(*m);
+    case VYPR_MSG_RESIZE:
+        if (auto* m = as<vypr_msg_resize>(payload, bytes)) vypr::resize_window(*m);
         break;
-    case SASH_MSG_PING: {
-        if (auto* m = as<sash_msg_ping>(payload, bytes)) {
+    case VYPR_MSG_PING: {
+        if (auto* m = as<vypr_msg_ping>(payload, bytes)) {
             LARGE_INTEGER qpc{}, freq{};
             QueryPerformanceCounter(&qpc);
             QueryPerformanceFrequency(&freq);
-            sash_msg_pong pong{};
+            vypr_msg_pong pong{};
             pong.token          = m->token;
             pong.guest_qpc      = static_cast<std::uint64_t>(qpc.QuadPart);
             pong.guest_qpc_freq = static_cast<std::uint64_t>(freq.QuadPart);
-            control_.send(SASH_MSG_PONG, &pong, sizeof(pong));
+            control_.send(VYPR_MSG_PONG, &pong, sizeof(pong));
         }
         break;
     }
 
-    case SASH_MSG_LAUNCH: {
+    case VYPR_MSG_LAUNCH: {
         std::wstring cmd;
         {
             const int n = MultiByteToWideChar(CP_UTF8, 0,
@@ -342,7 +342,7 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         } else {
-            std::fprintf(stderr, "sash: launch failed: %lu\n", GetLastError());
+            std::fprintf(stderr, "vypr: launch failed: %lu\n", GetLastError());
         }
         break;
     }
@@ -356,26 +356,26 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
 // anyway to notice a resize that WGC reports but nobody sent an event for.
 void Agent::watch_windows() {
     while (!stop_) {
-        auto current = sash::list_windows();
+        auto current = vypr::list_windows();
 
-        std::map<std::uint64_t, sash::WindowInfo> now;
+        std::map<std::uint64_t, vypr::WindowInfo> now;
         for (auto& w : current) now[w.desc.window_id] = w;
 
         for (auto& [id, info] : now) {
             auto it = known_.find(id);
             if (it == known_.end()) {
-                control_.send_window(SASH_MSG_WINDOW_ADDED, info.desc, info.title);
+                control_.send_window(VYPR_MSG_WINDOW_ADDED, info.desc, info.title);
             } else if (it->second.desc.width  != info.desc.width  ||
                        it->second.desc.height != info.desc.height ||
                        it->second.desc.flags  != info.desc.flags  ||
                        it->second.title       != info.title) {
-                control_.send_window(SASH_MSG_WINDOW_CHANGED, info.desc, info.title);
+                control_.send_window(VYPR_MSG_WINDOW_CHANGED, info.desc, info.title);
             }
         }
         for (auto& [id, info] : known_) {
             if (now.find(id) == now.end()) {
-                sash_msg_window_id gone{ id };
-                control_.send(SASH_MSG_WINDOW_REMOVED, &gone, sizeof(gone));
+                vypr_msg_window_id gone{ id };
+                control_.send(VYPR_MSG_WINDOW_REMOVED, &gone, sizeof(gone));
                 handle_detach(id);
             }
         }
@@ -394,7 +394,7 @@ void Agent::watch_windows() {
                 auto desc = it->second.desc;
                 desc.width = w;
                 desc.height = h;
-                control_.send_window(SASH_MSG_WINDOW_CHANGED, desc, it->second.title);
+                control_.send_window(VYPR_MSG_WINDOW_CHANGED, desc, it->second.title);
             }
         }
 
@@ -417,7 +417,7 @@ void Agent::watch_windows() {
             std::lock_guard<std::mutex> guard(lock_);
             for (auto& [id, info] : known_)
                 if (streams_.find(id) == streams_.end())
-                    control_.send_window(SASH_MSG_WINDOW_CHANGED, info.desc, info.title);
+                    control_.send_window(VYPR_MSG_WINDOW_CHANGED, info.desc, info.title);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -425,24 +425,24 @@ void Agent::watch_windows() {
 }
 
 bool Agent::run(const char* host, std::uint16_t port) {
-    if (!sash::capture_supported()) {
+    if (!vypr::capture_supported()) {
         std::fprintf(stderr,
-            "sash: Windows.Graphics.Capture is unavailable.\n"
+            "vypr: Windows.Graphics.Capture is unavailable.\n"
             "      Needs Windows 10 1903 or newer, and a display attached to the GPU -\n"
             "      with no monitor or dummy plug DWM has nothing to composite.\n");
         return false;
     }
 
     if (!control_.connect(host, port)) return false;
-    std::fprintf(stderr, "sash: control channel up to %s:%u\n", host, port);
+    std::fprintf(stderr, "vypr: control channel up to %s:%u\n", host, port);
 
     /* A second connection for audio, so a queued input event cannot sit in
      * front of a sound, and so the audio thread has a socket to itself. */
     if (audio_link_.connect(host, port)) {
-        audio_link_.send(SASH_MSG_AUDIO_HELLO, nullptr, 0);
-        std::fprintf(stderr, "sash: audio channel up\n");
+        audio_link_.send(VYPR_MSG_AUDIO_HELLO, nullptr, 0);
+        std::fprintf(stderr, "vypr: audio channel up\n");
     } else {
-        std::fprintf(stderr, "sash: no audio channel; sound disabled\n");
+        std::fprintf(stderr, "vypr: no audio channel; sound disabled\n");
     }
 
     // The region only exists once the host has formatted it, so this comes
@@ -454,13 +454,13 @@ bool Agent::run(const char* host, std::uint16_t port) {
     LARGE_INTEGER freq{};
     QueryPerformanceFrequency(&freq);
 
-    sash_msg_hello hello{};
-    hello.version      = SASH_PROTO_VERSION;
+    vypr_msg_hello hello{};
+    hello.version      = VYPR_PROTO_VERSION;
     hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
     hello.shm_bytes    = region_.bytes();
     hello.agent_pid    = GetCurrentProcessId();
-    hello.capabilities = SASH_CAP_RESIZE;
-    control_.send(SASH_MSG_HELLO, &hello, sizeof(hello));
+    hello.capabilities = VYPR_CAP_RESIZE;
+    control_.send(VYPR_MSG_HELLO, &hello, sizeof(hello));
 
 
     std::thread watcher([this] { watch_windows(); });
@@ -472,7 +472,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
     stop_ = true;
     audio_.stop();
     watcher.join();
-    sash::restore_pointer_acceleration();
+    vypr::restore_pointer_acceleration();
 
     for (auto& [id, s] : streams_) {
         s->capture.stop();
@@ -486,18 +486,18 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
 int main(int argc, char** argv) {
     const char*   host = "192.168.122.1";   // the virtual bridge's host address
-    std::uint16_t port = SASH_CONTROL_PORT;
+    std::uint16_t port = VYPR_CONTROL_PORT;
 
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--host") && i + 1 < argc)      host = argv[++i];
         else if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--dump")) {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            sash::dump_all_windows();
+            vypr::dump_all_windows();
             return 0;
         }
         else {
-            std::fputs("usage: sash-agent [--host ADDR] [--port N] [--dump]\n", stderr);
+            std::fputs("usage: vypr-agent [--host ADDR] [--port N] [--dump]\n", stderr);
             return 2;
         }
     }

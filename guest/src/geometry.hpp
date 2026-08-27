@@ -21,7 +21,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 
-inline RECT sash_capture_rect(HWND hwnd) {
+inline RECT vypr_capture_rect(HWND hwnd) {
     RECT r{};
     if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r))) ||
         r.right <= r.left || r.bottom <= r.top) {
@@ -42,15 +42,15 @@ inline RECT sash_capture_rect(HWND hwnd) {
  * Falls back to the captured frame for windows with no separate client area,
  * such as menus and fullscreen surfaces.
  */
-inline RECT sash_content_rect(HWND hwnd) {
+inline RECT vypr_content_rect(HWND hwnd) {
     RECT client{};
     POINT origin{ 0, 0 };
     if (!GetClientRect(hwnd, &client) || !ClientToScreen(hwnd, &origin))
-        return sash_capture_rect(hwnd);
+        return vypr_capture_rect(hwnd);
 
     const LONG w = client.right - client.left;
     const LONG h = client.bottom - client.top;
-    if (w < 8 || h < 8) return sash_capture_rect(hwnd);
+    if (w < 8 || h < 8) return vypr_capture_rect(hwnd);
 
     return RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
 }

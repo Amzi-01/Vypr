@@ -12,8 +12,8 @@
  *   "gpu"     SDL_GPU transfer buffers - a persistently mappable upload heap.
  *             One memcpy straight into memory the GPU will DMA from.
  */
-#ifndef SASH_HOST_PRESENT_H
-#define SASH_HOST_PRESENT_H
+#ifndef VYPR_HOST_PRESENT_H
+#define VYPR_HOST_PRESENT_H
 
 #include <SDL3/SDL.h>
 #include <stdbool.h>
@@ -34,7 +34,7 @@ struct presenter *presenter_create(SDL_Window *win, const char *backend,
 void              presenter_destroy(struct presenter *p);
 const char       *presenter_name(const struct presenter *p);
 
-bool presenter_upload(struct presenter *p, const struct sash_frame_view *f);
+bool presenter_upload(struct presenter *p, const struct vypr_frame_view *f);
 void presenter_present(struct presenter *p);
 
 /* Nanoseconds since the last call, then reset. */

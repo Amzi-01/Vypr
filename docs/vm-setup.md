@@ -1,7 +1,7 @@
-# VM changes sash needs
+# VM changes vypr needs
 
 The VM already passes through the RTX 5050 and has a 128 MB IVSHMEM device named
-`looking-glass`. sash needs its own, larger region, added alongside rather than
+`looking-glass`. vypr needs its own, larger region, added alongside rather than
 replacing it so Looking Glass keeps working.
 
 All of this requires the guest powered off.
@@ -11,7 +11,7 @@ All of this requires the guest powered off.
 `virsh edit RDPWindows`, then add inside `<devices>`:
 
 ```xml
-<shmem name='sash'>
+<shmem name='vypr'>
   <model type='ivshmem-plain'/>
   <size unit='M'>512</size>
 </shmem>
@@ -20,7 +20,7 @@ All of this requires the guest powered off.
 512 MB holds three 4K buffers for one window plus several 1080p windows.
 Uncompressed rings are large: a 4K slot is 96 MB, a 1080p slot 24 MB.
 
-The region appears on the host as `/dev/shm/sash`, owned by the qemu user, so
+The region appears on the host as `/dev/shm/vypr`, owned by the qemu user, so
 the host tools need it group-readable — the same arrangement the existing
 `looking-glass` region already uses.
 
@@ -40,8 +40,8 @@ out without copying through the network:
 ```xml
 <filesystem type='mount' accessmode='passthrough'>
   <driver type='virtiofs'/>
-  <source dir='/home/lucy/sash'/>
-  <target dir='sash'/>
+  <source dir='/home/lucy/vypr'/>
+  <target dir='vypr'/>
 </filesystem>
 ```
 
@@ -80,14 +80,14 @@ virsh detach-device RDPWindows tablet.xml --live --config
 
 Leaving only `<input type='mouse' bus='ps2'/>`, a relative device. The cost is
 that the SPICE console pointer now needs to be grabbed rather than tracking the
-host pointer, which does not matter when the guest is driven through sash or
+host pointer, which does not matter when the guest is driven through vypr or
 Looking Glass.
 
 ## 6. Parsec, running in the tray - for the mouse
 
 Not for streaming. For its driver.
 
-sash injects mouse motion with `SendInput`, which always goes through the Win32
+vypr injects mouse motion with `SendInput`, which always goes through the Win32
 cursor pipeline. A game that reads **raw input** for its camera - FiveM and
 GTA V both do - wants the `lLastX`/`lLastY` deltas a physical mouse produces.
 `SendInput` gives it `MOUSE_MOVE_ABSOLUTE` packets or zeroes, so the game reads
@@ -95,7 +95,7 @@ the cursor as (0,0), computes an enormous negative delta every frame, and whips
 the camera into a corner.
 
 **No userspace API can produce a real HID delta**, so this cannot be fixed in
-sash as it currently injects input. Sunshine and Apollo have the same bug for
+vypr as it currently injects input. Sunshine and Apollo have the same bug for
 the same reason. Parsec's `parsecvusba` driver injects at the kernel HID level,
 where the deltas are genuine, and with Parsec running the camera behaves.
 

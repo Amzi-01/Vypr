@@ -25,7 +25,7 @@ struct presenter *presenter_create(SDL_Window *win, const char *backend,
         /* The GPU backend needs a working Vulkan or D3D12; falling back beats
          * refusing to show the window at all. */
         if (ops != &present_render_ops) {
-            fprintf(stderr, "sash: '%s' backend unavailable, falling back to 'render'\n",
+            fprintf(stderr, "vypr: '%s' backend unavailable, falling back to 'render'\n",
                     ops->name);
             ops = &present_render_ops;
             p->impl = ops->create(win, NULL);
@@ -45,7 +45,7 @@ void presenter_destroy(struct presenter *p)
 
 const char *presenter_name(const struct presenter *p) { return p->ops->driver(p->impl); }
 
-bool presenter_upload(struct presenter *p, const struct sash_frame_view *f)
+bool presenter_upload(struct presenter *p, const struct vypr_frame_view *f)
 {
     return p->ops->upload(p->impl, f);
 }

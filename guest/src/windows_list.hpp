@@ -6,13 +6,13 @@
 #include <vector>
 
 extern "C" {
-#include "sash_proto.h"
+#include "vypr_proto.h"
 }
 
-namespace sash {
+namespace vypr {
 
 struct WindowInfo {
-    sash_msg_window desc{};
+    vypr_msg_window desc{};
     std::string     title;
 };
 
@@ -31,4 +31,4 @@ std::vector<WindowInfo> windows_for_pid(std::uint32_t pid);
 // dropped, is otherwise only visible through what the filter already discarded.
 void dump_all_windows();
 
-}  // namespace sash
+}  // namespace vypr

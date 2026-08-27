@@ -8,7 +8,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-namespace sash {
+namespace vypr {
 
 namespace { bool g_wsa = false; }
 
@@ -33,7 +33,7 @@ bool Control::connect(const char* host, std::uint16_t port) {
     }
 
     if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        std::fprintf(stderr, "sash: connect to %s:%u failed: %d\n", host, port, WSAGetLastError());
+        std::fprintf(stderr, "vypr: connect to %s:%u failed: %d\n", host, port, WSAGetLastError());
         closesocket(s);
         return false;
     }
@@ -56,9 +56,9 @@ void Control::close() {
 
 bool Control::send(std::uint16_t type, const void* payload, std::uint32_t bytes) {
     if (sock_ == ~0ull) return false;
-    if (bytes > SASH_MAX_MSG_BYTES) return false;
+    if (bytes > VYPR_MAX_MSG_BYTES) return false;
 
-    sash_msg_head head{};
+    vypr_msg_head head{};
     head.bytes = bytes;
     head.type  = type;
     head.flags = 0;
@@ -80,9 +80,9 @@ bool Control::send(std::uint16_t type, const void* payload, std::uint32_t bytes)
     return true;
 }
 
-bool Control::send_window(std::uint16_t type, const sash_msg_window& w,
+bool Control::send_window(std::uint16_t type, const vypr_msg_window& w,
                           const std::string& title) {
-    sash_msg_window msg = w;
+    vypr_msg_window msg = w;
     msg.title_bytes = static_cast<std::uint32_t>(title.size());
 
     std::vector<std::uint8_t> buf(sizeof(msg) + title.size());
@@ -104,11 +104,11 @@ bool Control::recv_exact(void* dst, std::uint32_t bytes) {
 
 void Control::run(const Handler& on_message) {
     while (sock_ != ~0ull) {
-        sash_msg_head head{};
+        vypr_msg_head head{};
         if (!recv_exact(&head, sizeof(head))) break;
 
-        if (head.bytes > SASH_MAX_MSG_BYTES) {
-            std::fprintf(stderr, "sash: control message of %u bytes; dropping link\n",
+        if (head.bytes > VYPR_MAX_MSG_BYTES) {
+            std::fprintf(stderr, "vypr: control message of %u bytes; dropping link\n",
                          head.bytes);
             break;
         }
@@ -121,4 +121,4 @@ void Control::run(const Handler& on_message) {
     close();
 }
 
-}  // namespace sash
+}  // namespace vypr

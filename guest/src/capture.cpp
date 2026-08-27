@@ -21,11 +21,11 @@
 #include <mutex>
 #include <thread>
 
-// Step-by-step tracing of capture startup, off unless SASH_TRACE is set. It is
+// Step-by-step tracing of capture startup, off unless VYPR_TRACE is set. It is
 // worth keeping: the failure that cost the most here was a crash partway
 // through start(), and knowing which step it reached is what identified it.
 static bool trace_enabled() {
-    static const bool on = std::getenv("SASH_TRACE") != nullptr;
+    static const bool on = std::getenv("VYPR_TRACE") != nullptr;
     return on;
 }
 #define TRACE(...) do { if (trace_enabled()) { \
@@ -41,7 +41,7 @@ using namespace winrt::Windows::Graphics::Capture;
 using namespace winrt::Windows::Graphics::DirectX;
 using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 
-namespace sash {
+namespace vypr {
 
 bool capture_supported() {
     try {
@@ -128,7 +128,7 @@ void WindowCapture::Impl::gdi_loop() {
 
     while (!gdi_stop.load()) {
         if (!IsWindow(gdi_hwnd)) break;
-        const RECT r = sash_content_rect(gdi_hwnd);
+        const RECT r = vypr_content_rect(gdi_hwnd);
 
         const int w = r.right - r.left;
         const int h = r.bottom - r.top;
@@ -167,7 +167,7 @@ void WindowCapture::Impl::gdi_loop() {
                     pub->publish(static_cast<std::uint32_t>(w),
                                  static_cast<std::uint32_t>(h), stride,
                                  static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
-                                 SASH_PUB_DAMAGE_FULL);
+                                 VYPR_PUB_DAMAGE_FULL);
                     captured++;
                 }
             }
@@ -198,7 +198,7 @@ bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
     for (auto& tex : staging) {
         tex = nullptr;
         if (FAILED(device->CreateTexture2D(&d, nullptr, tex.put()))) {
-            std::fprintf(stderr, "sash: staging texture %ux%u failed\n", w, h);
+            std::fprintf(stderr, "vypr: staging texture %ux%u failed\n", w, h);
             return false;
         }
     }
@@ -321,7 +321,7 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
             stamp      = static_cast<std::uint64_t>(qpc.QuadPart);
             stamp_freq = qpc_freq;
         }
-        pub->publish(w, h, stride, stamp, stamp_freq, SASH_PUB_DAMAGE_FULL);
+        pub->publish(w, h, stride, stamp, stamp_freq, VYPR_PUB_DAMAGE_FULL);
         captured++;
 
         // Guest-side cost, measured entirely within one clock: from the time
@@ -336,7 +336,7 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
             if (ms > pipeline_ms_worst) pipeline_ms_worst = ms;
             if (++pipeline_n >= 240) {
                 std::fprintf(stderr,
-                    "sash: capture->publish avg %.2f ms worst %.2f ms over %u frames\n",
+                    "vypr: capture->publish avg %.2f ms worst %.2f ms over %u frames\n",
                     pipeline_ms_total / pipeline_n, pipeline_ms_worst, pipeline_n);
                 pipeline_ms_total = 0; pipeline_ms_worst = 0; pipeline_n = 0;
             }
@@ -356,7 +356,7 @@ WindowCapture::~WindowCapture() { stop(); }
 
 bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     if (!capture_supported()) {
-        std::fprintf(stderr, "sash: Windows.Graphics.Capture unavailable "
+        std::fprintf(stderr, "vypr: Windows.Graphics.Capture unavailable "
                              "(needs Windows 10 1903+, and a display attached)\n");
         return false;
     }
@@ -373,7 +373,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
                                  nullptr, 0, D3D11_SDK_VERSION,
                                  impl_->device.put(), nullptr, impl_->context.put()))) {
-        std::fprintf(stderr, "sash: D3D11CreateDevice failed\n");
+        std::fprintf(stderr, "vypr: D3D11CreateDevice failed\n");
         return false;
     }
 
@@ -381,7 +381,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
     auto dxgi = impl_->device.as<IDXGIDevice>();
     com_ptr<::IInspectable> inspectable;
     if (FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), inspectable.put()))) {
-        std::fprintf(stderr, "sash: CreateDirect3D11DeviceFromDXGIDevice failed\n");
+        std::fprintf(stderr, "vypr: CreateDirect3D11DeviceFromDXGIDevice failed\n");
         return false;
     }
     impl_->rt_device = inspectable.as<IDirect3DDevice>();
@@ -394,7 +394,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
         wchar_t cls[64] = {0};
         GetClassNameW(hwnd, cls, 64);
         std::fprintf(stderr,
-                     "sash: WGC refused HWND %p class '%ls' (0x%08lX); using GDI\n",
+                     "vypr: WGC refused HWND %p class '%ls' (0x%08lX); using GDI\n",
                      hwnd_raw, cls, static_cast<unsigned long>(hr));
 
         impl_->pub         = pub;
@@ -490,4 +490,4 @@ void WindowCapture::content_size(std::uint32_t* w, std::uint32_t* h) const {
 std::uint64_t WindowCapture::frames_captured() const { return impl_->captured.load(); }
 std::uint64_t WindowCapture::frames_dropped() const { return impl_->dropped.load(); }
 
-}  // namespace sash
+}  // namespace vypr

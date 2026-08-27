@@ -13,7 +13,7 @@
 
 #pragma comment(lib, "ole32.lib")
 
-namespace sash {
+namespace vypr {
 
 struct AudioCapture::Impl {
     std::thread       thread;
@@ -160,19 +160,19 @@ void AudioCapture::Impl::run(Sink sink) {
 
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                 __uuidof(IMMDeviceEnumerator), (void**)&enumerator))) {
-        std::fprintf(stderr, "sash: no audio device enumerator\n");
+        std::fprintf(stderr, "vypr: no audio device enumerator\n");
         cleanup();
         return;
     }
     device = device_for_process(enumerator, static_cast<DWORD>(pid));
     if (device) {
-        std::fprintf(stderr, "sash: audio pinned to the device process %lu plays to\n", pid);
+        std::fprintf(stderr, "vypr: audio pinned to the device process %lu plays to\n", pid);
     } else if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
-        std::fprintf(stderr, "sash: no playback device; audio disabled\n");
+        std::fprintf(stderr, "vypr: no playback device; audio disabled\n");
         cleanup();
         return;
     } else if (pid) {
-        std::fprintf(stderr, "sash: process %lu has no audio session yet; "
+        std::fprintf(stderr, "vypr: process %lu has no audio session yet; "
                              "using the default device\n", pid);
     }
     if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) ||
@@ -188,12 +188,12 @@ void AudioCapture::Impl::run(Sink sink) {
                                   dur, 0, wfx, nullptr)) ||
         FAILED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture)) ||
         FAILED(client->Start())) {
-        std::fprintf(stderr, "sash: could not start loopback capture\n");
+        std::fprintf(stderr, "vypr: could not start loopback capture\n");
         cleanup();
         return;
     }
 
-    std::fprintf(stderr, "sash: audio %lu Hz, %u channels, %u-bit\n",
+    std::fprintf(stderr, "vypr: audio %lu Hz, %u channels, %u-bit\n",
                  wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample);
 
     std::vector<float> samples, stereo;
@@ -223,7 +223,7 @@ void AudioCapture::Impl::run(Sink sink) {
                     static unsigned long long total = 0;
                     total += frames;
                     if (++packets % 1000 == 0)
-                        std::fprintf(stderr, "sash: audio %u packets, %llu frames\n",
+                        std::fprintf(stderr, "vypr: audio %u packets, %llu frames\n",
                                      packets, total);
                 }
 
@@ -263,4 +263,4 @@ void AudioCapture::stop() {
     impl_->thread.join();
 }
 
-}  // namespace sash
+}  // namespace vypr

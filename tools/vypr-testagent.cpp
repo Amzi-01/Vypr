@@ -1,4 +1,4 @@
-// sash-testagent - runs the guest agent's real publish path on Linux.
+// vypr-testagent - runs the guest agent's real publish path on Linux.
 //
 // This links the same publisher.cpp the Windows agent will, against the same
 // host client, so the seqlock ordering and ring arithmetic are exercised for
@@ -56,7 +56,7 @@ static void draw(std::uint8_t* dst, std::uint32_t w, std::uint32_t h,
 
 // Control mode: behave like the Windows agent. Announce a window, wait to be
 // attached, publish into whatever slot the daemon assigns, and report the input
-// that comes back. This exercises sashd, slot allocation, client spawning and
+// that comes back. This exercises vyprd, slot allocation, client spawning and
 // the input return path without a VM.
 static int run_connected(const std::string& host, std::uint16_t port,
                          const std::string& shm_path, const std::string& title,
@@ -68,7 +68,7 @@ static int run_connected(const std::string& host, std::uint16_t port,
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        std::fprintf(stderr, "sash-testagent: bad address %s\n", host.c_str());
+        std::fprintf(stderr, "vypr-testagent: bad address %s\n", host.c_str());
         return 1;
     }
     if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -79,36 +79,36 @@ static int run_connected(const std::string& host, std::uint16_t port,
 
     // Open the mapping before announcing, so HELLO can report its real size -
     // the daemon formatted the region before it started listening.
-    struct sash_shm shm;
-    if (sash_shm_open(&shm, shm_path.c_str(), 0) < 0) return 1;
+    struct vypr_shm shm;
+    if (vypr_shm_open(&shm, shm_path.c_str(), 0) < 0) return 1;
 
-    sash_msg_hello hello{};
-    hello.version   = SASH_PROTO_VERSION;
+    vypr_msg_hello hello{};
+    hello.version   = VYPR_PROTO_VERSION;
     hello.qpc_freq  = 1000000000ull;
     hello.shm_bytes = shm.bytes;
     hello.agent_pid = (std::uint32_t)getpid();
-    hello.capabilities = SASH_CAP_RESIZE;
-    msg_send(fd, SASH_MSG_HELLO, &hello, sizeof(hello));
+    hello.capabilities = VYPR_CAP_RESIZE;
+    msg_send(fd, VYPR_MSG_HELLO, &hello, sizeof(hello));
 
     // A stable fake HWND, so a reconnect looks like the same window.
     const std::uint64_t window_id = 0x5a5480000001ull;
 
-    sash_msg_window desc{};
+    vypr_msg_window desc{};
     desc.window_id = window_id;
     desc.width = w; desc.height = h;
     desc.dpi = 96; desc.pid = (std::uint32_t)getpid();
-    desc.flags = SASH_WIN_RESIZABLE;
+    desc.flags = VYPR_WIN_RESIZABLE;
     desc.title_bytes = (std::uint32_t)title.size();
 
     std::vector<std::uint8_t> buf(sizeof(desc) + title.size());
     std::memcpy(buf.data(), &desc, sizeof(desc));
     std::memcpy(buf.data() + sizeof(desc), title.data(), title.size());
-    msg_send(fd, SASH_MSG_WINDOW_ADDED, buf.data(), (std::uint32_t)buf.size());
+    msg_send(fd, VYPR_MSG_WINDOW_ADDED, buf.data(), (std::uint32_t)buf.size());
 
-    std::fprintf(stderr, "sash-testagent: announced '%s' %ux%u, waiting for attach\n",
+    std::fprintf(stderr, "vypr-testagent: announced '%s' %ux%u, waiting for attach\n",
                  title.c_str(), w, h);
 
-    sash::Publisher pub;
+    vypr::Publisher pub;
     bool streaming = false;
 
     struct msg_reader rx{};
@@ -125,17 +125,17 @@ static int run_connected(const std::string& host, std::uint16_t port,
 
         if (p.revents & (POLLIN | POLLHUP)) {
             if (msg_reader_fill(&rx, fd) < 0) {
-                std::fprintf(stderr, "sash-testagent: daemon closed the link\n");
+                std::fprintf(stderr, "vypr-testagent: daemon closed the link\n");
                 break;
             }
-            sash_msg_head head;
+            vypr_msg_head head;
             const std::uint8_t* payload;
             while (msg_reader_next(&rx, &head, &payload) == 1) {
                 switch (head.type) {
-                case SASH_MSG_ATTACH: {
-                    if (head.bytes < sizeof(sash_msg_attach)) break;
-                    auto* at = (const sash_msg_attach*)payload;
-                    sash_msg_attach_result res{};
+                case VYPR_MSG_ATTACH: {
+                    if (head.bytes < sizeof(vypr_msg_attach)) break;
+                    auto* at = (const vypr_msg_attach*)payload;
+                    vypr_msg_attach_result res{};
                     res.window_id = at->window_id;
                     res.slot      = at->slot;
                     if (pub.bind(shm.base, shm.bytes, at->slot)) {
@@ -143,47 +143,47 @@ static int run_connected(const std::string& host, std::uint16_t port,
                         streaming = true;
                         next = now_ns();
                         std::fprintf(stderr,
-                            "sash-testagent: attached to slot %u (%ux%u max)\n",
+                            "vypr-testagent: attached to slot %u (%ux%u max)\n",
                             at->slot, pub.max_width(), pub.max_height());
                     } else {
                         res.status = -2;
-                        std::fprintf(stderr, "sash-testagent: bind failed\n");
+                        std::fprintf(stderr, "vypr-testagent: bind failed\n");
                     }
-                    msg_send(fd, SASH_MSG_ATTACH_RESULT, &res, sizeof(res));
+                    msg_send(fd, VYPR_MSG_ATTACH_RESULT, &res, sizeof(res));
                     break;
                 }
-                case SASH_MSG_POINTER: {
-                    if (head.bytes < sizeof(sash_msg_pointer)) break;
-                    auto* m = (const sash_msg_pointer*)payload;
+                case VYPR_MSG_POINTER: {
+                    if (head.bytes < sizeof(vypr_msg_pointer)) break;
+                    auto* m = (const vypr_msg_pointer*)payload;
                     if (++input_events <= 5 || input_events % 100 == 0)
-                        std::fprintf(stderr, "sash-testagent: pointer %d,%d buttons %u"
+                        std::fprintf(stderr, "vypr-testagent: pointer %d,%d buttons %u"
                                              " wheel %d\n", m->x, m->y, m->buttons, m->wheel);
                     break;
                 }
-                case SASH_MSG_KEY: {
-                    if (head.bytes < sizeof(sash_msg_key)) break;
-                    auto* m = (const sash_msg_key*)payload;
+                case VYPR_MSG_KEY: {
+                    if (head.bytes < sizeof(vypr_msg_key)) break;
+                    auto* m = (const vypr_msg_key*)payload;
                     input_events++;
-                    std::fprintf(stderr, "sash-testagent: key scancode 0x%02X %s\n",
+                    std::fprintf(stderr, "vypr-testagent: key scancode 0x%02X %s\n",
                                  m->scancode, m->down ? "down" : "up");
                     break;
                 }
-                case SASH_MSG_FOCUS:
-                    std::fprintf(stderr, "sash-testagent: focus\n");
+                case VYPR_MSG_FOCUS:
+                    std::fprintf(stderr, "vypr-testagent: focus\n");
                     break;
-                case SASH_MSG_RESIZE: {
-                    if (head.bytes < sizeof(sash_msg_resize)) break;
-                    auto* m = (const sash_msg_resize*)payload;
-                    std::fprintf(stderr, "sash-testagent: resize request %ux%u\n",
+                case VYPR_MSG_RESIZE: {
+                    if (head.bytes < sizeof(vypr_msg_resize)) break;
+                    auto* m = (const vypr_msg_resize*)payload;
+                    std::fprintf(stderr, "vypr-testagent: resize request %ux%u\n",
                                  m->width, m->height);
                     break;
                 }
-                case SASH_MSG_CLOSE:
-                    std::fprintf(stderr, "sash-testagent: host closed the window\n");
+                case VYPR_MSG_CLOSE:
+                    std::fprintf(stderr, "vypr-testagent: host closed the window\n");
                     g_stop = true;
                     break;
-                case SASH_MSG_DETACH:
-                    std::fprintf(stderr, "sash-testagent: detached\n");
+                case VYPR_MSG_DETACH:
+                    std::fprintf(stderr, "vypr-testagent: detached\n");
                     streaming = false;
                     pub.close();
                     break;
@@ -197,26 +197,26 @@ static int run_connected(const std::string& host, std::uint16_t port,
             std::uint32_t stride = 0;
             if (std::uint8_t* dst = pub.begin_frame(&stride)) {
                 draw(dst, w, h, stride, pub.serial());
-                pub.publish(w, h, stride, now_ns(), 1000000000ull, SASH_PUB_DAMAGE_FULL);
+                pub.publish(w, h, stride, now_ns(), 1000000000ull, VYPR_PUB_DAMAGE_FULL);
             }
             next += period;
             if (next < now_ns()) next = now_ns();
         }
     }
 
-    std::fprintf(stderr, "\nsash-testagent: %u frames, %llu input events\n",
+    std::fprintf(stderr, "\nvypr-testagent: %u frames, %llu input events\n",
                  pub.serial(), (unsigned long long)input_events);
     pub.close();
     msg_reader_free(&rx);
-    sash_shm_close(&shm);
+    vypr_shm_close(&shm);
     close(fd);
     return 0;
 }
 
 int main(int argc, char** argv) {
-    std::string path = "/dev/shm/sash-test";
-    std::string connect_host, title = "sash test window";
-    std::uint16_t port = SASH_CONTROL_PORT;
+    std::string path = "/dev/shm/vypr-test";
+    std::string connect_host, title = "vypr test window";
+    std::uint16_t port = VYPR_CONTROL_PORT;
     std::uint32_t w = 1280, h = 720, fps = 60;
 
     for (int i = 1; i < argc; i++) {
@@ -228,10 +228,10 @@ int main(int argc, char** argv) {
         else if (a == "--port" && i + 1 < argc) port = (std::uint16_t)std::atoi(argv[++i]);
         else if (a == "--title" && i + 1 < argc) title = argv[++i];
         else {
-            std::fputs("usage: sash-testagent [--shm PATH] [--size WxH] [--fps N]\n"
+            std::fputs("usage: vypr-testagent [--shm PATH] [--size WxH] [--fps N]\n"
                        "                      [--connect HOST [--port N] [--title T]]\n"
                        "\nWithout --connect it formats the region and publishes standalone.\n"
-                       "With --connect it behaves like the guest agent against sashd.\n", stderr);
+                       "With --connect it behaves like the guest agent against vyprd.\n", stderr);
             return 2;
         }
     }
@@ -250,21 +250,21 @@ int main(int argc, char** argv) {
     close(fd);
 
     // Host half: format and carve.
-    struct sash_shm shm;
-    if (sash_shm_open(&shm, path.c_str(), 1) < 0) return 1;
+    struct vypr_shm shm;
+    if (vypr_shm_open(&shm, path.c_str(), 1) < 0) return 1;
 
-    struct sash_msg_attach at;
-    if (sash_shm_alloc(&shm, 0x5a5480000001ull, w, h, &at) < 0) return 1;
+    struct vypr_msg_attach at;
+    if (vypr_shm_alloc(&shm, 0x5a5480000001ull, w, h, &at) < 0) return 1;
 
     // Guest half: bind and publish, exactly as the Windows agent will.
-    sash::Publisher pub;
+    vypr::Publisher pub;
     if (!pub.bind(shm.base, shm.bytes, at.slot)) {
-        std::fprintf(stderr, "sash-testagent: bind failed for slot %u\n", at.slot);
+        std::fprintf(stderr, "vypr-testagent: bind failed for slot %u\n", at.slot);
         return 1;
     }
 
-    std::printf("sash-testagent: slot %u, %ux%u, stride %u\n", at.slot, w, h, pub.stride());
-    std::printf("present it with:  ./build/sash-host --shm %s --slot %u --stats\n",
+    std::printf("vypr-testagent: slot %u, %ux%u, stride %u\n", at.slot, w, h, pub.stride());
+    std::printf("present it with:  ./build/vypr-window --shm %s --slot %u --stats\n",
                 path.c_str(), at.slot);
 
     const std::uint64_t period = 1000000000ull / (fps ? fps : 60);
@@ -286,8 +286,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (!pub.publish(w, h, stride, now_ns(), 1000000000ull, SASH_PUB_DAMAGE_FULL)) {
-            std::fprintf(stderr, "sash-testagent: publish rejected\n");
+        if (!pub.publish(w, h, stride, now_ns(), 1000000000ull, VYPR_PUB_DAMAGE_FULL)) {
+            std::fprintf(stderr, "vypr-testagent: publish rejected\n");
             break;
         }
 
@@ -297,8 +297,8 @@ int main(int argc, char** argv) {
         else next = t;
     }
 
-    std::printf("\nsash-testagent: published %u frames\n", pub.serial());
+    std::printf("\nvypr-testagent: published %u frames\n", pub.serial());
     pub.close();
-    sash_shm_close(&shm);
+    vypr_shm_close(&shm);
     return 0;
 }

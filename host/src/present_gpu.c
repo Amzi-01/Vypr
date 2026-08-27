@@ -62,12 +62,12 @@ static void *gpu_create(SDL_Window *win, void *share_impl)
         p->owns_device = true;
     }
     if (!p->dev) {
-        fprintf(stderr, "sash: SDL_CreateGPUDevice: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: SDL_CreateGPUDevice: %s\n", SDL_GetError());
         SDL_free(p);
         return NULL;
     }
     if (!SDL_ClaimWindowForGPUDevice(p->dev, win)) {
-        fprintf(stderr, "sash: ClaimWindowForGPUDevice: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: ClaimWindowForGPUDevice: %s\n", SDL_GetError());
         if (p->owns_device) SDL_DestroyGPUDevice(p->dev);
         SDL_free(p);
         return NULL;
@@ -93,7 +93,7 @@ static void gpu_destroy(void *impl)
     SDL_free(p);
 }
 
-static bool ensure_resources(struct gpu_state *p, const struct sash_frame_view *f)
+static bool ensure_resources(struct gpu_state *p, const struct vypr_frame_view *f)
 {
     const uint32_t need = f->stride * f->height;
 
@@ -116,7 +116,7 @@ static bool ensure_resources(struct gpu_state *p, const struct sash_frame_view *
     };
     p->tex = SDL_CreateGPUTexture(p->dev, &ti);
     if (!p->tex) {
-        fprintf(stderr, "sash: CreateGPUTexture %ux%u: %s\n",
+        fprintf(stderr, "vypr: CreateGPUTexture %ux%u: %s\n",
                 f->width, f->height, SDL_GetError());
         return false;
     }
@@ -127,7 +127,7 @@ static bool ensure_resources(struct gpu_state *p, const struct sash_frame_view *
     };
     p->xfer = SDL_CreateGPUTransferBuffer(p->dev, &bi);
     if (!p->xfer) {
-        fprintf(stderr, "sash: CreateGPUTransferBuffer %u bytes: %s\n",
+        fprintf(stderr, "vypr: CreateGPUTransferBuffer %u bytes: %s\n",
                 need, SDL_GetError());
         return false;
     }
@@ -138,7 +138,7 @@ static bool ensure_resources(struct gpu_state *p, const struct sash_frame_view *
     return true;
 }
 
-static bool gpu_upload(void *impl, const struct sash_frame_view *f)
+static bool gpu_upload(void *impl, const struct vypr_frame_view *f)
 {
     struct gpu_state *p = impl;
     const uint64_t t0 = SDL_GetTicksNS();
@@ -148,7 +148,7 @@ static bool gpu_upload(void *impl, const struct sash_frame_view *f)
 
     void *dst = SDL_MapGPUTransferBuffer(p->dev, p->xfer, true);
     if (!dst) {
-        fprintf(stderr, "sash: MapGPUTransferBuffer: %s\n", SDL_GetError());
+        fprintf(stderr, "vypr: MapGPUTransferBuffer: %s\n", SDL_GetError());
         return false;
     }
     /* One contiguous copy, padding included - cheaper than skipping it. */

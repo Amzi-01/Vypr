@@ -2,15 +2,15 @@
 # Push the agent's sources into the guest. Only what the agent build needs:
 # the shared headers and guest/, never the host tree.
 set -e
-KEY="$HOME/.ssh/sash-guest"
+KEY="$HOME/.ssh/vypr-guest"
 DEST="Lucy@192.168.122.58"
 SSHOPTS="-i $KEY -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR"
 
-ssh $SSHOPTS "$DEST" 'if not exist C:\sash\guest\src mkdir C:\sash\guest\src' >/dev/null
-ssh $SSHOPTS "$DEST" 'if not exist C:\sash\include mkdir C:\sash\include' >/dev/null
+ssh $SSHOPTS "$DEST" 'if not exist C:\vypr\guest\src mkdir C:\vypr\guest\src' >/dev/null
+ssh $SSHOPTS "$DEST" 'if not exist C:\vypr\include mkdir C:\vypr\include' >/dev/null
 
-scp $SSHOPTS -q ~/sash/include/*.h            "$DEST:C:/sash/include/"
-scp $SSHOPTS -q ~/sash/guest/src/*.cpp        "$DEST:C:/sash/guest/src/"
-scp $SSHOPTS -q ~/sash/guest/src/*.hpp        "$DEST:C:/sash/guest/src/"
-scp $SSHOPTS -q ~/sash/guest/CMakeLists.txt   "$DEST:C:/sash/guest/"
-echo "synced $(ls ~/sash/guest/src | wc -l) guest files + $(ls ~/sash/include | wc -l) headers"
+scp $SSHOPTS -q ~/vypr/include/*.h            "$DEST:C:/vypr/include/"
+scp $SSHOPTS -q ~/vypr/guest/src/*.cpp        "$DEST:C:/vypr/guest/src/"
+scp $SSHOPTS -q ~/vypr/guest/src/*.hpp        "$DEST:C:/vypr/guest/src/"
+scp $SSHOPTS -q ~/vypr/guest/CMakeLists.txt   "$DEST:C:/vypr/guest/"
+echo "synced $(ls ~/vypr/guest/src | wc -l) guest files + $(ls ~/vypr/include | wc -l) headers"

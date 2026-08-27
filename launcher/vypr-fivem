@@ -9,9 +9,9 @@ set -uo pipefail
 
 VM=RDPWindows
 GUEST=192.168.122.58
-KEY="$HOME/.ssh/sash-guest"
-SASH="$HOME/sash/host/build"
-SHM=/dev/shm/sash
+KEY="$HOME/.ssh/vypr-guest"
+SASH="$HOME/vypr/host/build"
+SHM=/dev/shm/vypr
 # Every window the game puts up, not only the main one: the launcher and its
 # splash appear first and are worth seeing. This was narrowed to the game window
 # alone while the launcher and game were stealing focus from each other; that
@@ -20,11 +20,11 @@ MATCHES=(FiveM Cfx Rockstar "Social Club")
 export LIBVIRT_DEFAULT_URI=qemu:///system
 
 say() {
-    echo "sash-fivem: $*"
-    notify-send --app-name=FiveM --icon=sash-fivem "FiveM" "$*" 2>/dev/null || true
+    echo "vypr-fivem: $*"
+    notify-send --app-name=FiveM --icon=vypr-fivem "FiveM" "$*" 2>/dev/null || true
 }
 die() {
-    echo "sash-fivem: $*" >&2
+    echo "vypr-fivem: $*" >&2
     notify-send --app-name=FiveM --icon=dialog-error -u critical "FiveM" "$*" 2>/dev/null || true
     exit 1
 }
@@ -72,22 +72,22 @@ fi
 #
 # Clicking the icon is the way back: if the game is running but nothing is
 # presenting it, restart the daemon, which forgets what was dismissed.
-if pgrep -x sashd >/dev/null && ! pgrep -x sash-host >/dev/null; then
+if pgrep -x vyprd >/dev/null && ! pgrep -x vypr-window >/dev/null; then
     running=$(guest 'tasklist' 2>/dev/null || true)
     if grep -qi 'GTAProcess' <<<"$running"; then
         say "Reattaching to the running game..."
-        pkill -x sashd
+        pkill -x vyprd
         sleep 2
     fi
 fi
 
-if ! pgrep -x sashd >/dev/null; then
-    say "Starting the sash session..."
-    [ -x "$SASH/sashd" ] || die "$SASH/sashd is missing - build it first"
+if ! pgrep -x vyprd >/dev/null; then
+    say "Starting the vypr session..."
+    [ -x "$SASH/vyprd" ] || die "$SASH/vyprd is missing - build it first"
     match_args=()
     for m in "${MATCHES[@]}"; do match_args+=(--match "$m"); done
-    nohup "$SASH/sashd" --shm "$SHM" "${match_args[@]}" \
-        >"${XDG_RUNTIME_DIR:-/tmp}/sashd.log" 2>&1 &
+    nohup "$SASH/vyprd" --shm "$SHM" "${match_args[@]}" \
+        >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
     sleep 2
 fi
 
@@ -96,10 +96,10 @@ fi
 # Never taskkill the agent: the IVSHMEM driver does not clean up after a
 # TerminateProcess and leaves an unkillable process holding the device, which
 # takes a guest reboot to clear. Ending the scheduled task lets it exit.
-agent_ps=$(guest 'tasklist /fi "imagename eq sash-agent.exe" /fo csv /nh' 2>/dev/null || true)
-if ! grep -q sash-agent <<<"$agent_ps"; then
+agent_ps=$(guest 'tasklist /fi "imagename eq vypr-agent.exe" /fo csv /nh' 2>/dev/null || true)
+if ! grep -q vypr-agent <<<"$agent_ps"; then
     say "Starting the guest agent..."
-    guest 'schtasks /end /tn sash-agent >nul 2>&1 & schtasks /run /tn sash-agent' >/dev/null 2>&1
+    guest 'schtasks /end /tn vypr-agent >nul 2>&1 & schtasks /run /tn vypr-agent' >/dev/null 2>&1
     sleep 6
 fi
 
@@ -107,20 +107,20 @@ fi
 #
 # Not for streaming - for its driver.
 #
-# sash injects mouse motion with SendInput, which always goes through the Win32
+# vypr injects mouse motion with SendInput, which always goes through the Win32
 # cursor pipeline. A game reading raw input for its camera - FiveM and GTA V
 # both do - wants the lLastX/lLastY deltas a physical mouse produces, and gets
 # MOUSE_MOVE_ABSOLUTE packets or zeroes instead, reads the cursor as (0,0), and
 # whips the camera into a corner every frame. No userspace API can produce a
-# real HID delta, so this is not fixable in sash as it stands.
+# real HID delta, so this is not fixable in vypr as it stands.
 #
 # Parsec's parsecvusba driver injects at the kernel HID level. With Parsec
-# running, the deltas are genuine and the camera behaves. Until sash grows its
+# running, the deltas are genuine and the camera behaves. Until vypr grows its
 # own virtual HID device, keeping Parsec in the tray is the fix.
 parsec_ps=$(guest 'tasklist /fi "imagename eq parsecd.exe" /fo csv /nh' 2>/dev/null || true)
 if ! grep -q parsecd <<<"$parsec_ps"; then
     say "Starting Parsec (its driver is what makes the mouse work)..."
-    guest 'schtasks /end /tn sash-parsec >nul 2>&1 & schtasks /run /tn sash-parsec' >/dev/null 2>&1
+    guest 'schtasks /end /tn vypr-parsec >nul 2>&1 & schtasks /run /tn vypr-parsec' >/dev/null 2>&1
     sleep 5
 fi
 
@@ -130,13 +130,13 @@ if grep -qi 'FiveM_b.*GTAProcess' <<<"$game_ps"; then
     say "FiveM is already running."
 else
     say "Launching FiveM..."
-    guest 'schtasks /end /tn sash-fivem >nul 2>&1 & schtasks /run /tn sash-fivem' >/dev/null 2>&1
+    guest 'schtasks /end /tn vypr-fivem >nul 2>&1 & schtasks /run /tn vypr-fivem' >/dev/null 2>&1
 fi
 
 # --- wait for the window ---------------------------------------------------
 for _ in $(seq 1 60); do
-    pgrep -x sash-host >/dev/null && { say "FiveM is on screen."; exit 0; }
+    pgrep -x vypr-window >/dev/null && { say "FiveM is on screen."; exit 0; }
     sleep 5
 done
 
-die "the game did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/sashd.log"
+die "the game did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
