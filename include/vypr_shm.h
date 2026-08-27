@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define VYPR_SHM_MAGIC      0x48534153u  /* 'SASH' little-endian */
+#define VYPR_SHM_MAGIC      0x52505956u  /* 'VYPR' little-endian */
 #define VYPR_SHM_VERSION    1u
 
 /* Slots are windows. Sixteen is far past what a person keeps open from one VM,
