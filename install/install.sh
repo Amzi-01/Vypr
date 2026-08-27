@@ -247,7 +247,7 @@ USE_PARSEC=1
 EOF
 ok "wrote $CONF_DIR/config"
 
-install -Dm644 "$here/launcher/vypr-fivem.png" \
+install -Dm644 "$here/launcher/vypr.png" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/vypr.png" 2>/dev/null \
     && ok "installed the icon" || true
 

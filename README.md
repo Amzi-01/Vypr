@@ -6,6 +6,51 @@ An app running in the guest appears as an ordinary window on the Linux desktop �
 its own entry in the taskbar, its own place in the stacking order — with no RDP
 and no video codec in the path.
 
+## Installing
+
+Two installers, one per side.
+
+**What you need before either of them.** These are the parts no installer can
+arrange, and both installers check for them rather than failing halfway:
+
+- a second GPU bound to `vfio-pci`, and IOMMU enabled in firmware and kernel
+- a Windows VM under libvirt that already exists and has that GPU passed through
+- SDL3, CMake, Ninja and a C++ compiler on the Linux side
+
+**On Linux**, from a clone of this repository:
+
+```bash
+./install/install.sh
+```
+
+It builds and installs `vyprd`, `vypr-window` and the `vypr` command, adds the
+shared-memory device to your VM, removes the USB tablet, requires `topoext`,
+generates a keypair for the guest and writes `~/.config/vypr/config`. It prints
+the two commands that need root instead of asking for a password, and prints the
+public key the guest half wants. It changes the VM only when something is
+actually missing, and saves the original XML before it does.
+
+**In Windows**, run `vypr-setup.exe` from the release page. One executable: it
+carries the agent inside it, installs the IVSHMEM driver that frames travel
+through and the Parsec driver that makes the mouse work in games, authorises the
+key the Linux installer printed, and sets the agent to start when you log in.
+Windows will ask you to accept the drivers, which only a person can click.
+
+**Then add an application:**
+
+```bash
+vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM --process GTAProcess
+```
+
+That creates the scheduled task in the guest and a desktop entry here, so the
+game is in your application menu like anything else. `vypr run fivem` starts it,
+`vypr apps` lists what is registered, `vypr status` says what is up.
+
+Applications are registered **without** elevation. Several games refuse to run as
+administrator outright — FiveM says so and exits — and there is no need: the
+agent is elevated so it can see and drive elevated windows, and input travels
+downwards from there. `--elevated` is there for the rare app that demands it.
+
 ## Why not the obvious approaches
 
 **RDP RemoteApp** (what WinApps uses) hands over each window as a separate
@@ -146,15 +191,15 @@ nothing; the readback is the thing to attack.
 
 ## Launching
 
-`launcher/vypr-fivem` brings up whatever is not already running - the VM, the
-session daemon, the guest agent - and then starts the game, skipping any step
-that is already done. `launcher/vypr-fivem.desktop` puts it on the desktop with
-the game's own icon, extracted at 256x256 from the guest's executable.
+`vypr run <app>` brings up whatever is not already running - the VM, the session
+daemon, the guest agent, Parsec for its driver - and then starts the app,
+skipping any step that is already done. Each registered app gets a desktop entry,
+so it is in the application menu like anything else.
 
-It matches every window the game puts up - the FiveM splash, the Rockstar
-launcher, the sign-in dialog - not only the main game window, so the whole
-startup sequence is visible rather than a blank wait followed by a game. Each
-appears and closes in turn as its own host window.
+An app can match every window it puts up - for FiveM that is the splash, the
+Rockstar launcher and the sign-in dialog, not only the main game window - so the
+whole startup sequence is visible rather than a blank wait followed by a game.
+Each appears and closes in turn as its own host window.
 
 It waits for the guest to *answer*, not merely for the domain to report
 'running': a booting Windows cannot do anything useful yet. It also refuses
@@ -417,7 +462,9 @@ past 2560x1440 mapped out of range.
 | `host/src/vyprd.c` — session daemon | working, verified end to end |
 | `host/src/msg.c` — framing, shared by both host processes | done |
 | Input path — pointer, keys, focus, resize, close | working, verified |
-| Launcher / `.desktop` integration | not started |
+| Launcher / `.desktop` integration | done — `vypr add` registers any app |
+| Linux installer | done — `install/install.sh` |
+| Windows installer | done — one `vypr-setup.exe` |
 
 ## Building
 
