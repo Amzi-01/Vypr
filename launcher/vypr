@@ -180,17 +180,20 @@ usage: vypr add <name> '<windows path to the .exe or shortcut>'
   Optional, and worth setting for games:
     --match <text>     window titles to stream (repeatable; defaults to <name>)
     --process <exe>    how to tell it is already running, e.g. GTAProcess
+    --name <text>      the name to show in your application menu
+    --elevated         run it as administrator (most games refuse this)
 EOF
         return 1
     fi
     shift 2
 
-    local matches=() process="" label="" m
+    local matches=() process="" label="" elevated=0 m
     while [ $# -gt 0 ]; do
         case "$1" in
             --match)   matches+=("$2"); shift 2 ;;
             --process) process="$2"; shift 2 ;;
             --name)    label="$2"; shift 2 ;;
+            --elevated) elevated=1; shift ;;
             *) die "unknown option '$1'" ;;
         esac
     done
@@ -199,8 +202,12 @@ EOF
 
     start_vm
 
-    # The task must be interactive and elevated: a non-interactive task has no
-    # desktop to draw on, and games that check for administrator refuse to run.
+    # The task must be interactive - a non-interactive task has no desktop to
+    # draw on - but it must NOT be elevated by default. Several games refuse to
+    # start as administrator outright: FiveM says so and exits. The agent runs
+    # elevated so it can see and drive elevated windows, and injecting input
+    # downwards from there works, so the app itself has no reason to be.
+    # Pass --elevated for the rare application that demands it.
     #
     # It is run through 'cmd /c start' rather than directly because Task
     # Scheduler launches with CreateProcess, which cannot open a .lnk - and
@@ -208,7 +215,9 @@ EOF
     # through the shell, which resolves them.
     local task="vypr-$app"
     say "Registering '$label' in the guest..."
-    guest "schtasks /delete /tn $task /f >nul 2>&1 & schtasks /create /tn $task /tr \"cmd /c start \\\"\\\" \\\"$path\\\"\" /sc once /st 00:00 /it /rl highest /f" \
+    local level="limited"
+    [ "$elevated" = "1" ] && level="highest"
+    guest "schtasks /delete /tn $task /f >nul 2>&1 & schtasks /create /tn $task /tr \"cmd /c start \\\"\\\" \\\"$path\\\"\" /sc once /st 00:00 /it /rl $level /f" \
         >/dev/null 2>&1 || die "could not create the scheduled task in the guest"
 
     mkdir -p "$APPS"

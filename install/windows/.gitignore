@@ -1,0 +1,5 @@
+# Build products - the agent is copied in, the installer is built from it.
+vypr-agent.exe
+vypr-setup.exe
+vypr-setup.res
+*.obj
