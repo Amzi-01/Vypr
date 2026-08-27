@@ -243,6 +243,10 @@ VM=$DOMAIN
 GUEST=$guest_ip
 GUEST_USER=$guest_user
 
+# Must match the <shmem> size in the domain. The launcher grows the region to
+# this before starting anything, because the tmpfiles rule recreates it empty.
+SHM_SIZE_MB=$SHM_SIZE_MB
+
 # Parsec is started alongside the session because its driver is what makes the
 # mouse work in games that read raw input. Set to 0 if you do not play those.
 USE_PARSEC=1

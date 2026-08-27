@@ -18,6 +18,7 @@ BIN="$(dirname "$(readlink -f "$0")")"
 SHM=/dev/shm/vypr
 KEY="$HOME/.ssh/vypr-guest"
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
+SHM_SIZE_MB_DEFAULT=512
 
 [ -f "$CONF" ] || { echo "vypr: not configured - run the installer first" >&2; exit 1; }
 # shellcheck source=/dev/null
@@ -94,6 +95,26 @@ PS1
     guest "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\vypr-icon.ps1 -Target \"$target\" -Out C:\\Windows\\Temp\\vypr-icon.png" >/dev/null 2>&1 || return 1
     guest_get 'C:/Windows/Temp/vypr-icon.png' "$out" || return 1
     [ -s "$out" ]
+}
+
+# ---------------------------------------------------------- the shared region
+#
+# The tmpfiles rule recreates /dev/shm/vypr at every boot with the right owner,
+# but tmpfiles has no way to give a file a size, so it comes back empty. vyprd
+# reads the size from the file and refuses one that is too small, and QEMU only
+# sizes it if the VM happens to start first. Rather than depend on that order,
+# give it its size here - the owner can, and it costs nothing when already right.
+ensure_region() {
+    local want=$(( ${SHM_SIZE_MB:-$SHM_SIZE_MB_DEFAULT} * 1024 * 1024 ))
+    if [ ! -e "$SHM" ]; then
+        die "$SHM does not exist - the tmpfiles rule the installer printed was never applied"
+    fi
+    local have
+    have=$(stat -c%s "$SHM" 2>/dev/null || echo 0)
+    if [ "$have" -lt "$want" ]; then
+        truncate -s "$want" "$SHM" 2>/dev/null || \
+            die "$SHM is $have bytes and could not be grown to $want"
+    fi
 }
 
 # --------------------------------------------------------------- the VM
@@ -202,6 +223,7 @@ cmd_run() {
     : "${MATCHES:?$profile does not set MATCHES}"
     : "${TASK:?$profile does not set TASK}"
 
+    ensure_region
     start_vm
     start_daemon MATCHES
     start_agent
@@ -326,10 +348,14 @@ cmd_status() {
     printf '  VM %-14s %s\n' "$VM" "$(virsh domstate "$VM" 2>/dev/null || echo missing)"
     printf '  vyprd          %s\n' "$(pgrep -x vyprd >/dev/null && echo running || echo stopped)"
     printf '  windows open   %s\n' "$(pgrep -xc vypr-window 2>/dev/null || echo 0)"
-    printf '  region         %s\n' "$([ -e "$SHM" ] && echo "$SHM" || echo missing)"
+    if [ -e "$SHM" ]; then
+        printf '  region         %s (%s MiB)\n' "$SHM" "$(( $(stat -c%s "$SHM") / 1024 / 1024 ))"
+    else
+        printf '  region         missing\n'
+    fi
 }
 
-cmd_up()   { start_vm; start_agent; start_parsec; say "Session is up."; }
+cmd_up()   { ensure_region; start_vm; start_agent; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
     pkill -x vyprd 2>/dev/null
