@@ -77,22 +77,61 @@ public class Ico {
   [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
 }
 "@
-# A shortcut carries no image of its own; follow it to the executable first.
+<#
+  Find the image Windows itself shows for this thing.
+
+  A shortcut may name its own icon, and that is what the desktop draws - the
+  target executable's icon can be something else entirely, or absent. Steam
+  writes .url files rather than shortcuts, and keeps the artwork it downloaded
+  in a separate .ico that only the .url points at, which is why a Steam game
+  registered by URL had no icon at all to find.
+
+  So: whatever the file says its icon is, then the thing it launches, then give
+  up and let the caller fall back.
+#>
+$index = 0
+$sources = @()
+
 if ($Target.ToLower().EndsWith(".lnk")) {
     $sh = New-Object -ComObject WScript.Shell
-    $Target = $sh.CreateShortcut($Target).TargetPath
+    $lnk = $sh.CreateShortcut($Target)
+    if ($lnk.IconLocation) {
+        # Stored as "path,index"; an empty path means "use the target".
+        $parts = $lnk.IconLocation -split ',(?=[^,]*$)'
+        if ($parts[0].Trim()) {
+            $sources += $parts[0].Trim('"').Trim()
+            if ($parts.Count -gt 1) { [int]::TryParse($parts[1], [ref]$index) | Out-Null }
+        }
+    }
+    if ($lnk.TargetPath) { $sources += $lnk.TargetPath }
 }
-if (-not (Test-Path $Target)) { exit 1 }
+elseif ($Target.ToLower().EndsWith(".url")) {
+    $icon = (Select-String -LiteralPath $Target -Pattern '^IconFile=(.+)$' |
+             Select-Object -First 1)
+    if ($icon) { $sources += $icon.Matches.Groups[1].Value.Trim() }
+    $idx = (Select-String -LiteralPath $Target -Pattern '^IconIndex=(.+)$' |
+            Select-Object -First 1)
+    if ($idx) { [int]::TryParse($idx.Matches.Groups[1].Value.Trim(), [ref]$index) | Out-Null }
+}
+else {
+    $sources += $Target
+}
+
+$sources = $sources | Where-Object { $_ -and (Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue) }
+if (-not $sources) { exit 1 }
+
+foreach ($src in $sources) {
 foreach ($size in 256,128,64,48,32) {
     $h = New-Object IntPtr[] 1
     $id = New-Object int[] 1
-    $n = [Ico]::PrivateExtractIcons($Target, 0, $size, $size, $h, $id, 1, 0)
+    $n = [Ico]::PrivateExtractIcons($src, $index, $size, $size, $h, $id, 1, 0)
     if ($n -gt 0 -and $h[0] -ne [IntPtr]::Zero) {
         $bmp = [System.Drawing.Icon]::FromHandle($h[0]).ToBitmap()
         $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
         [Ico]::DestroyIcon($h[0]) | Out-Null
         exit 0
     }
+}
 }
 exit 1
 PS1
@@ -397,13 +436,15 @@ usage: vypr add <name> '<windows path to the .exe or shortcut>'
     --name <text>      the name to show in your application menu
     --elevated         run it as administrator (most games refuse this)
     --icon <file.png>  use this icon instead of the one in the .exe
+    --icon-from <path> a Windows file to take the icon from, when the
+                       thing being launched is not one (a steam:// URL)
     --no-desktop-icon  only add it to the application menu, not the desktop
 EOF
         return 1
     fi
     shift 2
 
-    local matches=() process="" label="" elevated=0 iconfile="" desktop_icon=1 m
+    local matches=() process="" label="" elevated=0 iconfile="" iconfrom="" desktop_icon=1 m
     while [ $# -gt 0 ]; do
         case "$1" in
             --match)   matches+=("$2"); shift 2 ;;
@@ -411,6 +452,7 @@ EOF
             --name)    label="$2"; shift 2 ;;
             --elevated) elevated=1; shift ;;
             --icon)    iconfile="$2"; shift 2 ;;
+            --icon-from) iconfrom="$2"; shift 2 ;;
             --no-desktop-icon) desktop_icon=0; shift ;;
             *) die "unknown option '$1'" ;;
         esac
@@ -456,7 +498,7 @@ EOF
     local staged="${TMPDIR:-/tmp}/vypr-icon-$app.png"
     if [ -n "$iconfile" ] && [ -f "$iconfile" ]; then
         install -Dm644 "$iconfile" "$icon_dir/vypr-$app.png" && icon_name="vypr-$app"
-    elif icon_from_guest "$path" "$staged"; then
+    elif icon_from_guest "${iconfrom:-$path}" "$staged"; then
         install -Dm644 "$staged" "$icon_dir/vypr-$app.png" && icon_name="vypr-$app"
         rm -f "$staged"
     fi
@@ -577,7 +619,7 @@ foreach ($d in $dirs) {
     try { $target = $sh.CreateShortcut($_.FullName).TargetPath } catch { }
     # Shortcuts to folders, documents and uninstallers are not applications.
     if ($target -and $target.ToLower().EndsWith(".exe") -and $_.BaseName -notmatch $skip) {
-      "{0}`t{1}" -f $_.BaseName, $_.FullName
+      "{0}`t{1}`t{2}" -f $_.BaseName, $_.FullName, $_.FullName
     }
   }
 
@@ -587,7 +629,9 @@ foreach ($d in $dirs) {
     $url = (Select-String -LiteralPath $_.FullName -Pattern '^URL=(.+)$' |
             Select-Object -First 1).Matches.Groups[1].Value
     if ($url -and $url -match '^steam://' -and $_.BaseName -notmatch $skip) {
-      "{0}`t{1}" -f $_.BaseName, $url.Trim()
+      # Third field is where the icon lives: the .url itself names it, while
+      # the steam:// URL that launches the game is not a file at all.
+      "{0}`t{1}`t{2}" -f $_.BaseName, $url.Trim(), $_.FullName
     }
   }
 }
@@ -635,14 +679,23 @@ PS1
         [ "$n" -ge 1 ] && [ "$n" -le "${#found[@]}" ] || { echo "  no item $n"; continue; }
         line="${found[$((n - 1))]}"
         name="${line%%$'\t'*}"
-        path="${line#*$'\t'}"
+        local rest="${line#*$'\t'}"
+        path="${rest%%$'\t'*}"
+        local iconsrc="${rest#*$'\t'}"
         # A short, filesystem-safe handle for the command line.
-        local slug
-        slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
+        # Whole words only: cutting mid-word gave 'callofdutymodernwarfarei',
+        # which nobody is going to type.
+        local slug="" word
+        for word in $(printf '%s' "$name" | tr -c '[:alnum:]' ' '); do
+            word=$(printf '%s' "$word" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+            [ -n "$word" ] || continue
+            [ ${#slug} -ge 16 ] && break
+            slug="$slug$word"
+        done
         [ -n "$slug" ] || slug="app$n"
         echo
         echo "  Adding '$name' as '$slug'..."
-        cmd_add "$slug" "$path" --name "$name"
+        cmd_add "$slug" "$path" --name "$name" --icon-from "$iconsrc"
     done
 }
 
