@@ -174,6 +174,75 @@ else
     info "the domain already has everything it needs"
 fi
 
+# ------------------------------------------------------------- home folder
+head2 "Sharing your home folder"
+
+# Asked here rather than assumed, because this is the one setting that decides
+# what the VM can read. Windows gets whatever the share points at, and a guest
+# that is compromised has it too - which is a different proposition from
+# lending it a GPU.
+if [ "$(virsh dumpxml --inactive "$DOMAIN" 2>/dev/null | grep -c "target dir='vyprhome'")" != "0" ]; then
+    ok "already shared"
+else
+    echo "  Windows can be given a folder from this machine, appearing as a drive."
+    echo "  Anything it can reach, the VM can read and write."
+    echo
+    read -rp "  Share a folder? [y/N]: " share_reply
+    if [ "${share_reply:-n}" = "y" ] || [ "${share_reply:-n}" = "Y" ]; then
+        read -rp "  Which folder [$HOME]: " share_dir
+        share_dir="${share_dir:-$HOME}"
+        if [ ! -d "$share_dir" ]; then
+            bad "$share_dir is not a directory; skipping"
+        elif ! command -v virtiofsd >/dev/null 2>&1 && [ ! -x /usr/lib/virtiofsd ]; then
+            bad "virtiofsd is not installed, so the share cannot be served"
+            MANUAL+=("install virtiofsd, then re-run this to add the share")
+        else
+            tmp2=$(mktemp -d)
+            virsh dumpxml --inactive "$DOMAIN" > "$tmp2/domain.xml"
+            if python3 - "$tmp2/domain.xml" "$share_dir" <<'PY'
+import sys, xml.etree.ElementTree as ET
+for prefix, uri in (("qemu", "http://libvirt.org/schemas/domain/qemu/1.0"),
+                    ("lxc",  "http://libvirt.org/schemas/domain/lxc/1.0")):
+    ET.register_namespace(prefix, uri)
+
+path, share = sys.argv[1], sys.argv[2]
+tree = ET.parse(path); root = tree.getroot()
+
+# virtiofs reads guest memory directly, so the VM's memory has to be shareable.
+# Without this the domain will not start with a virtiofs device attached.
+mb = root.find("memoryBacking")
+if mb is None:
+    mb = ET.SubElement(root, "memoryBacking")
+if mb.find("access") is None:
+    if mb.find("source") is None:
+        ET.SubElement(mb, "source").set("type", "memfd")
+    ET.SubElement(mb, "access").set("mode", "shared")
+
+dev = root.find("devices")
+fs = ET.SubElement(dev, "filesystem")
+fs.set("type", "mount"); fs.set("accessmode", "passthrough")
+ET.SubElement(fs, "driver").set("type", "virtiofs")
+ET.SubElement(fs, "source").set("dir", share)
+ET.SubElement(fs, "target").set("dir", "vyprhome")
+
+ET.indent(tree, space="  "); tree.write(path, encoding="unicode")
+PY
+            then
+                if virsh define "$tmp2/domain.xml" >/dev/null 2>&1; then
+                    ok "sharing $share_dir with the VM"
+                    info "it appears in Windows once the guest installer's"
+                    info "'home folder' box has been ticked, and after a VM restart"
+                else
+                    bad "could not add the share; the domain is unchanged"
+                fi
+            fi
+            rm -rf "$tmp2"
+        fi
+    else
+        info "not shared - re-run this installer to change that"
+    fi
+fi
+
 # ---------------------------------------------------------------- shared region
 head2 "Shared memory"
 

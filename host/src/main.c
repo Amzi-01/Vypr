@@ -681,6 +681,8 @@ int main(int argc, char **argv)
     }
     uint8_t *parked = NULL;
     size_t   parked_cap = 0;
+    /* The last clipboard text we set or sent, to tell an echo from a change. */
+    char    *clip_last = NULL;
 
     /* Relative pointer mode, driven by the guest telling us an app has taken
      * the pointer. `suspended` is the user's override: a captured pointer must
@@ -935,6 +937,21 @@ int main(int argc, char **argv)
                 break;
             }
 
+            case SDL_EVENT_CLIPBOARD_UPDATE: {
+                if (daemon_fd < 0) break;
+                char *text = SDL_GetClipboardText();
+                if (!text) break;
+                const size_t len = strlen(text);
+                if (len && len <= VYPR_MAX_MSG_BYTES &&
+                    (!clip_last || strcmp(clip_last, text) != 0)) {
+                    free(clip_last);
+                    clip_last = strdup(text);
+                    msg_send(daemon_fd, VYPR_MSG_CLIPBOARD, text, (uint32_t)len);
+                }
+                SDL_free(text);
+                break;
+            }
+
             case SDL_EVENT_WINDOW_RESIZED: {
                 if (daemon_fd < 0) break;
                 /* Adopting the frame size raises this event too. Asking the
@@ -1010,6 +1027,17 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct vypr_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == VYPR_MSG_CLIENT_CLIPBOARD) {
+                        /* Remembered before setting it, so the update this
+                         * causes is recognised as our own and not sent back. */
+                        char *text = malloc(head.bytes + 1);
+                        if (text) {
+                            memcpy(text, payload, head.bytes);
+                            text[head.bytes] = '\0';
+                            free(clip_last);
+                            clip_last = text;
+                            SDL_SetClipboardText(text);
+                        }
                     } else if (head.type == VYPR_MSG_CLIENT_STATE &&
                                head.bytes >= sizeof(struct vypr_msg_window_state)) {
                         const struct vypr_msg_window_state *m = (const void *)payload;
@@ -1163,6 +1191,7 @@ int main(int argc, char **argv)
     pthread_mutex_destroy(&link.lock);
     free(link.pending.p);
     free(parked);
+    free(clip_last);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
     vypr_shm_close(&shm);

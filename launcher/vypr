@@ -5,6 +5,7 @@
 #   vypr run <app>      bring everything up and start the app
 #   vypr add <app>      register a Windows application as a launchable app
 #   vypr remove <app>   undo that - task, profile, menu entry and icons
+#   vypr detect         find apps on the guest desktop and offer to add them
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -41,7 +42,10 @@ die() {
     exit 1
 }
 guest() {
-    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+    # -n so ssh does not read our stdin. Without it, any prompt after a remote
+    # command finds its input already eaten - 'vypr detect' listed everything
+    # and then took the empty answer as "add none".
+    ssh -n -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
         -o ConnectTimeout=8 "$GUEST_USER@$GUEST" "$@"
 }
 guest_put() {
@@ -546,6 +550,102 @@ cmd_remove() {
     [ "$removed" = "1" ] && say "'$label' removed." || echo "vypr: nothing to remove"
 }
 
+# Find what is on the guest's desktop and offer to register it.
+#
+# Reads both desktops - the user's and the shared All Users one - because
+# installers scatter shortcuts across either, and resolves each shortcut to the
+# executable it points at so a name and an icon can be had from it.
+cmd_detect() {
+    start_vm
+
+    local script; script=$(mktemp)
+    cat > "$script" <<'PS1'
+# Names carry (R) and similar; without this they arrive mangled through the
+# console codepage and end up in the menu entry that way.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$sh = New-Object -ComObject WScript.Shell
+$dirs = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory')
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+$skip = '(?i)uninstall|readme|website|support'
+
+foreach ($d in $dirs) {
+  Get-ChildItem -LiteralPath $d -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+    $target = ""
+    try { $target = $sh.CreateShortcut($_.FullName).TargetPath } catch { }
+    # Shortcuts to folders, documents and uninstallers are not applications.
+    if ($target -and $target.ToLower().EndsWith(".exe") -and $_.BaseName -notmatch $skip) {
+      "{0}`t{1}" -f $_.BaseName, $_.FullName
+    }
+  }
+
+  # Steam writes .url files, not shortcuts, so a Steam library is invisible to
+  # the pass above - and those are exactly the things worth streaming.
+  Get-ChildItem -LiteralPath $d -Filter *.url -ErrorAction SilentlyContinue | ForEach-Object {
+    $url = (Select-String -LiteralPath $_.FullName -Pattern '^URL=(.+)$' |
+            Select-Object -First 1).Matches.Groups[1].Value
+    if ($url -and $url -match '^steam://' -and $_.BaseName -notmatch $skip) {
+      "{0}`t{1}" -f $_.BaseName, $url.Trim()
+    }
+  }
+}
+PS1
+    guest_put "$script" 'C:/Windows/Temp/vypr-detect.ps1' || { rm -f "$script"; die "could not reach the guest"; }
+    rm -f "$script"
+
+    local found=()
+    mapfile -t found < <(guest 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\vypr-detect.ps1' 2>/dev/null | tr -d '\r')
+
+    [ "${#found[@]}" -gt 0 ] || { say "Nothing on the guest desktop looks like an application."; return 0; }
+
+    echo
+    echo "  Found on the Windows desktop:"
+    echo
+    local i=1 name path line
+    for line in "${found[@]}"; do
+        name="${line%%$'\t'*}"
+        # Already registered? Say so rather than offering it again.
+        local known=""
+        for f in "$APPS"/*.conf; do
+            [ -e "$f" ] || continue
+            # Case-insensitively: the same game registered by hand and by
+            # detection differ only in how the shortcut happened to be spelt.
+            grep -qi "^NAME=\"$name\"$" "$f" 2>/dev/null && known="  (already added)"
+        done
+        printf '    %2d) %s%s\n' "$i" "$name" "$known"
+        i=$((i + 1))
+    done
+    echo
+    echo "  Which would you like to add? Numbers separated by spaces, 'all', or"
+    read -rp "  blank to add none: " picks
+    [ -n "$picks" ] || { echo "  Nothing added."; return 0; }
+
+    local chosen=()
+    if [ "$picks" = "all" ]; then
+        chosen=($(seq 1 "${#found[@]}"))
+    else
+        chosen=($picks)
+    fi
+
+    local n
+    for n in "${chosen[@]}"; do
+        case "$n" in (*[!0-9]*|"") echo "  skipping '$n'"; continue ;; esac
+        [ "$n" -ge 1 ] && [ "$n" -le "${#found[@]}" ] || { echo "  no item $n"; continue; }
+        line="${found[$((n - 1))]}"
+        name="${line%%$'\t'*}"
+        path="${line#*$'\t'}"
+        # A short, filesystem-safe handle for the command line.
+        local slug
+        slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
+        [ -n "$slug" ] || slug="app$n"
+        echo
+        echo "  Adding '$name' as '$slug'..."
+        cmd_add "$slug" "$path" --name "$name"
+    done
+}
+
 cmd_apps() {
     [ -d "$APPS" ] && ls -1 "$APPS"/*.conf 2>/dev/null | while read -r f; do
         printf '  %-16s %s\n' "$(basename "$f" .conf)" "$(sed -n 's/^NAME="\(.*\)"/\1/p' "$f")"
@@ -653,6 +753,7 @@ case "${1:-}" in
     add)    shift; cmd_add "$@" ;;
     remove) shift; cmd_remove "$@" ;;
     apps)   cmd_apps ;;
+    detect) cmd_detect ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;
     __watch) watch_and_shutdown ;;   # internal: the shutdown supervisor

@@ -66,40 +66,26 @@ anything else in the VM too.
 [WinApps](https://github.com/winapps-org/winapps) and
 [WinBoat](https://winboat.app/) solve the same shape of problem — Windows
 applications as native Linux windows — and both do it over RDP RemoteApp. That
-choice is what this table is really about.
+choice is what this table is about.
 
 | | WinApps | WinBoat | Vypr |
 |---|:---:|:---:|:---:|
-| Windows apps as native Linux windows | ✅ | ✅ | ✅ |
 | How the picture travels | RDP codec | RDP codec | **shared memory, uncompressed** |
 | GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
 | Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
 | Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
-| Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
-| Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
-| Clipboard sharing | ✅ | ✅ | ❌ |
-| Your home folder inside Windows | ✅ | ✅ | ❌ |
-| Finds your installed apps for you | ✅ | ✅ | ❌ *(`vypr add`)* |
-| Graphical manager | ❌ | ✅ | ❌ *(command line)* |
-| Runs on an ordinary single-GPU machine | ✅ | ✅ | ❌ |
-| Setup effort | guided | guided | two installers, plus passthrough |
+| Audio tied to the app's own output device | ❌ | ❌ | ✅ |
+| Frame latency | codec encode + decode | codec encode + decode | **no codec in the path** |
 
-**Where Vypr wins, it wins on the thing it was built for.** RDP's video path was
-designed for documents: it is fine for a text editor and falls apart on anything
-that moves, and neither project has GPU passthrough, so a demanding game is out
-of reach for both. Vypr puts a real GPU in the VM and moves frames through shared
-memory with no encoder in the path at all — which is why a 4K game runs at 60 fps
-through it.
+RDP's video path was designed for documents: it is fine for a text editor and
+falls apart on anything that moves. Neither project has GPU passthrough — WinBoat
+lists it as planned — so a demanding game is out of reach for both. Vypr puts a
+real GPU in the VM and moves frames through shared memory with no encoder
+anywhere in the path, which is why a 4K game runs at 60 fps through it.
 
-**Where it loses, it loses on convenience.** There is no clipboard sharing, your
-home folder is not mounted inside Windows, and applications are registered one at
-a time rather than discovered. Those are real gaps, not oversights waiting to be
-denied.
-
-So: if you want Office or Photoshop occasionally on an ordinary laptop, WinApps
-or WinBoat will cost you far less effort and do a better job. Vypr is for the
-case they cannot serve — when the thing you are running has to be fast, and you
-have a second GPU to give it.
+That trade has a cost, and it is the whole of [What you need](#what-you-need)
+and [What does not](#what-does-not) below: Vypr needs a second GPU, and WinApps
+and WinBoat will do far less demanding work with far less effort from you.
 
 *Compared against WinApps and WinBoat documentation as of August 2026.*
 
@@ -143,7 +129,15 @@ The installer says so on screen and links to its own source.
 
 ## Using it
 
-Register an application once:
+The quickest start is to let it look for you:
+
+```bash
+vypr detect
+```
+
+That reads the guest's desktop — shortcuts and Steam entries alike — lists what
+it found, marks anything already registered, and adds the ones you pick. Or
+register them one at a time:
 
 ```bash
 vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM
@@ -161,6 +155,7 @@ vypr add cod 'steam://rungameid/3595230' --name 'Call of Duty Modern Warfare II'
 |---|---|
 | `vypr run <app>` | start it, bringing up the VM and session if needed |
 | `vypr add <app> <path>` | register a Windows application |
+| `vypr detect` | find apps on the guest desktop and pick which to add |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
 | `vypr status` | what is currently running |
@@ -175,6 +170,9 @@ something during that minute cancels it.
 - Games, including ones that capture the mouse and read raw input
 - Audio, pinned to whatever the app is actually playing to
 - Menus, popups and dialogs, positioned against the window they belong to
+- Clipboard text, shared both ways
+- A folder from this machine, mounted in Windows as a drive
+- Finding what is on the guest's desktop and offering to add it
 - Minimise, maximise, close and dragging, all acting on the guest window
 - Fullscreen, mirrored from the guest
 
@@ -189,6 +187,8 @@ something during that minute cancels it.
   VM has a display for the compositor to draw on. See the technical notes for why
   both of those are true.
 - **Two apps at once** works, but a second app restarts the session briefly.
+- **Clipboard is text only.** Images and file lists need a format negotiation
+  the protocol does not have.
 
 ## Digging deeper
 

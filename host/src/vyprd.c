@@ -674,6 +674,18 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
+    case VYPR_MSG_CLIPBOARD: {
+        /* To every client, not one: the clipboard is the desktop's, not a
+         * window's, and whichever host window the user pastes into should
+         * already have it. */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window *w = &d->windows[i];
+            if (w->id && w->client_fd >= 0)
+                client_send(d, w->client_fd, VYPR_MSG_CLIENT_CLIPBOARD, payload, bytes);
+        }
+        break;
+    }
+
     case VYPR_MSG_LOG:
         fprintf(stderr, "vyprd: agent: %.*s\n", (int)bytes, payload);
         break;
@@ -695,6 +707,18 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         if (!w) return;
         w->client_fd = fd;
         *owner = w;
+        return;
+    }
+
+    if (type == VYPR_MSG_CLIPBOARD) {
+        /* Straight through to the agent, and to the other clients so their
+         * own idea of the clipboard does not go stale and bounce back. */
+        if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_CLIPBOARD, payload, bytes);
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window *w = &d->windows[i];
+            if (w->id && w->client_fd >= 0 && w->client_fd != fd)
+                client_send(d, w->client_fd, VYPR_MSG_CLIENT_CLIPBOARD, payload, bytes);
+        }
         return;
     }
 

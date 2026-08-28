@@ -34,6 +34,7 @@
 #define ID_CHK_PARSEC    1013
 #define ID_PASSWORD      1014
 #define ID_SOURCE_LINK   1015
+#define ID_CHK_HOMEDIR   1016
 #define WM_STEP_DONE     (WM_APP + 1)
 
 static const wchar_t *LG_HOST_URL =
@@ -42,11 +43,16 @@ static const wchar_t *PARSEC_APP_URL =
     L"https://builds.parsec.app/package/parsec-windows.exe";
 static const wchar_t *PARSEC_VUD_URL =
     L"https://builds.parsec.app/vud/parsec-vud-0.3.10.0.exe";
+static const wchar_t *WINFSP_URL =
+    L"https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi";
+static const wchar_t *VIRTIO_TOOLS_URL =
+    L"https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
+    L"stable-virtio/virtio-win-guest-tools.exe";
 static const wchar_t *SOURCE_URL =
     L"https://github.com/Amzi-01/Vypr/blob/master/install/windows/vypr-setup.cpp";
 
 static HWND g_main, g_log, g_key, g_install, g_progress;
-static HWND g_chk_drivers, g_chk_ssh, g_chk_autologin, g_chk_parsec;
+static HWND g_chk_drivers, g_chk_ssh, g_chk_autologin, g_chk_parsec, g_chk_homedir;
 static HWND g_password, g_pw_label, g_pw_note, g_link;
 static HFONT g_font, g_font_bold;
 static bool  g_failed = false;
@@ -419,6 +425,72 @@ static void install_parsec_app()
     step_ok(run(task, true) == 0, L"registered so Vypr can start it");
 }
 
+static void install_home_share()
+{
+    logf(L"Linux folder as a drive");
+
+    // Two pieces, and the order is not optional: virtio-fs is a filesystem
+    // driver, and Windows has no filesystem driver interface for it to plug
+    // into. WinFsp provides that, and the virtio-win tools only register their
+    // VirtioFsSvc if they find WinFsp already there.
+    if (powershell(L"if (Test-Path 'C:\\Program Files (x86)\\WinFsp\\bin') "
+                   L"{ exit 0 } else { exit 1 }\n", true) != 0) {
+        std::wstring msi = temp_dir() + L"winfsp.msi";
+        logf(L"  downloading WinFsp...");
+        if (URLDownloadToFileW(nullptr, WINFSP_URL, msi.c_str(), 0, nullptr) != S_OK) {
+            logf(L"  [!!] could not download WinFsp (winfsp.dev). Without it");
+            logf(L"       Windows has nothing for virtio-fs to attach to.");
+            g_failed = true;
+            return;
+        }
+        logf(L"  installing WinFsp...");
+        if (run_bounded(L"msiexec /i \"" + msi + L"\" /qn /norestart", 300000)
+            == (DWORD)-2) {
+            logf(L"  [!!] the WinFsp installer ran out of time");
+            g_failed = true;
+            return;
+        }
+    } else {
+        logf(L"  [ok] WinFsp already installed");
+    }
+
+    if (powershell(L"if (Get-Service VirtioFsSvc -ErrorAction SilentlyContinue) "
+                   L"{ exit 0 } else { exit 1 }\n", true) != 0) {
+        std::wstring exe = temp_dir() + L"virtio-win-guest-tools.exe";
+        logf(L"  downloading the virtio-fs driver...");
+        if (URLDownloadToFileW(nullptr, VIRTIO_TOOLS_URL, exe.c_str(), 0, nullptr) != S_OK) {
+            logf(L"  [!!] could not download the virtio-win guest tools.");
+            g_failed = true;
+            return;
+        }
+        logf(L"  installing (this one is slow)...");
+        if (run_bounded(L"\"" + exe + L"\" /quiet /norestart", 600000) == (DWORD)-2) {
+            logf(L"  [!!] the virtio-win installer ran out of time");
+            g_failed = true;
+            return;
+        }
+    } else {
+        logf(L"  [ok] virtio-fs driver already installed");
+    }
+
+    // Left running and automatic, so the drive is there after every boot
+    // rather than only when somebody starts the service by hand.
+    powershell(L"Set-Service VirtioFsSvc -StartupType Automatic "
+               L"-ErrorAction SilentlyContinue\n"
+               L"Start-Service VirtioFsSvc -ErrorAction SilentlyContinue\n", true);
+
+    if (powershell(L"if ((Get-Service VirtioFsSvc -ErrorAction SilentlyContinue)"
+                   L".Status -eq 'Running') { exit 0 } else { exit 1 }\n", true) == 0) {
+        step_ok(true, L"shared folder mounted as a drive");
+        logf(L"  [--] it appears as Z: once the VM restarts. If it does not, the");
+        logf(L"       Linux installer has not been told to share a folder yet.");
+    } else {
+        logf(L"  [!!] the virtio-fs service is not running. A reboot of Windows");
+        logf(L"       usually settles this.");
+        g_failed = true;
+    }
+}
+
 // --------------------------------------------------------------------- SSH
 
 static void setup_ssh(const std::wstring &pubkey)
@@ -532,6 +604,7 @@ static DWORD WINAPI worker(LPVOID)
     bool want_parsec    = SendMessageW(g_chk_parsec, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_ssh       = SendMessageW(g_chk_ssh, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_autologin = SendMessageW(g_chk_autologin, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool want_homedir   = SendMessageW(g_chk_homedir, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     int len = GetWindowTextLengthW(g_key);
     std::wstring pubkey(len + 1, L'\0');
@@ -555,6 +628,7 @@ static DWORD WINAPI worker(LPVOID)
     if (want_drivers)   install_ivshmem();
     if (want_parsec)    { install_parsec_app(); install_parsec_vud(); }
     if (want_ssh)       setup_ssh(pubkey);
+    if (want_homedir)   install_home_share();
     if (want_autologin) setup_autologin(password);
 
     PostMessageW(g_main, WM_STEP_DONE, 0, 0);
@@ -599,40 +673,43 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
                           BS_AUTOCHECKBOX, 24, 132, 480, 22, ID_CHK_PARSEC, h);
         g_chk_ssh = mk(L"BUTTON", L"OpenSSH server \x2014 lets the host start things in here",
                        BS_AUTOCHECKBOX, 24, 156, 480, 22, ID_CHK_SSH, h);
+        g_chk_homedir = mk(L"BUTTON",
+                           L"Mount the folder your Linux machine shares, as a drive",
+                           BS_AUTOCHECKBOX, 24, 180, 480, 22, ID_CHK_HOMEDIR, h);
         g_chk_autologin = mk(L"BUTTON",
                              L"Log in to Windows automatically \x2014 Vypr needs a desktop to capture",
-                             BS_AUTOCHECKBOX, 24, 180, 480, 22, ID_CHK_AUTOLOGIN, h);
+                             BS_AUTOCHECKBOX, 24, 204, 480, 22, ID_CHK_AUTOLOGIN, h);
 
         SendMessageW(g_chk_drivers, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_parsec, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_ssh, BM_SETCHECK, BST_CHECKED, 0);
 
         g_pw_label = mk(L"STATIC", L"Windows password for this account:",
-                        0, 44, 206, 480, 20, 0, h);
+                        0, 44, 230, 480, 20, 0, h);
         g_password = mk(L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL,
-                        44, 226, 300, 24, ID_PASSWORD, h);
+                        44, 250, 300, 24, ID_PASSWORD, h);
         g_pw_note = mk(L"STATIC",
             L"Used once, to write Windows' own automatic-login setting. It is "
             L"not sent anywhere and Vypr does not keep it. Windows stores it in "
             L"the registry \x2014 that is how automatic login works.",
-            0, 44, 256, 490, 72, 0, h);
+            0, 44, 280, 490, 72, 0, h);
         g_link = mk(L"STATIC", L"Read exactly what this does \x2014 the source of this installer",
-                    SS_NOTIFY, 44, 332, 490, 20, ID_SOURCE_LINK, h);
+                    SS_NOTIFY, 44, 356, 490, 20, ID_SOURCE_LINK, h);
 
         /* Off until asked for, so the field cannot be filled in by habit. */
         EnableWindow(g_password, FALSE);
         EnableWindow(g_pw_label, FALSE);
 
         mk(L"STATIC", L"Host public key (the Linux installer printed this):",
-           0, 24, 368, 480, 20, 0, h);
+           0, 24, 392, 480, 20, 0, h);
         g_key = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
-                   24, 390, 520, 24, ID_KEY, h);
+                   24, 414, 520, 24, ID_KEY, h);
 
         g_log = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOSEL,
-                   24, 428, 520, 186, ID_LOG, h);
+                   24, 452, 520, 186, ID_LOG, h);
 
         g_install = mk(L"BUTTON", L"Install", BS_DEFPUSHBUTTON,
-                       444, 626, 100, 30, ID_INSTALL, h);
+                       444, 650, 100, 30, ID_INSTALL, h);
         return 0;
     }
 
@@ -708,7 +785,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_VYPR));
     RegisterClassExW(&wc);
 
-    RECT r{0, 0, 570, 676};
+    RECT r{0, 0, 570, 700};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME, FALSE);
     g_main = CreateWindowExW(0, L"VyprSetup", L"Vypr Setup",
                              (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX),

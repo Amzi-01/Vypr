@@ -64,6 +64,16 @@ enum vypr_msg_type {
     VYPR_MSG_PING             = 73,  /* vypr_msg_ping */
     VYPR_MSG_WINDOW_STATE     = 74,  /* vypr_msg_window_state */
 
+    /*
+     * Clipboard text, UTF-8, no trailing NUL, sent whichever way it changed.
+     *
+     * Only text. Images and file lists are the two other things people expect
+     * from a clipboard, and both want a negotiation this protocol does not
+     * have - the far side has to say what formats it can take before megabytes
+     * of bitmap are sent across on the chance it is wanted.
+     */
+    VYPR_MSG_CLIPBOARD        = 75,  /* utf8 text */
+
     /* 128 and up are host-internal: they travel between vyprd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
      * framing means one reader implementation rather than two. */
@@ -73,7 +83,8 @@ enum vypr_msg_type {
     VYPR_MSG_CLIENT_LOCK      = 131, /* vypr_msg_pointer_lock */
     VYPR_MSG_CLIENT_GEOM      = 132, /* vypr_msg_client_geom */
     VYPR_MSG_CLIENT_STATE     = 133, /* vypr_msg_window_state */
-    VYPR_MSG_CLIENT_AUDIO     = 134  /* vypr_msg_audio + interleaved float */
+    VYPR_MSG_CLIENT_AUDIO     = 134, /* vypr_msg_audio + interleaved float */
+    VYPR_MSG_CLIENT_CLIPBOARD = 135  /* utf8 text */
 };
 
 /*

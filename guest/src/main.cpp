@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "audio.hpp"
+#include "clipboard.hpp"
 #include "capture.hpp"
 #include "control.hpp"
 #include "input.hpp"
@@ -60,6 +61,7 @@ private:
     vypr::Control      control_;
     vypr::Control      audio_link_;   /* audio only; written by one thread */
     vypr::AudioCapture audio_;
+    vypr::Clipboard    clipboard_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -284,6 +286,9 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     case VYPR_MSG_ATTACH:
         if (auto* m = as<vypr_msg_attach>(payload, bytes)) handle_attach(*m);
         break;
+    case VYPR_MSG_CLIPBOARD:
+        clipboard_.set_text(std::string(reinterpret_cast<const char*>(payload), bytes));
+        break;
     case VYPR_MSG_DETACH:
         if (auto* m = as<vypr_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
         break;
@@ -504,6 +509,14 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
     /* A second connection for audio, so a queued input event cannot sit in
      * front of a sound, and so the audio thread has a socket to itself. */
+    /* Guest clipboard -> host. Sent on the control channel: it is text, it is
+     * rare, and it must not overtake or be overtaken by anything. */
+    clipboard_.start([this](const std::string& text) {
+        if (text.size() <= VYPR_MAX_MSG_BYTES)
+            control_.send(VYPR_MSG_CLIPBOARD, text.data(),
+                          static_cast<std::uint32_t>(text.size()));
+    });
+
     if (audio_link_.connect(host, port)) {
         audio_link_.send(VYPR_MSG_AUDIO_HELLO, nullptr, 0);
         std::fprintf(stderr, "vypr: audio channel up\n");
