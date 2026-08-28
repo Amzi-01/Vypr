@@ -81,8 +81,6 @@ choice is what most of this table comes down to.
 | A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
 | Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
 | Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
-| Graphical manager | ❌ | ✅ | ❌ *(command line)* |
-| Runs on an ordinary single-GPU machine | ✅ | ✅ | ❌ |
 | Setup effort | guided | guided | two installers, plus passthrough |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
