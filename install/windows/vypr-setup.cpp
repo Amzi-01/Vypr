@@ -38,6 +38,8 @@
 
 static const wchar_t *LG_HOST_URL =
     L"https://looking-glass.io/artifact/stable/host";
+static const wchar_t *PARSEC_APP_URL =
+    L"https://builds.parsec.app/package/parsec-windows.exe";
 static const wchar_t *PARSEC_VUD_URL =
     L"https://builds.parsec.app/vud/parsec-vud-0.3.10.0.exe";
 static const wchar_t *SOURCE_URL =
@@ -369,6 +371,54 @@ static void install_parsec_vud()
             L"Parsec virtual USB driver installed");
 }
 
+static void install_parsec_app()
+{
+    logf(L"Parsec");
+
+    // Two reasons, neither of them streaming.
+    //
+    // Its virtual USB driver injects mouse motion at the kernel level, which
+    // is the only way a game reading raw input sees real deltas. And with it
+    // running the VM has a display: Windows.Graphics.Capture needs DWM to have
+    // something to composite, and a passthrough GPU with no monitor attached
+    // gives it nothing. An agent started without Parsec on this VM reports
+    // "Windows.Graphics.Capture is unavailable" and stops there.
+    const std::wstring parsecd = L"C:\\Program Files\\Parsec\\parsecd.exe";
+    const bool present = GetFileAttributesW(parsecd.c_str()) != INVALID_FILE_ATTRIBUTES;
+
+    if (present) {
+        logf(L"  [ok] already installed");
+    } else {
+        std::wstring exe = temp_dir() + L"parsec-windows.exe";
+        logf(L"  downloading...");
+        if (URLDownloadToFileW(nullptr, PARSEC_APP_URL, exe.c_str(), 0, nullptr) != S_OK) {
+            logf(L"  [!!] could not download Parsec. Without it the mouse will");
+            logf(L"       misbehave in games and the VM may have no display for");
+            logf(L"       Vypr to capture. Get it from parsec.app and install it.");
+            g_failed = true;
+            return;
+        }
+
+        logf(L"  installing...");
+        if (run_bounded(L"\"" + exe + L"\" /silent", 300000) == (DWORD)-2) {
+            logf(L"  [!!] Parsec's installer did not finish within five minutes.");
+            logf(L"       Run it yourself: %s", exe.c_str());
+            g_failed = true;
+            return;
+        }
+        step_ok(GetFileAttributesW(parsecd.c_str()) != INVALID_FILE_ATTRIBUTES,
+                L"Parsec installed");
+    }
+
+    // The launcher starts Parsec through this task before each session. It was
+    // never created by anything, so a fresh install had a launcher asking for a
+    // task that did not exist. Not elevated: Parsec runs as the user.
+    const std::wstring task =
+        L"schtasks /create /tn vypr-parsec /tr \"\\\"" + parsecd + L"\\\"\" "
+        L"/sc once /st 00:00 /it /f";
+    step_ok(run(task, true) == 0, L"registered so Vypr can start it");
+}
+
 // --------------------------------------------------------------------- SSH
 
 static void setup_ssh(const std::wstring &pubkey)
@@ -503,7 +553,7 @@ static DWORD WINAPI worker(LPVOID)
 
     install_agent();
     if (want_drivers)   install_ivshmem();
-    if (want_parsec)    install_parsec_vud();
+    if (want_parsec)    { install_parsec_app(); install_parsec_vud(); }
     if (want_ssh)       setup_ssh(pubkey);
     if (want_autologin) setup_autologin(password);
 
@@ -544,7 +594,8 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
 
         g_chk_drivers = mk(L"BUTTON", L"IVSHMEM driver \x2014 how frames leave the VM",
                            BS_AUTOCHECKBOX, 24, 108, 480, 22, ID_CHK_DRIVERS, h);
-        g_chk_parsec = mk(L"BUTTON", L"Parsec virtual USB driver \x2014 fixes the mouse in games",
+        g_chk_parsec = mk(L"BUTTON",
+                          L"Parsec \x2014 its drivers give the VM a mouse games accept, and a display",
                           BS_AUTOCHECKBOX, 24, 132, 480, 22, ID_CHK_PARSEC, h);
         g_chk_ssh = mk(L"BUTTON", L"OpenSSH server \x2014 lets the host start things in here",
                        BS_AUTOCHECKBOX, 24, 156, 480, 22, ID_CHK_SSH, h);

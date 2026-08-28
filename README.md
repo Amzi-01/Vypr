@@ -141,9 +141,11 @@ something during that minute cancels it.
 - **Exclusive fullscreen.** There is nothing to capture — the game bypasses the
   compositor entirely. Set the game to borderless or windowed. Vypr says so when
   it happens rather than showing a black window.
-- **Raw-input games need Parsec running** in the guest, for its driver. Nothing
-  in userspace can produce the mouse deltas those games expect; Parsec's driver
-  works at the kernel level. See the technical notes for why.
+- **Parsec has to be running in the guest**, and the installer sets it up for
+  you. It is not used for streaming — its driver produces the mouse deltas that
+  raw-input games expect, which nothing in userspace can, and with it running the
+  VM has a display for the compositor to draw on. See the technical notes for why
+  both of those are true.
 - **Two apps at once** works, but a second app restarts the session briefly.
 
 ## Digging deeper
