@@ -61,6 +61,48 @@ anything else in the VM too.
 
 </details>
 
+## How it compares
+
+[WinApps](https://github.com/winapps-org/winapps) and
+[WinBoat](https://winboat.app/) solve the same shape of problem — Windows
+applications as native Linux windows — and both do it over RDP RemoteApp. That
+choice is what this table is really about.
+
+| | WinApps | WinBoat | Vypr |
+|---|:---:|:---:|:---:|
+| Windows apps as native Linux windows | ✅ | ✅ | ✅ |
+| How the picture travels | RDP codec | RDP codec | **shared memory, uncompressed** |
+| GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
+| Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
+| Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
+| Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
+| Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
+| Clipboard sharing | ✅ | ✅ | ❌ |
+| Your home folder inside Windows | ✅ | ✅ | ❌ |
+| Finds your installed apps for you | ✅ | ✅ | ❌ *(`vypr add`)* |
+| Graphical manager | ❌ | ✅ | ❌ *(command line)* |
+| Runs on an ordinary single-GPU machine | ✅ | ✅ | ❌ |
+| Setup effort | guided | guided | two installers, plus passthrough |
+
+**Where Vypr wins, it wins on the thing it was built for.** RDP's video path was
+designed for documents: it is fine for a text editor and falls apart on anything
+that moves, and neither project has GPU passthrough, so a demanding game is out
+of reach for both. Vypr puts a real GPU in the VM and moves frames through shared
+memory with no encoder in the path at all — which is why a 4K game runs at 60 fps
+through it.
+
+**Where it loses, it loses on convenience.** There is no clipboard sharing, your
+home folder is not mounted inside Windows, and applications are registered one at
+a time rather than discovered. Those are real gaps, not oversights waiting to be
+denied.
+
+So: if you want Office or Photoshop occasionally on an ordinary laptop, WinApps
+or WinBoat will cost you far less effort and do a better job. Vypr is for the
+case they cannot serve — when the thing you are running has to be fast, and you
+have a second GPU to give it.
+
+*Compared against WinApps and WinBoat documentation as of August 2026.*
+
 ## What you need
 
 Vypr does not create your VM — it makes an existing one useful. Before
