@@ -66,26 +66,40 @@ anything else in the VM too.
 [WinApps](https://github.com/winapps-org/winapps) and
 [WinBoat](https://winboat.app/) solve the same shape of problem — Windows
 applications as native Linux windows — and both do it over RDP RemoteApp. That
-choice is what this table is about.
+choice is what most of this table comes down to.
 
 | | WinApps | WinBoat | Vypr |
 |---|:---:|:---:|:---:|
+| Windows apps as native Linux windows | ✅ | ✅ | ✅ |
 | How the picture travels | RDP codec | RDP codec | **shared memory, uncompressed** |
 | GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
 | Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
 | Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
-| Audio tied to the app's own output device | ❌ | ❌ | ✅ |
-| Frame latency | codec encode + decode | codec encode + decode | **no codec in the path** |
+| Frame latency | encode + decode | encode + decode | **no codec in the path** |
+| Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
+| Clipboard sharing | ✅ | ✅ | ✅ *text only* |
+| A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
+| Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
+| Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
+| Graphical manager | ❌ | ✅ | ❌ *(command line)* |
+| Runs on an ordinary single-GPU machine | ✅ | ✅ | ❌ |
+| Setup effort | guided | guided | two installers, plus passthrough |
 
-RDP's video path was designed for documents: it is fine for a text editor and
-falls apart on anything that moves. Neither project has GPU passthrough — WinBoat
-lists it as planned — so a demanding game is out of reach for both. Vypr puts a
-real GPU in the VM and moves frames through shared memory with no encoder
-anywhere in the path, which is why a 4K game runs at 60 fps through it.
+**Where Vypr wins, it wins on what it was built for.** RDP's video path was
+designed for documents: fine for a text editor, and it falls apart on anything
+that moves. Neither project has GPU passthrough — WinBoat lists it as planned —
+so a demanding game is out of reach for both. Vypr puts a real GPU in the VM and
+moves frames through shared memory with no encoder anywhere in the path.
 
-That trade has a cost, and it is the whole of [What you need](#what-you-need)
-and [What does not](#what-does-not) below: Vypr needs a second GPU, and WinApps
-and WinBoat will do far less demanding work with far less effort from you.
+**Where it loses, it loses on reach and convenience.** It needs a second GPU,
+which most machines do not have and cannot be worked around. There is no
+graphical manager. Its clipboard is text only, and it finds applications from the
+guest's desktop rather than everything installed.
+
+So: if you want Office or Photoshop occasionally on an ordinary laptop, WinApps
+or WinBoat will cost you far less effort and serve you better. Vypr is for the
+case they cannot reach — when the thing you are running has to be fast, and you
+have a second GPU to give it.
 
 *Compared against WinApps and WinBoat documentation as of August 2026.*
 
