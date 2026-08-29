@@ -471,6 +471,66 @@ static void install_gamepads()
             L"controllers will be forwarded");
 }
 
+static void name_audio_endpoints()
+{
+    logf(L"Naming the VM's audio devices");
+
+    /*
+     * The Linux installer gives the VM an emulated sound card, so Windows has a
+     * microphone through its own inbox driver and nothing third-party is
+     * needed. Both endpoints arrive called "High Definition Audio Device",
+     * which says nothing about where the sound goes.
+     *
+     * Two properties look like the name. {b3f8fa53...},6 is the adapter's, and
+     * Windows regenerates it from the driver whenever the endpoint is
+     * re-enumerated - renaming that lasts until the next restart, which is how
+     * it was first got wrong. {a45c254e...},2 is the endpoint's own
+     * description: the field the Sound control panel edits, and the one that
+     * survives.
+     *
+     * The keys grant Administrators exactly SetValue and ReadKey. PowerShell's
+     * registry provider asks for more and is refused, which reads as access
+     * denied on a key you can in fact write - so it is opened asking for
+     * precisely SetValue. Running as SYSTEM does not help: SYSTEM owns the key
+     * but has no write entry on it.
+     */
+    const std::wstring script =
+        L"$DESC = '{a45c254e-df1c-4efd-8020-67d146a850e0},2'\n"
+        L"$ADAPT = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'\n"
+        L"$INBOX = 'High Definition Audio Device'\n"
+        L"$ROOT = 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio'\n"
+        L"$done = 0\n"
+        L"foreach ($kind in @(@('Render','Vypr Speakers'), @('Capture','Vypr Microphone'))) {\n"
+        L"  $parent = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\"$ROOT\\$($kind[0])\")\n"
+        L"  if (-not $parent) { continue }\n"
+        L"  foreach ($guid in $parent.GetSubKeyNames()) {\n"
+        L"    $ep = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(\"$ROOT\\$($kind[0])\\$guid\")\n"
+        L"    if ($ep.GetValue('DeviceState') -ne 1) { continue }\n"
+        L"    $pp = \"$ROOT\\$($kind[0])\\$guid\\Properties\"\n"
+        L"    $ro = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($pp)\n"
+        L"    if (-not $ro -or $ro.GetValue($ADAPT) -ne $INBOX) { continue }\n"
+        L"    try {\n"
+        L"      $rw = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($pp,"
+        L"[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,"
+        L"[System.Security.AccessControl.RegistryRights]::SetValue)\n"
+        L"      $rw.SetValue($DESC, $kind[1], [Microsoft.Win32.RegistryValueKind]::String)\n"
+        L"      $rw.Close(); $done++\n"
+        L"    } catch { }\n"
+        L"  }\n"
+        L"}\n"
+        L"if ($done -gt 0) { exit 0 } else { exit 1 }\n";
+
+    if (powershell(script, true) == 0) {
+        step_ok(true, L"they appear as Vypr Speakers and Vypr Microphone");
+        /* The names are cached until the endpoint service re-reads them. */
+        run(L"net stop audiosrv /y", true);
+        run(L"net start audiosrv", true);
+    } else {
+        logf(L"  [--] no emulated sound card found to name. The Linux installer");
+        logf(L"       adds one; run it, restart the VM, then run this again.");
+    }
+}
+
 static void install_home_share()
 {
     logf(L"Linux folder as a drive");
@@ -674,6 +734,8 @@ static DWORD WINAPI worker(LPVOID)
     if (want_drivers)   install_ivshmem();
     if (want_parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
     if (want_ssh)       setup_ssh(pubkey);
+    name_audio_endpoints();
+    name_audio_endpoints();
     if (want_homedir)   install_home_share();
     if (want_autologin) setup_autologin(password);
 

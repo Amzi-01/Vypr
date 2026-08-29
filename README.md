@@ -78,6 +78,7 @@ choice is what most of this table comes down to.
 | Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
 | Frame latency | encode + decode | encode + decode | **no codec in the path** |
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
+| Microphone into the guest | ✅ | ✅ | ✅ *no extra software* |
 | Clipboard sharing | ✅ | ✅ | ✅ *text only* |
 | A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
 | Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
@@ -184,6 +185,7 @@ something during that minute cancels it.
 - Audio, pinned to whatever the app is actually playing to
 - Menus, popups and dialogs, positioned against the window they belong to
 - Controllers, presented to Windows as real XInput devices
+- Your microphone and speakers, as ordinary Windows devices
 - Clipboard text, shared both ways
 - A folder from this machine, mounted in Windows as a drive
 - Finding what is on the guest's desktop and offering to add it

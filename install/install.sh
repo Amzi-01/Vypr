@@ -174,6 +174,72 @@ else
     info "the domain already has everything it needs"
 fi
 
+# ------------------------------------------------- microphone and speakers
+head2 "Audio devices in the VM"
+
+# Windows can only use a microphone that exists as a device. Rather than have
+# anyone install a virtual audio cable, the VM is given an emulated sound card:
+# Windows drives it with its own inbox driver and QEMU carries this machine's
+# real microphone into it. Nothing third-party on either side, which is the
+# only version of this that can be packaged.
+dom_xml=$(virsh dumpxml --inactive "$DOMAIN" 2>/dev/null)
+if grep -q "<sound" <<<"$dom_xml" && grep -q "type='pulseaudio'" <<<"$dom_xml"; then
+    ok "already configured"
+elif [ ! -S "/run/user/$(id -u)/pulse/native" ]; then
+    warn "no PulseAudio socket at /run/user/$(id -u)/pulse/native, so the VM has"
+    warn "nowhere to take audio from; skipping"
+else
+    tmp3=$(mktemp -d)
+    virsh dumpxml --inactive "$DOMAIN" > "$tmp3/domain.xml"
+    if python3 - "$tmp3/domain.xml" "/run/user/$(id -u)/pulse/native" <<'PY'
+import sys, xml.etree.ElementTree as ET
+for prefix, uri in (("qemu", "http://libvirt.org/schemas/domain/qemu/1.0"),
+                    ("lxc",  "http://libvirt.org/schemas/domain/lxc/1.0")):
+    ET.register_namespace(prefix, uri)
+
+path, socket = sys.argv[1], sys.argv[2]
+tree = ET.parse(path); root = tree.getroot(); dev = root.find("devices")
+
+if dev.find("sound") is None:
+    ET.SubElement(dev, "sound").set("model", "ich9")
+
+# PulseAudio, deliberately, and not PipeWire's own backend.
+#
+# QEMU runs under a seccomp sandbox with resourcecontrol=deny, which blocks
+# sched_setscheduler. PipeWire's client library sets up a realtime thread when
+# it connects, is refused, and stalls - taking the guest with it. Measured:
+# twenty-four seconds of boot, then every vCPU idle and a black screen. The
+# PulseAudio socket reaches exactly the same devices and needs no such thing.
+for a in dev.findall("audio"):
+    dev.remove(a)
+a = ET.SubElement(dev, "audio")
+a.set("id", "1"); a.set("type", "pulseaudio"); a.set("serverName", socket)
+
+ET.indent(tree, space="  "); tree.write(path, encoding="unicode")
+PY
+    then
+        if virsh define "$tmp3/domain.xml" >/dev/null 2>&1; then
+            ok "sound card added; the VM will use this machine's mic and speakers"
+            info "they appear in Windows as Vypr Microphone and Vypr Speakers"
+            info "once the guest installer has run"
+        else
+            bad "could not add the sound card; the domain is unchanged"
+        fi
+    fi
+    rm -rf "$tmp3"
+fi
+
+# QEMU has to run as you to reach your audio socket, which lives in a directory
+# only you can enter. Without this the devices exist and carry silence.
+qemu_user=$(grep -sE "^[[:space:]]*user[[:space:]]*=" /etc/libvirt/qemu.conf 2>/dev/null |
+            tail -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ "$qemu_user" = "$USER" ]; then
+    ok "QEMU runs as you, so it can reach your microphone"
+else
+    warn "QEMU does not run as you, so it cannot reach your audio"
+    MANUAL+=("sudo sed -i 's|^#\\?user = .*|user = \"$USER\"|' /etc/libvirt/qemu.conf && sudo systemctl restart virtqemud   # let the VM use your mic")
+fi
+
 # ------------------------------------------------------------- home folder
 head2 "Sharing your home folder"
 

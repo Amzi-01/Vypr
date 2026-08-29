@@ -75,6 +75,7 @@ enum vypr_msg_type {
     VYPR_MSG_CLIPBOARD        = 75,  /* utf8 text */
     VYPR_MSG_GAMEPAD          = 76,  /* vypr_msg_gamepad */
 
+
     /* 128 and up are host-internal: they travel between vyprd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
      * framing means one reader implementation rather than two. */

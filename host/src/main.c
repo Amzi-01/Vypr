@@ -58,6 +58,10 @@ static void usage(void)
  * mapping is a table rather than a guess, and it happens here because SDL knows
  * about far more controllers than the agent ever would.
  */
+/* Defined with the outgoing queue below; used by the input paths above it. */
+static void send_queued(uint16_t type, const void *payload, uint32_t bytes,
+                        bool droppable);
+
 #define VYPR_MAX_PADS 4
 
 struct pad {
@@ -150,7 +154,7 @@ static void pads_poll(struct pad *pads, int daemon_fd, bool focused)
 
         if (memcmp(&m, &pads[i].last, sizeof m) == 0) continue;
         pads[i].last = m;
-        if (daemon_fd >= 0) msg_send(daemon_fd, VYPR_MSG_GAMEPAD, &m, sizeof m);
+        if (daemon_fd >= 0) send_queued(VYPR_MSG_GAMEPAD, &m, sizeof m, false);
     }
 }
 
@@ -224,6 +228,49 @@ static int bb_append(struct byte_buf *b, const void *data, size_t n)
     }
     memcpy(b->p + b->len, data, n);
     b->len += n;
+    return 0;
+}
+
+/*
+ * Outgoing messages to the daemon, queued rather than written straight out.
+ *
+ * The socket is non-blocking, and msg_send loops on writev until the whole
+ * message is gone - so a partial write followed by EAGAIN leaves half a message
+ * on the wire and returns an error, and the daemon's parser is then reading
+ * the middle of one message as the header of the next. Every message sent so
+ * far has been small enough that this never happened. Microphone audio is not:
+ * it is hundreds of kilobytes a second, and it would happen constantly.
+ *
+ * So: append here, flush when the socket says it can take it, and let realtime
+ * traffic be dropped when it backs up rather than delaying what is behind it.
+ */
+static struct byte_buf g_out;
+
+#define OUT_DROP_LIMIT (128 * 1024)
+
+static void send_queued(uint16_t type, const void *payload, uint32_t bytes,
+                        bool droppable)
+{
+    if (droppable && g_out.len > OUT_DROP_LIMIT) return;
+    struct vypr_msg_head head = { .bytes = bytes, .type = type, .flags = 0 };
+    if (bb_append(&g_out, &head, sizeof head) != 0) return;
+    if (bytes) bb_append(&g_out, payload, bytes);
+}
+
+/* Returns -1 when the link is gone. */
+static int out_flush(int fd)
+{
+    while (g_out.len) {
+        ssize_t n = send(fd, g_out.p, g_out.len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        if (n == 0) return -1;
+        memmove(g_out.p, g_out.p + n, g_out.len - (size_t)n);
+        g_out.len -= (size_t)n;
+    }
     return 0;
 }
 
@@ -637,7 +684,8 @@ static void pointer_flush(int fd, uint64_t window_id, struct pointer_accum *a)
     msg.wheel   = a->wheel;
     msg.hwheel  = a->hwheel;
     msg.flags   = a->flags;
-    msg_send(fd, VYPR_MSG_POINTER, &msg, sizeof(msg));
+    (void)fd;
+    send_queued(VYPR_MSG_POINTER, &msg, sizeof(msg), false);
 
     a->pending = false;
     a->wheel = a->hwheel = 0;
@@ -911,7 +959,7 @@ int main(int argc, char **argv)
                                   ? opt.window_id : v->window_id;
                 if (daemon_fd >= 0) {
                     struct vypr_msg_window_id msg = { .window_id = id };
-                    msg_send(daemon_fd, VYPR_MSG_CLOSE, &msg, sizeof(msg));
+                    send_queued(VYPR_MSG_CLOSE, &msg, sizeof(msg), false);
                 }
                 if (ev.type == SDL_EVENT_QUIT || !v->is_popup) running = 0;
                 break;
@@ -1036,7 +1084,7 @@ int main(int argc, char **argv)
                             up.window_id = v->window_id;
                             up.scancode  = mods[k];
                             up.down      = 0;
-                            msg_send(daemon_fd, VYPR_MSG_KEY, &up, sizeof(up));
+                            send_queued(VYPR_MSG_KEY, &up, sizeof(up), false);
                         }
                     }
 
@@ -1052,7 +1100,7 @@ int main(int argc, char **argv)
                 msg.down      = (ev.type == SDL_EVENT_KEY_DOWN);
                 msg.modifiers = ev.key.mod;
                 if (msg.scancode)
-                    msg_send(daemon_fd, VYPR_MSG_KEY, &msg, sizeof(msg));
+                    send_queued(VYPR_MSG_KEY, &msg, sizeof(msg), false);
                 break;
             }
 
@@ -1070,14 +1118,14 @@ int main(int argc, char **argv)
                 struct vypr_msg_window_state st = {0};
                 st.window_id = v->window_id;
                 st.minimized = mini ? 1u : 0u;
-                msg_send(daemon_fd, VYPR_MSG_WINDOW_STATE, &st, sizeof(st));
+                send_queued(VYPR_MSG_WINDOW_STATE, &st, sizeof(st), false);
                 break;
             }
 
             case SDL_EVENT_WINDOW_FOCUS_GAINED: {
                 if (daemon_fd < 0 || v->is_popup) break;
                 struct vypr_msg_window_id msg = { .window_id = v->window_id };
-                msg_send(daemon_fd, VYPR_MSG_FOCUS, &msg, sizeof(msg));
+                send_queued(VYPR_MSG_FOCUS, &msg, sizeof(msg), false);
                 break;
             }
 
@@ -1095,9 +1143,10 @@ int main(int argc, char **argv)
                 if (len && len <= VYPR_MAX_MSG_BYTES &&
                     (!clip_last || strcmp(clip_last, text) != 0)) {
                     free(clip_last);
+    free(g_out.p);
     pads_close(pads);
                     clip_last = strdup(text);
-                    msg_send(daemon_fd, VYPR_MSG_CLIPBOARD, text, (uint32_t)len);
+                    send_queued(VYPR_MSG_CLIPBOARD, text, (uint32_t)len, false);
                 }
                 SDL_free(text);
                 break;
@@ -1129,7 +1178,7 @@ int main(int argc, char **argv)
             rs.window_id = views[0].window_id;
             rs.width  = resize_w;
             rs.height = resize_h;
-            msg_send(daemon_fd, VYPR_MSG_RESIZE, &rs, sizeof(rs));
+            send_queued(VYPR_MSG_RESIZE, &rs, sizeof(rs), false);
             resize_at = 0;
         }
 
@@ -1139,6 +1188,8 @@ int main(int argc, char **argv)
         hit.captured   = pointer_locked || capture_forced;
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
+        if (daemon_fd >= 0 && out_flush(daemon_fd) < 0) running = 0;
+
         pads_poll(pads, daemon_fd,
                   (SDL_GetWindowFlags(views[0].win) & SDL_WINDOW_INPUT_FOCUS) != 0);
 
