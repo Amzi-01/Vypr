@@ -723,8 +723,45 @@ static void view_close(struct view *views, int *count, uint64_t window_id)
     }
 }
 
+/*
+ * Report what SDL can see and exit.
+ *
+ * Vypr can only forward a controller the host has. A pad that is not paired,
+ * or is held exclusively by something else, is invisible here and no amount of
+ * guest-side work changes that - so it is worth being able to ask directly
+ * rather than inferring it from a game not responding.
+ */
+static int list_pads(void)
+{
+    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
+        printf("SDL could not start its gamepad subsystem: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    int nj = 0;
+    SDL_JoystickID *js = SDL_GetJoysticks(&nj);
+    if (nj == 0) printf("no controllers\n");
+
+    for (int i = 0; i < nj; i++) {
+        const char *name = SDL_GetJoystickNameForID(js[i]);
+        if (!name) name = "(unnamed)";
+        if (SDL_IsGamepad(js[i]))
+            printf("%s\n", name);
+        else
+            /* SDL sees the device but has no button layout for it, so it
+             * cannot be mapped onto the Xbox layout the guest expects. */
+            printf("%s - no mapping, so it cannot be forwarded\n", name);
+    }
+    SDL_free(js);
+    SDL_Quit();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--list-pads")) return list_pads();
+
     struct options opt;
     if (parse_args(argc, argv, &opt) < 0) return 2;
 

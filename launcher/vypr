@@ -754,6 +754,11 @@ cmd_doctor() {
         else printf '  %-12s NOT ON PATH\n' "$b"; bad=1; fi
     done
 
+    echo "controllers"
+    if [ -x "$BIN/vypr-window" ]; then
+        "$BIN/vypr-window" --list-pads 2>/dev/null | sed 's/^/  /'
+    fi
+
     echo "vm"
     local state; state=$(virsh domstate "$VM" 2>/dev/null || echo missing)
     printf '  %-12s %s\n' "$VM" "$state"
