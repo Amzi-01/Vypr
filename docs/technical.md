@@ -413,6 +413,18 @@ Until vypr injects through a virtual HID device of its own, **Parsec running in
 the tray** supplies one: its `parsecvusba` driver injects at the kernel level
 where the deltas are real. See `docs/vm-setup.md`.
 
+**It is not needed for anything else, which took a while to establish.** An
+agent started without Parsec once reported `Windows.Graphics.Capture is
+unavailable`, and the conclusion drawn — that Parsec's virtual display was what
+gave DWM something to compose — was wrong. Measured directly afterwards, with
+Parsec killed: the passed-through adapter still drove 3840x2160, its virtual
+display adapter reported no resolution at all, and the agent started clean.
+
+The real requirement is a display on the passed-through GPU, which a monitor or
+a dummy plug satisfies. `vypr doctor` reports it, because "capture is
+unavailable" says nothing about what to do and the answer is not to install
+more software.
+
 This is worth knowing before debugging anything else about mouse behaviour in a
 game - it is not fixable at the level vypr currently operates, and every
 plausible-looking fix above it (relative mode, acceleration, re-centring) is

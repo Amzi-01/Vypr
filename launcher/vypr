@@ -208,7 +208,7 @@ start_agent() {
 
 # --------------------------------------------------- Parsec, for the mouse
 #
-# Not for streaming - for its driver.
+# Not for streaming, and not for the display either - only for its driver.
 #
 # Vypr injects mouse motion with SendInput, which always goes through the Win32
 # cursor pipeline. A game reading raw input for its camera wants the lLastX and
@@ -217,6 +217,13 @@ start_agent() {
 # corner every frame. No userspace API can produce a real HID delta, so this is
 # not fixable in Vypr as it stands. Parsec's parsecvusba driver injects at the
 # kernel HID level, and with it running the deltas are genuine.
+#
+# It was also believed to be what gave the VM a display, because an agent
+# started without it once reported the capture API as unavailable. That was
+# wrong: with a monitor or a dummy plug on the passed-through GPU the display
+# is there regardless, measured with Parsec killed - the adapter still drove
+# 3840x2160 and the agent started clean. So this is only about the mouse, and
+# only for games that read raw input. USE_PARSEC=0 turns it off.
 start_parsec() {
     [ "${USE_PARSEC:-1}" = "1" ] || return 0
     local ps
@@ -770,6 +777,22 @@ cmd_doctor() {
     if [ "$state" = "running" ]; then
         if guest 'echo ok' >/dev/null 2>&1; then
             echo "  ssh           answering"
+
+            # The real requirement behind "capture is unavailable": DWM needs a
+            # display to compose. A passed-through GPU with nothing plugged into
+            # it has none, and no amount of Vypr fixes that.
+            local disp
+            # No $_ in here: it is expanded away by the shell layers between
+            # this script and PowerShell, leaving a filter that matches nothing.
+            disp=$(guest 'powershell -NoProfile -Command "@(Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution -gt 0).Count"' 2>/dev/null | tr -d '\r' | tr -cd '0-9')
+            if [ -n "$disp" ] && [ "$disp" -gt 0 ]; then
+                echo "  display       $disp active"
+            else
+                echo "  display       NONE - nothing to capture. Attach a monitor or a"
+                echo "                dummy plug to the passed-through GPU, or run"
+                echo "                something that provides a virtual display."
+                bad=1
+            fi
             guest 'tasklist /fi "imagename eq vypr-agent.exe" /fo csv /nh' 2>/dev/null \
                 | grep -q vypr-agent \
                 && echo "  agent         running" \

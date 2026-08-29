@@ -195,11 +195,13 @@ something during that minute cancels it.
 - **Exclusive fullscreen.** There is nothing to capture — the game bypasses the
   compositor entirely. Set the game to borderless or windowed. Vypr says so when
   it happens rather than showing a black window.
-- **Parsec has to be running in the guest**, and the installer sets it up for
-  you. It is not used for streaming — its driver produces the mouse deltas that
-  raw-input games expect, which nothing in userspace can, and with it running the
-  VM has a display for the compositor to draw on. See the technical notes for why
-  both of those are true.
+- **Games that read raw mouse input need Parsec running** in the guest, for its
+  driver only — nothing in userspace can produce the mouse deltas they expect.
+  The installer sets it up for you, and `USE_PARSEC=0` turns it off if you do
+  not play those. Everything else works without it.
+- **The passed-through GPU needs a display** — a monitor or a dummy plug. The
+  compositor has nothing to draw on otherwise, and there is nothing to capture.
+  `vypr doctor` checks this.
 - **Two apps at once** works, but a second app restarts the session briefly.
 - **Clipboard is text only.** Images and file lists need a format negotiation
   the protocol does not have.
