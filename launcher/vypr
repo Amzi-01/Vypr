@@ -754,6 +754,20 @@ cmd_doctor() {
         else printf '  %-12s NOT ON PATH\n' "$b"; bad=1; fi
     done
 
+    # A kernel that has been upgraded but not rebooted has no module tree for
+    # the version actually running, so nothing that is not already loaded can
+    # load. It presents as a controller that enumerates on USB, gets no driver,
+    # creates no input device and is invisible to everything - which looks like
+    # a fault in whatever you were trying to use it with. Cost an hour once.
+    if [ ! -d "/lib/modules/$(uname -r)" ]; then
+        echo "kernel"
+        echo "  running $(uname -r), whose modules are not installed."
+        echo "  The kernel was upgraded and this machine has not rebooted, so"
+        echo "  drivers that are modules - controllers among them - cannot load."
+        echo "  Reboot."
+        bad=1
+    fi
+
     echo "controllers"
     if [ -x "$BIN/vypr-window" ]; then
         "$BIN/vypr-window" --list-pads 2>/dev/null | sed 's/^/  /'

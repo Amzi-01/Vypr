@@ -400,6 +400,29 @@ The fallback strip - for windows that draw their own chrome and report no title
 bar - applies only when the pointer is *not* captured, so a captured game never
 has a dead band across the top of it.
 
+## Controllers
+
+A pad is forwarded as a **real XInput device**, not as injected events. Games
+read controllers through XInput and XInput only reports genuine hardware, so
+there is nothing to inject into - the guest has to present a device. ViGEmBus is
+a signed bus driver that does that, and the agent speaks its ioctl interface
+directly rather than linking its client library.
+
+The host reads pads through SDL and maps them to the XInput layout before
+sending, because SDL already normalises every controller it recognises to that
+layout and recognises far more of them than the agent would. Two details that
+would otherwise be bugs: SDL's stick Y grows downwards where XInput's grows up,
+and negating -32768 overflows a signed 16-bit value, so it is clamped first.
+
+**The first bug report against this was not in this code at all.** A DualShock 4
+enumerated on USB, produced no input device, and was invisible to SDL; over
+Bluetooth it reported `Connected: yes` with `Paired: no`. Both were one cause:
+the machine was running a kernel whose module tree had been removed by an
+upgrade it had not yet rebooted into, so `hid_playstation` and `hidp` could not
+load. Nothing that was not already in memory could. `vypr doctor` checks for
+that now, and `vypr-window --list-pads` says what SDL can see, because "my
+controller does not work" otherwise has three indistinguishable answers.
+
 ## Raw-input games need a kernel HID device
 
 `SendInput` cannot drive a game that reads raw input for its camera. It always
