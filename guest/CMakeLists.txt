@@ -22,6 +22,7 @@ add_executable(vypr-agent
     src/ivshmem.cpp
     src/publisher.cpp
     src/clipboard.cpp
+    src/gamepad.cpp
     src/windows_list.cpp
 )
 

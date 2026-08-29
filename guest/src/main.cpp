@@ -26,6 +26,7 @@
 
 #include "audio.hpp"
 #include "clipboard.hpp"
+#include "gamepad.hpp"
 #include "capture.hpp"
 #include "control.hpp"
 #include "input.hpp"
@@ -62,6 +63,7 @@ private:
     vypr::Control      audio_link_;   /* audio only; written by one thread */
     vypr::AudioCapture audio_;
     vypr::Clipboard    clipboard_;
+    vypr::Gamepads     gamepads_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -286,6 +288,9 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     case VYPR_MSG_ATTACH:
         if (auto* m = as<vypr_msg_attach>(payload, bytes)) handle_attach(*m);
         break;
+    case VYPR_MSG_GAMEPAD:
+        if (auto* m = as<vypr_msg_gamepad>(payload, bytes)) gamepads_.apply(*m);
+        break;
     case VYPR_MSG_CLIPBOARD:
         clipboard_.set_text(std::string(reinterpret_cast<const char*>(payload), bytes));
         break;
@@ -509,6 +514,10 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
     /* A second connection for audio, so a queued input event cannot sit in
      * front of a sound, and so the audio thread has a socket to itself. */
+    /* Not fatal when it fails: ViGEmBus may not be installed, and everything
+     * except controllers works without it. */
+    gamepads_.open();
+
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */
     clipboard_.start([this](const std::string& text) {

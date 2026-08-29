@@ -9,7 +9,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /bigobj ^
    /Fe:vypr-agent.exe ^
    ..\src\main.cpp ..\src\audio.cpp ..\src\capture.cpp ..\src\control.cpp ^
    ..\src\input.cpp ^
-   ..\src\clipboard.cpp ..\src\ivshmem.cpp ..\src\publisher.cpp ^
+   ..\src\clipboard.cpp ..\src\gamepad.cpp ..\src\ivshmem.cpp ..\src\publisher.cpp ^
    ..\src\windows_list.cpp ^
    /link d3d11.lib dxgi.lib windowsapp.lib setupapi.lib ws2_32.lib dwmapi.lib user32.lib gdi32.lib ole32.lib
 echo BUILD_EXIT=%ERRORLEVEL%

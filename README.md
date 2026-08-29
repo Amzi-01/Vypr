@@ -75,6 +75,7 @@ choice is what most of this table comes down to.
 | GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
 | Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
 | Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
+| Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
 | Frame latency | encode + decode | encode + decode | **no codec in the path** |
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
 | Clipboard sharing | ✅ | ✅ | ✅ *text only* |
@@ -182,6 +183,7 @@ something during that minute cancels it.
 - Games, including ones that capture the mouse and read raw input
 - Audio, pinned to whatever the app is actually playing to
 - Menus, popups and dialogs, positioned against the window they belong to
+- Controllers, presented to Windows as real XInput devices
 - Clipboard text, shared both ways
 - A folder from this machine, mounted in Windows as a drive
 - Finding what is on the guest's desktop and offering to add it

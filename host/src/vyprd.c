@@ -710,6 +710,11 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         return;
     }
 
+    if (type == VYPR_MSG_GAMEPAD) {
+        if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_GAMEPAD, payload, bytes);
+        return;
+    }
+
     if (type == VYPR_MSG_CLIPBOARD) {
         /* Straight through to the agent, and to the other clients so their
          * own idea of the clipboard does not go stale and bounce back. */

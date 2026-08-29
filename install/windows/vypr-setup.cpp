@@ -43,6 +43,9 @@ static const wchar_t *PARSEC_APP_URL =
     L"https://builds.parsec.app/package/parsec-windows.exe";
 static const wchar_t *PARSEC_VUD_URL =
     L"https://builds.parsec.app/vud/parsec-vud-0.3.10.0.exe";
+static const wchar_t *VIGEMBUS_URL =
+    L"https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/"
+    L"ViGEmBus_1.22.0_x64_x86_arm64.exe";
 static const wchar_t *WINFSP_URL =
     L"https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi";
 static const wchar_t *VIRTIO_TOOLS_URL =
@@ -425,6 +428,49 @@ static void install_parsec_app()
     step_ok(run(task, true) == 0, L"registered so Vypr can start it");
 }
 
+static void install_gamepads()
+{
+    logf(L"Controller support");
+
+    // Games read controllers through XInput, and XInput only reports real
+    // devices - so forwarding a pad means presenting one to Windows as
+    // hardware. ViGEmBus is a signed bus driver that does exactly that.
+    if (powershell(L"if ((pnputil /enum-drivers) -match 'vigem') "
+                   L"{ exit 0 } else { exit 1 }\n", true) == 0) {
+        logf(L"  [ok] already installed");
+        return;
+    }
+
+    std::wstring exe = temp_dir() + L"vigembus.exe";
+    logf(L"  downloading ViGEmBus...");
+    if (URLDownloadToFileW(nullptr, VIGEMBUS_URL, exe.c_str(), 0, nullptr) != S_OK) {
+        logf(L"  [!!] could not download ViGEmBus. Everything else works;");
+        logf(L"       controllers will not be forwarded until it is installed.");
+        g_failed = true;
+        return;
+    }
+
+    logf(L"  installing...");
+    const DWORD rc = run_bounded(L"\"" + exe + L"\" /quiet /norestart", 300000);
+    if (rc == (DWORD)-2) {
+        logf(L"  [!!] the ViGEmBus installer ran out of time");
+        g_failed = true;
+        return;
+    }
+    /* 1604 is ERROR_INSTALL_SUSPEND, which here means an earlier driver has
+     * left a restart pending - the other installs above can do it. Worth
+     * saying, because the installer's own output is silent about why. */
+    if (rc == 1604) {
+        logf(L"  [!!] Windows wants restarting before this driver can install.");
+        logf(L"       Restart, then run this again - the rest is done.");
+        g_failed = true;
+        return;
+    }
+    step_ok(powershell(L"if ((pnputil /enum-drivers) -match 'vigem') "
+                       L"{ exit 0 } else { exit 1 }\n", true) == 0,
+            L"controllers will be forwarded");
+}
+
 static void install_home_share()
 {
     logf(L"Linux folder as a drive");
@@ -626,7 +672,7 @@ static DWORD WINAPI worker(LPVOID)
 
     install_agent();
     if (want_drivers)   install_ivshmem();
-    if (want_parsec)    { install_parsec_app(); install_parsec_vud(); }
+    if (want_parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
     if (want_ssh)       setup_ssh(pubkey);
     if (want_homedir)   install_home_share();
     if (want_autologin) setup_autologin(password);
@@ -669,7 +715,7 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_chk_drivers = mk(L"BUTTON", L"IVSHMEM driver \x2014 how frames leave the VM",
                            BS_AUTOCHECKBOX, 24, 108, 480, 22, ID_CHK_DRIVERS, h);
         g_chk_parsec = mk(L"BUTTON",
-                          L"Parsec \x2014 its drivers give the VM a mouse games accept, and a display",
+                          L"Input drivers \x2014 a mouse games accept, controllers, and a display",
                           BS_AUTOCHECKBOX, 24, 132, 480, 22, ID_CHK_PARSEC, h);
         g_chk_ssh = mk(L"BUTTON", L"OpenSSH server \x2014 lets the host start things in here",
                        BS_AUTOCHECKBOX, 24, 156, 480, 22, ID_CHK_SSH, h);

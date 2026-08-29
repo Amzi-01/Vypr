@@ -50,6 +50,110 @@ static void usage(void)
 /* Input goes back to vyprd rather than straight to the guest: one process owns
  * the link to the agent, so window identity and reconnect are decided in one
  * place. Returns -1 when there is no daemon, which is the standalone case. */
+/*
+ * Controllers, forwarded to the guest.
+ *
+ * SDL normalises every pad it recognises to the Xbox layout, which is the same
+ * layout XInput reports and therefore the one the guest has to produce - so the
+ * mapping is a table rather than a guess, and it happens here because SDL knows
+ * about far more controllers than the agent ever would.
+ */
+#define VYPR_MAX_PADS 4
+
+struct pad {
+    SDL_Gamepad *pad;
+    SDL_JoystickID id;
+    struct vypr_msg_gamepad last;
+    bool open;
+};
+
+static const struct { SDL_GamepadButton sdl; uint16_t bit; } pad_buttons[] = {
+    { SDL_GAMEPAD_BUTTON_DPAD_UP,        VYPR_PAD_DPAD_UP        },
+    { SDL_GAMEPAD_BUTTON_DPAD_DOWN,      VYPR_PAD_DPAD_DOWN      },
+    { SDL_GAMEPAD_BUTTON_DPAD_LEFT,      VYPR_PAD_DPAD_LEFT      },
+    { SDL_GAMEPAD_BUTTON_DPAD_RIGHT,     VYPR_PAD_DPAD_RIGHT     },
+    { SDL_GAMEPAD_BUTTON_START,          VYPR_PAD_START          },
+    { SDL_GAMEPAD_BUTTON_BACK,           VYPR_PAD_BACK           },
+    { SDL_GAMEPAD_BUTTON_LEFT_STICK,     VYPR_PAD_LEFT_THUMB     },
+    { SDL_GAMEPAD_BUTTON_RIGHT_STICK,    VYPR_PAD_RIGHT_THUMB    },
+    { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  VYPR_PAD_LEFT_SHOULDER  },
+    { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, VYPR_PAD_RIGHT_SHOULDER },
+    { SDL_GAMEPAD_BUTTON_GUIDE,          VYPR_PAD_GUIDE          },
+    { SDL_GAMEPAD_BUTTON_SOUTH,          VYPR_PAD_A              },
+    { SDL_GAMEPAD_BUTTON_EAST,           VYPR_PAD_B              },
+    { SDL_GAMEPAD_BUTTON_WEST,           VYPR_PAD_X              },
+    { SDL_GAMEPAD_BUTTON_NORTH,          VYPR_PAD_Y              },
+};
+
+static void pads_open(struct pad *pads)
+{
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    if (!ids) return;
+
+    for (int i = 0; i < count && i < VYPR_MAX_PADS; i++) {
+        if (pads[i].open) continue;
+        SDL_Gamepad *g = SDL_OpenGamepad(ids[i]);
+        if (!g) continue;
+        pads[i].pad  = g;
+        pads[i].id   = ids[i];
+        pads[i].open = true;
+        printf("vypr: controller %d: %s\n", i, SDL_GetGamepadName(g));
+        fflush(stdout);
+    }
+    SDL_free(ids);
+}
+
+static void pads_close(struct pad *pads)
+{
+    for (int i = 0; i < VYPR_MAX_PADS; i++) {
+        if (!pads[i].open) continue;
+        SDL_CloseGamepad(pads[i].pad);
+        pads[i].open = false;
+    }
+}
+
+/*
+ * Sent only when something changed. A controller reports continuously whether
+ * or not it is being touched, and a packet per pad per frame is a packet per
+ * pad per frame the guest has to wake up for and the link has to carry.
+ */
+static void pads_poll(struct pad *pads, int daemon_fd, bool focused)
+{
+    for (int i = 0; i < VYPR_MAX_PADS; i++) {
+        if (!pads[i].open) continue;
+
+        struct vypr_msg_gamepad m = {0};
+        m.index = (uint32_t)i;
+
+        /* Only the focused window drives the guest: two host windows both
+         * forwarding the same physical pad would fight over it. */
+        if (focused) {
+            m.flags = VYPR_PAD_CONNECTED;
+            for (size_t b = 0; b < sizeof(pad_buttons) / sizeof(pad_buttons[0]); b++)
+                if (SDL_GetGamepadButton(pads[i].pad, pad_buttons[b].sdl))
+                    m.buttons |= pad_buttons[b].bit;
+
+            /* SDL gives triggers 0..32767; XInput wants 0..255. */
+            m.left_trigger  = (uint8_t)(SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
+            m.right_trigger = (uint8_t)(SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
+
+            /* SDL's Y grows downwards, XInput's grows up. Negating -32768
+             * would overflow, so it is clamped before it is flipped. */
+            const Sint16 ly = SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_LEFTY);
+            const Sint16 ry = SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_RIGHTY);
+            m.lx = SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_LEFTX);
+            m.rx = SDL_GetGamepadAxis(pads[i].pad, SDL_GAMEPAD_AXIS_RIGHTX);
+            m.ly = (int16_t)-(ly == -32768 ? -32767 : ly);
+            m.ry = (int16_t)-(ry == -32768 ? -32767 : ry);
+        }
+
+        if (memcmp(&m, &pads[i].last, sizeof m) == 0) continue;
+        pads[i].last = m;
+        if (daemon_fd >= 0) msg_send(daemon_fd, VYPR_MSG_GAMEPAD, &m, sizeof m);
+    }
+}
+
 static int connect_daemon(const char *path, uint64_t window_id)
 {
     if (!path) return -1;
@@ -629,7 +733,7 @@ int main(int argc, char **argv)
 
     const int daemon_fd = connect_daemon(opt.sock_path, opt.window_id);
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "vypr: SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -679,6 +783,9 @@ int main(int argc, char **argv)
         else
             fprintf(stderr, "vypr: could not start the link reader thread\n");
     }
+    struct pad pads[VYPR_MAX_PADS] = {0};
+    pads_open(pads);
+
     uint8_t *parked = NULL;
     size_t   parked_cap = 0;
     /* The last clipboard text we set or sent, to tell an echo from a change. */
@@ -937,6 +1044,12 @@ int main(int argc, char **argv)
                 break;
             }
 
+            case SDL_EVENT_GAMEPAD_ADDED:
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                pads_close(pads);
+                pads_open(pads);
+                break;
+
             case SDL_EVENT_CLIPBOARD_UPDATE: {
                 if (daemon_fd < 0) break;
                 char *text = SDL_GetClipboardText();
@@ -945,6 +1058,7 @@ int main(int argc, char **argv)
                 if (len && len <= VYPR_MAX_MSG_BYTES &&
                     (!clip_last || strcmp(clip_last, text) != 0)) {
                     free(clip_last);
+    pads_close(pads);
                     clip_last = strdup(text);
                     msg_send(daemon_fd, VYPR_MSG_CLIPBOARD, text, (uint32_t)len);
                 }
@@ -988,6 +1102,8 @@ int main(int argc, char **argv)
         hit.captured   = pointer_locked || capture_forced;
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
+        pads_poll(pads, daemon_fd,
+                  (SDL_GetWindowFlags(views[0].win) & SDL_WINDOW_INPUT_FOCUS) != 0);
 
         /* Messages the reader thread parked for us. Popups open windows and
          * the rest touches the compositor, so they are handled here rather

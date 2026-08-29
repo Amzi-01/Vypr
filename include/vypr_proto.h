@@ -73,6 +73,7 @@ enum vypr_msg_type {
      * of bitmap are sent across on the chance it is wanted.
      */
     VYPR_MSG_CLIPBOARD        = 75,  /* utf8 text */
+    VYPR_MSG_GAMEPAD          = 76,  /* vypr_msg_gamepad */
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
@@ -107,6 +108,46 @@ struct vypr_msg_client_popup {
     uint32_t _pad;
     int32_t  dx, dy;
     uint32_t width, height;
+};
+
+/*
+ * One controller's state.
+ *
+ * The button bits and axis ranges are XInput's, not SDL's, because that is
+ * what the guest has to produce and the mapping is better done once on the
+ * host than in the agent: SDL already normalises every pad it knows about to
+ * this layout, and it knows about far more of them than we would.
+ */
+enum {
+    VYPR_PAD_DPAD_UP        = 0x0001,
+    VYPR_PAD_DPAD_DOWN      = 0x0002,
+    VYPR_PAD_DPAD_LEFT      = 0x0004,
+    VYPR_PAD_DPAD_RIGHT     = 0x0008,
+    VYPR_PAD_START          = 0x0010,
+    VYPR_PAD_BACK           = 0x0020,
+    VYPR_PAD_LEFT_THUMB     = 0x0040,
+    VYPR_PAD_RIGHT_THUMB    = 0x0080,
+    VYPR_PAD_LEFT_SHOULDER  = 0x0100,
+    VYPR_PAD_RIGHT_SHOULDER = 0x0200,
+    VYPR_PAD_GUIDE          = 0x0400,
+    VYPR_PAD_A              = 0x1000,
+    VYPR_PAD_B              = 0x2000,
+    VYPR_PAD_X              = 0x4000,
+    VYPR_PAD_Y              = 0x8000,
+};
+
+enum {
+    VYPR_PAD_CONNECTED    = 1u << 0,
+};
+
+struct vypr_msg_gamepad {
+    uint32_t index;          /* which pad; the guest plugs one target per index */
+    uint32_t flags;          /* VYPR_PAD_CONNECTED, clear when it goes away */
+    uint16_t buttons;
+    uint8_t  left_trigger;   /* 0..255 */
+    uint8_t  right_trigger;
+    int16_t  lx, ly;         /* -32768..32767, y positive up, as XInput has it */
+    int16_t  rx, ry;
 };
 
 /* Every message begins with this. `bytes` counts the payload only. */
