@@ -72,20 +72,20 @@ choice is what most of this table comes down to.
 |---|:---:|:---:|:---:|
 | Windows apps as native Linux windows | ✅ | ✅ | ✅ |
 | How the picture travels | RDP codec | RDP codec | **shared memory, uncompressed** |
-| GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
-| Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
-| Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
-| Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
 | Frame latency | encode + decode | encode + decode | **no codec in the path** |
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
 | Microphone into the guest | ✅ | ✅ | ✅ *no extra software* |
 | Clipboard sharing | ✅ | ✅ | ✅ *text only* |
-| Dragging a Linux file onto a Windows app | ❌ | ❌ | ✅ **copied in and dropped on the app** |
 | A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
 | Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
 | Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
 | Seeing the guest's whole screen when something is wrong | ✅ | ✅ | ✅ *`vypr --debug desktop`* |
 | Setup effort | guided | guided | two installers, plus passthrough |
+| GPU acceleration inside the guest | ❌ | ❌ *(planned)* | ✅ **passed-through GPU** |
+| Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
+| Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
+| Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
+| Dragging a Linux file onto a Windows app | ❌ | ❌ | ✅ **copied in and dropped on the app** |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
 designed for documents: fine for a text editor, and it falls apart on anything
