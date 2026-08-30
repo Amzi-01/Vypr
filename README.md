@@ -86,6 +86,7 @@ choice is what most of this table comes down to.
 | Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
 | Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
 | Opening a Linux file in a Windows app — `.psd`, `.exe`, anything | ❌ | ❌ | ✅ **double-click it, and saves come back** |
+| Dragging a file onto a running Windows app | ❌ | ❌ | ✅ **copied in and dropped where you point** |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
 designed for documents: fine for a text editor, and it falls apart on anything
