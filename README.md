@@ -87,6 +87,7 @@ choice is what most of this table comes down to.
 | Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
 | Opening a Linux file in a Windows app — `.psd`, `.exe`, anything | ❌ | ❌ | ✅ **double-click it, and saves come back** |
 | Dragging a file onto a running Windows app | ❌ | ❌ | ✅ **copied in and dropped where you point** |
+| Windows notifications on the Linux desktop | ❌ | ❌ | ✅ **raised as ordinary desktop notifications** |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
 designed for documents: fine for a text editor, and it falls apart on anything
@@ -189,6 +190,7 @@ does the same thing for one file without changing any defaults.
 | `vypr open <file>` | open a Linux file in the Windows app that handles it |
 | `vypr associate` | make double-clicking `.psd`, `.exe` and friends do that |
 | `vypr open-elevation` | let the guest elevate without a prompt Vypr cannot answer |
+| `vypr guest-notifications` | turn the guest's notifications back on |
 | `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
@@ -207,6 +209,9 @@ something during that minute cancels it.
 - Controllers, presented to Windows as real XInput devices
 - Your microphone and speakers, as ordinary Windows devices
 - Clipboard text, shared both ways
+- Notifications the guest raises, appearing as ordinary notifications on this
+  desktop — including ones from an application that is minimised, behind
+  something else, or not being streamed at all
 - Double-clicking a Linux file to open it in the Windows application that
   handles it — a `.psd` in Photoshop, a `.exe` or an installer, a document in
   whatever opens it over there. **Saving writes back to the file you opened**,
@@ -246,6 +251,11 @@ something during that minute cancels it.
   seeing it is as far as that goes. `vypr open-elevation` turns the prompt off
   inside the VM, which is what makes installers work; `vypr doctor` says which
   of the two states you are in.
+- **The guest has to have notifications turned on.** They can be switched off
+  for the whole Windows user, and then nothing reaches the Action Center for
+  Vypr to read — which looks exactly like forwarding being broken.
+  `vypr guest-notifications` turns them on and restarts the service that caches
+  the setting, which is the step that is easy to miss. `vypr doctor` checks.
 - **An opened file is copied, not shared.** The guest cannot see this
   filesystem, so `vypr open` copies the file in and copies each saved version
   back out, usually within a few seconds. That is invisible in ordinary use and

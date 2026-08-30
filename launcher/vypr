@@ -9,6 +9,7 @@
 #   vypr open <file>    open a Linux file in the Windows app that handles it
 #   vypr associate      make this desktop open .psd, .exe and friends that way
 #   vypr open-elevation let the guest elevate without a prompt Vypr cannot answer
+#   vypr guest-notifications  turn the guest's notifications back on
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
@@ -1118,6 +1119,26 @@ cmd_doctor() {
             echo "    vypr open-elevation"
             bad=1
         fi
+
+        # Notifications the guest will not raise in the first place.
+        #
+        # Toasts can be switched off for the whole user, and then nothing
+        # reaches the Action Center for the agent to read - which looks exactly
+        # like forwarding being broken. Worse, turning it back on is not enough
+        # on its own: the notification service caches the setting and has to be
+        # restarted before it takes.
+        local toasts
+        toasts=$(guest 'reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications" /v ToastEnabled' 2>/dev/null |
+                 tr -d '\r' | awk '/ToastEnabled/ { print $3 }')
+        if [ "$toasts" = "0x0" ]; then
+            echo "notifications"
+            echo "  the guest has notifications switched off, so nothing will be"
+            echo "  forwarded. Turn them on and restart the service that caches"
+            echo "  the setting:"
+            echo
+            echo "    vypr guest-notifications"
+            bad=1
+        fi
     fi
 
     echo "controllers"
@@ -1230,6 +1251,24 @@ EOF
     say "'vypr open-elevation --remove' puts both back."
 }
 
+# Turn the guest's notifications on.
+#
+# Two steps, and the second is the one that is easy to miss: the notification
+# service reads ToastEnabled once and keeps it, so setting the value without
+# restarting the service changes nothing and looks like the setting did not
+# work. Cost an afternoon.
+cmd_guest_notifications() {
+    resolve_guest || die "cannot reach the guest - is the VM running?"
+
+    guest 'reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications" /v ToastEnabled /t REG_DWORD /d 1 /f' \
+        >/dev/null 2>&1 || die "could not write the guest's settings"
+
+    guest 'powershell -NoProfile -Command "Get-Service -Name WpnUserService* | Restart-Service -Force -ErrorAction SilentlyContinue"' \
+        >/dev/null 2>&1
+
+    say "The guest will raise notifications again, and Vypr will forward them."
+}
+
 cmd_up()   { ensure_region; start_vm; start_agent; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
@@ -1258,6 +1297,7 @@ case "${1:-}" in
     detect) cmd_detect ;;
     open)   shift; cmd_open "$@" ;;
     open-elevation) shift; cmd_open_elevation "$@" ;;
+    guest-notifications) cmd_guest_notifications ;;
     associate) shift; cmd_associate "$@" ;;
     __sync) shift; watch_and_sync "$@" ;;   # internal: carry saves back out
     status) cmd_status ;;
