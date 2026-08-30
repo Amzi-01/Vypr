@@ -1143,8 +1143,6 @@ int main(int argc, char **argv)
                 if (len && len <= VYPR_MAX_MSG_BYTES &&
                     (!clip_last || strcmp(clip_last, text) != 0)) {
                     free(clip_last);
-    free(g_out.p);
-    pads_close(pads);
                     clip_last = strdup(text);
                     send_queued(VYPR_MSG_CLIPBOARD, text, (uint32_t)len, false);
                 }
@@ -1396,6 +1394,8 @@ int main(int argc, char **argv)
     free(link.pending.p);
     free(parked);
     free(clip_last);
+    free(g_out.p);
+    pads_close(pads);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);
     vypr_shm_close(&shm);
