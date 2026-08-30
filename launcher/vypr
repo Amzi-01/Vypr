@@ -6,6 +6,8 @@
 #   vypr add <app>      register a Windows application as a launchable app
 #   vypr remove <app>   undo that - task, profile, menu entry and icons
 #   vypr detect         find apps on the guest desktop and offer to add them
+#   vypr open <file>    open a Linux file in the Windows app that handles it
+#   vypr associate      make this desktop open .psd, .exe and friends that way
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
@@ -79,6 +81,9 @@ guest() {
     ssh -n -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
         -o ConnectTimeout=8 "$GUEST_USER@$GUEST" "$@"
 }
+# The remote path is passed as it stands. Windows' sshd does not hand it to a
+# shell, so a document called 'My Poster.psd' needs no quoting - and quoting it
+# anyway makes the quotes part of the filename.
 guest_put() {
     scp -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
         -q "$1" "$GUEST_USER@$GUEST:$2"
@@ -418,6 +423,194 @@ cmd_run() {
         sleep 5
     done
     die "$APP_NAME did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+}
+
+# ------------------------------------------------- opening a Linux file
+#
+# The guest cannot see this filesystem, so the file is copied in, opened with
+# whatever Windows associates with it, and copied back whenever the application
+# saves. To the person doing it, double-clicking a .psd opens Photoshop and
+# Ctrl+S writes to the file they double-clicked.
+#
+# The copy is the part worth being careful about. An application that saves is
+# not editing the file you opened, it is editing the guest's copy of it, and
+# unless something carries that back the work is stranded in the VM. So a
+# watcher follows the guest copy for as long as the session lasts and writes
+# each new version back over the original.
+#
+# A shared folder would avoid the round trip entirely - the application would
+# open the real file - but that needs virtiofs set up on both sides, and this
+# has to work whether or not it is.
+# Two spellings of one directory. Windows' own tools want backslashes; scp
+# reads the remote path itself and treats a backslash as an escape, so
+# everything that goes through it uses the forward-slash form - which
+# PowerShell is equally happy with.
+OPEN_DIR_WIN='C:\ProgramData\Vypr\open'
+OPEN_DIR_SCP='C:/ProgramData/Vypr/open'
+
+# LastWriteTime and length together, as one string. Either alone misses an edit
+# that keeps the other the same.
+guest_stamp() {
+    guest "powershell -NoProfile -Command \"\$f='$1'; if (Test-Path -LiteralPath \$f) { \$i=Get-Item -LiteralPath \$f; Write-Output (\\\"{0}:{1}\\\" -f \$i.LastWriteTimeUtc.Ticks, \$i.Length) } else { Write-Output 'gone' }\"" 2>/dev/null | tr -d '\r' | tail -1
+}
+
+# Copy the guest's version back over the file the user opened.
+#
+# Written beside the original and moved into place, so an interrupted copy
+# cannot leave a half-written file where the whole one was - and so the
+# original's permissions and ownership survive.
+sync_back() {
+    local original="$1" remote="$2" tmp
+    tmp=$(mktemp "$(dirname -- "$original")/.vypr-XXXXXX") || return 1
+    if guest_get "$remote" "$tmp"; then
+        chmod --reference="$original" "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$original" && return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# The watcher, run in the background by 'vypr open'.
+#
+# It polls rather than being told, because nothing in the guest is going to
+# tell us. Two identical readings before copying: an application part way
+# through writing a large file has a size that is changing, and copying then
+# would fetch half a document.
+watch_and_sync() {
+    local original="$1" remote="$2"
+    local last stamp settled=""
+
+    # One watcher per file. Opening the same document twice would otherwise
+    # leave two of them copying the same changes over each other.
+    local lock
+    lock="${XDG_RUNTIME_DIR:-/tmp}/vypr-sync-$(printf '%s' "$original" | md5sum | cut -c1-16).lock"
+    exec 9>"$lock" || exit 0
+    flock -n 9 || exit 0
+
+    last=$(guest_stamp "$remote")
+    while pgrep -x vyprd >/dev/null 2>&1; do
+        sleep 3
+        stamp=$(guest_stamp "$remote")
+        [ -n "$stamp" ] || continue
+        [ "$stamp" = "gone" ] && break
+        [ "$stamp" = "$last" ] && { settled=""; continue; }
+
+        if [ "$stamp" = "$settled" ]; then
+            if sync_back "$original" "$remote"; then
+                say "Saved back to $(basename -- "$original")"
+                last="$stamp"
+            fi
+            settled=""
+        else
+            settled="$stamp"
+        fi
+    done
+    exit 0
+}
+
+cmd_open() {
+    local file="${1:-}"
+    [ -n "$file" ] || die "usage: vypr open <file>"
+    [ -e "$file" ] || die "no such file: $file"
+    [ -f "$file" ] || die "$file is not a file - only files can be opened this way"
+    file=$(readlink -f -- "$file")
+
+    local base stem
+    base=$(basename -- "$file")
+    stem="${base%.*}"
+    APP_NAME="$base"
+
+    ensure_region
+    start_vm
+    resolve_guest || die "cannot work out where the guest is - is the VM running?"
+
+    # An application titles its window after the document, so the file's own
+    # name is what to watch for. Both forms: some show the extension, some do
+    # not.
+    local MATCHES=("$stem" "$base")
+    start_daemon MATCHES
+    start_agent
+    start_parsec
+
+    say "Copying $base into the guest..."
+    guest "if not exist \"$OPEN_DIR_WIN\" mkdir \"$OPEN_DIR_WIN\"" >/dev/null 2>&1
+    guest_put "$file" "$OPEN_DIR_SCP/$base" || die "could not copy $base into the guest"
+
+    # Through a scheduled task, not over ssh: an ssh session is not the
+    # interactive desktop, and a window opened from one appears on a desktop
+    # nobody is looking at and nothing can capture.
+    say "Opening $base in Windows..."
+    guest "schtasks /delete /tn vypr-open /f >nul 2>&1 & schtasks /create /tn vypr-open /tr \"cmd /c start \\\"\\\" \\\"$OPEN_DIR_WIN\\\\$base\\\"\" /sc once /st 00:00 /it /rl limited /f" \
+        >/dev/null 2>&1 || die "could not create the scheduled task in the guest"
+    guest "schtasks /run /tn vypr-open" >/dev/null 2>&1
+
+    # Saves in the guest come back here for as long as the session lasts.
+    nohup "$0" __sync "$file" "$OPEN_DIR_SCP/$base" \
+        >>"${XDG_RUNTIME_DIR:-/tmp}/vypr-sync.log" 2>&1 &
+    disown 2>/dev/null || true
+
+    start_watcher
+
+    local i
+    for i in $(seq 1 24); do
+        pgrep -x vypr-window >/dev/null && { say "$base is open in Windows."; exit 0; }
+        sleep 5
+    done
+    echo "vypr: nothing appeared within two minutes." >&2
+    echo "vypr: the guest may have opened it in a window titled something other" >&2
+    echo "      than '$stem'. 'vypr --debug desktop' shows the whole screen." >&2
+    exit 1
+}
+
+# ------------------------------------------- making double-click do that
+#
+# The MIME types Windows applications are the obvious answer for. PSD has two
+# names in the wild, and executables have collected several over the years;
+# registering all of them costs nothing and missing one means a file that
+# quietly opens in something else.
+OPEN_MIMES=(
+    image/vnd.adobe.photoshop
+    image/x-psd
+    application/x-ms-dos-executable
+    application/x-msdownload
+    application/vnd.microsoft.portable-executable
+    application/x-msi
+)
+
+cmd_associate() {
+    local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local entry="$apps/vypr-open.desktop"
+
+    if [ "${1:-}" = "--remove" ]; then
+        rm -f "$entry"
+        update-desktop-database "$apps" 2>/dev/null || true
+        say "Vypr is no longer offered for those files. Your file manager may"
+        say "need to be restarted before it stops using it."
+        return 0
+    fi
+
+    mkdir -p "$apps"
+    {
+        echo "[Desktop Entry]"
+        echo "Type=Application"
+        echo "Name=Open in Windows (Vypr)"
+        echo "Comment=Open this file in the Windows application that handles it"
+        echo "Exec=$BIN/vypr open %f"
+        echo "Icon=vypr"
+        echo "Terminal=false"
+        echo "NoDisplay=true"
+        printf 'MimeType=%s;\n' "$(IFS=';'; echo "${OPEN_MIMES[*]}")"
+    } > "$entry"
+    update-desktop-database "$apps" 2>/dev/null || true
+
+    local m
+    for m in "${OPEN_MIMES[@]}"; do
+        xdg-mime default vypr-open.desktop "$m" 2>/dev/null || true
+    done
+
+    say "Double-clicking these will now open them in the VM:"
+    printf '        %s\n' "${OPEN_MIMES[@]}"
+    say "'vypr associate --remove' puts that back."
 }
 
 # What to look for in a window title, when the user has not said.
@@ -913,6 +1106,9 @@ case "${1:-}" in
         esac
         ;;
     detect) cmd_detect ;;
+    open)   shift; cmd_open "$@" ;;
+    associate) shift; cmd_associate "$@" ;;
+    __sync) shift; watch_and_sync "$@" ;;   # internal: carry saves back out
     status) cmd_status ;;
     doctor) cmd_doctor ;;
     __watch) watch_and_shutdown ;;   # internal: the shutdown supervisor

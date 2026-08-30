@@ -85,7 +85,7 @@ choice is what most of this table comes down to.
 | Demanding games | ❌ | ❌ | ✅ **4K at 60 fps, measured** |
 | Games that read raw mouse input | ❌ | ❌ | ✅ **kernel-level HID injection** |
 | Controllers | ❌ | ❌ | ✅ **as real XInput devices** |
-| Opening a Linux file in a Windows app — `.psd`, `.exe`, anything | ❌ | ❌ | ✅ **dragged in, copied, and dropped on the app** |
+| Opening a Linux file in a Windows app — `.psd`, `.exe`, anything | ❌ | ❌ | ✅ **double-click it, and saves come back** |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
 designed for documents: fine for a text editor, and it falls apart on anything
@@ -167,11 +167,26 @@ Steam games are registered by their URL instead of a path:
 vypr add cod 'steam://rungameid/3595230' --name 'Call of Duty Modern Warfare II'
 ```
 
+To open your own files in the guest's applications, register Vypr as their
+handler once:
+
+```bash
+vypr associate
+```
+
+After that, double-clicking a `.psd`, `.exe`, `.msi` or similar opens it in the
+VM: the file is copied in, opened with whatever Windows associates with it, and
+each time the application saves, the new version is written back over the file
+you double-clicked. `vypr associate --remove` undoes it, and `vypr open <file>`
+does the same thing for one file without changing any defaults.
+
 | | |
 |---|---|
 | `vypr run <app>` | start it, bringing up the VM and session if needed |
 | `vypr add <app> <path>` | register a Windows application |
 | `vypr detect` | find apps on the guest desktop and pick which to add |
+| `vypr open <file>` | open a Linux file in the Windows app that handles it |
+| `vypr associate` | make double-clicking `.psd`, `.exe` and friends do that |
 | `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
@@ -190,11 +205,13 @@ something during that minute cancels it.
 - Controllers, presented to Windows as real XInput devices
 - Your microphone and speakers, as ordinary Windows devices
 - Clipboard text, shared both ways
-- Dragging a file from the Linux desktop straight onto a Windows application —
-  a `.psd` onto Photoshop, an installer or a `.exe` onto Explorer, a save file
-  onto a game's launcher. The file is copied into the guest and dropped on
-  whatever is under the pointer, so the application opens an ordinary local
-  file rather than a path it cannot reach
+- Double-clicking a Linux file to open it in the Windows application that
+  handles it — a `.psd` in Photoshop, a `.exe` or an installer, a document in
+  whatever opens it over there. **Saving writes back to the file you opened**,
+  not to a copy stranded in the VM
+- Dragging a file from the Linux desktop straight onto a running Windows
+  application, for when you want it opened by that application rather than by
+  whatever Windows would choose
 - A folder from this machine, mounted in Windows as a drive
 - Finding what is on the guest's desktop and offering to add it
 - Streaming the guest's whole screen, for debugging
@@ -218,9 +235,12 @@ something during that minute cancels it.
   the protocol does not have.
 - **Dragging goes one way, and files only.** A file dragged from Linux lands in
   the Windows application; dragging back out is not implemented, and neither is
-  dragging a folder. Double-clicking a `.psd` in your Linux file manager does
-  not open it in the guest either — drag it onto the running application
-  instead.
+  dragging a folder.
+- **An opened file is copied, not shared.** The guest cannot see this
+  filesystem, so `vypr open` copies the file in and copies each saved version
+  back out, usually within a few seconds. That is invisible in ordinary use and
+  wrong in two cases: editing the same file on both sides at once, and an
+  application that expects the file to change underneath it while it is open.
 
 ## Digging deeper
 
