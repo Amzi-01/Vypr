@@ -263,3 +263,8 @@ cmake --build build
 
 Needs SDL3. The guest agent is built with MSVC inside the VM; see
 `tools/dev/README.md` for the loop used to develop it.
+
+---
+
+*Documentation and commit descriptions in this repository were written with
+Claude. (It just helps speed things up.)*
