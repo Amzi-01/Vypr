@@ -188,6 +188,7 @@ does the same thing for one file without changing any defaults.
 | `vypr detect` | find apps on the guest desktop and pick which to add |
 | `vypr open <file>` | open a Linux file in the Windows app that handles it |
 | `vypr associate` | make double-clicking `.psd`, `.exe` and friends do that |
+| `vypr open-elevation` | let the guest elevate without a prompt Vypr cannot answer |
 | `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
@@ -237,6 +238,14 @@ something during that minute cancels it.
 - **Dragging goes one way, and files only.** A file dragged from Linux lands in
   the Windows application; dragging back out is not implemented, and neither is
   dragging a folder.
+- **Administrator prompts cannot be answered through Vypr.** Windows draws the
+  User Account Control prompt on the secure desktop, which nothing here can see
+  — so an installer that asks for approval waits forever on a question you were
+  never shown. Vypr now streams the prompt if the guest has been told to draw it
+  on the ordinary desktop, but Windows still refuses injected input to it, so
+  seeing it is as far as that goes. `vypr open-elevation` turns the prompt off
+  inside the VM, which is what makes installers work; `vypr doctor` says which
+  of the two states you are in.
 - **An opened file is copied, not shared.** The guest cannot see this
   filesystem, so `vypr open` copies the file in and copies each saved version
   back out, usually within a few seconds. That is invisible in ordinary use and

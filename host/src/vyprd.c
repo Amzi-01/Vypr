@@ -229,10 +229,26 @@ static void title_key(const char *in, char *out, size_t cap)
 static int title_matches(struct daemon *d, const char *title)
 {
     if (d->match_all) return 1;
-    if (d->match_count == 0) return 0;
 
     char tkey[1024];
     title_key(title, tkey, sizeof tkey);
+
+    /*
+     * Windows asking for administrator approval is always worth showing.
+     *
+     * Any application can raise it, at any moment, and it is modal: until it
+     * is answered the thing you launched does not start and the window you
+     * were using does not respond. A prompt nobody can see is therefore
+     * indistinguishable from the session having died, which is exactly what it
+     * looked like before this - so it is matched whatever the session was
+     * started to watch for.
+     *
+     * It only reaches us at all if the guest has been told to stop drawing it
+     * on the secure desktop, which nothing here can see. 'vypr doctor' checks.
+     */
+    if (strstr(tkey, "useraccountcontrol")) return 1;
+
+    if (d->match_count == 0) return 0;
 
     for (int i = 0; i < d->match_count; i++) {
         char pkey[256];

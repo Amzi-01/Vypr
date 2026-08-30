@@ -83,8 +83,23 @@ bool is_presentable(HWND hwnd) {
         && cloaked)
         return false;
 
+    /*
+     * No redirection bitmap, which used to mean nothing to capture.
+     *
+     * It does not mean that any more: WGC composes from DWM's own tree rather
+     * than from a window's redirection surface, so a XAML window without one
+     * captures perfectly well. Rejecting them outright cost us the ones that
+     * matter most - the User Account Control prompt is a 'Credential Dialog
+     * Xaml Host', and dropping it is why asking Windows for administrator
+     * approval looked like the stream had died.
+     *
+     * Untitled ones are still dropped. That is what the flag is genuinely good
+     * for: the invisible XAML helper windows an application leaves lying
+     * around, which have nothing to show and no name to show it under.
+     */
     const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (ex & WS_EX_NOREDIRECTIONBITMAP) return false;  // nothing for WGC to capture
+    if ((ex & WS_EX_NOREDIRECTIONBITMAP) && GetWindowTextLengthW(hwnd) == 0)
+        return false;
 
     const RECT cap = vypr_capture_rect(hwnd);
     if (cap.right - cap.left < 8 || cap.bottom - cap.top < 8) return false;

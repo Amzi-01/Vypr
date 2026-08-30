@@ -8,6 +8,7 @@
 #   vypr detect         find apps on the guest desktop and offer to add them
 #   vypr open <file>    open a Linux file in the Windows app that handles it
 #   vypr associate      make this desktop open .psd, .exe and friends that way
+#   vypr open-elevation let the guest elevate without a prompt Vypr cannot answer
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
@@ -508,6 +509,51 @@ watch_and_sync() {
     exit 0
 }
 
+# What to watch for in the window an opened file puts up.
+#
+# The file's own name is the first guess and usually right: an application
+# titles its window after the document. An installer does not - it is named
+# after what it installs plus a word saying that is what it does, while the
+# window it opens is named after the product alone. 'voicemeetersetup.exe' puts
+# up 'Voicemeeter Installation (Version 1.1.2.2)', which shares no whole word
+# with the filename, so the plain name never matches.
+open_matches() {
+    local stem="$1" base="$2"
+    printf '%s\n%s\n' "$stem" "$base"
+
+    local short="${stem,,}"
+    short="${short//[^a-z0-9]/}"
+    short="${short%%v[0-9]*}"                    # trailing version, as in _v1122
+    short="${short%%[0-9][0-9][0-9]*}"
+    local suffix
+    for suffix in setup installer install x64 x86 win64 win32 amd64 full latest; do
+        short="${short%$suffix}"
+    done
+    # Four characters is short enough to be a word and long enough not to match
+    # half the desktop.
+    if [ ${#short} -ge 4 ] && [ "$short" != "${stem,,}" ]; then
+        printf '%s\n' "$short"
+    fi
+}
+
+# The window that turned up, when none of the guesses matched.
+#
+# vyprd logs every window the guest offers and says which ones it ignored, so
+# the ones that appeared since the launch are known - and if exactly one
+# plausible application window is among them, that is what was opened. Adopting
+# it by name is better than telling the user nothing happened.
+open_adopt_candidate() {
+    local since="$1" log="${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+    [ -f "$log" ] || return 1
+
+    tail -n "+$((since + 1))" "$log" |
+        sed -n "s/^vyprd: guest window '\(.*\)' [0-9]*x[0-9]* at .*(no title match)$/\1/p" |
+        grep -v '^$' |
+        grep -viE '^(program manager|parsec|vypr desktop|notificationtoasts)' |
+        grep -viE '^C:\\Windows' |
+        tail -1
+}
+
 cmd_open() {
     local file="${1:-}"
     [ -n "$file" ] || die "usage: vypr open <file>"
@@ -524,10 +570,8 @@ cmd_open() {
     start_vm
     resolve_guest || die "cannot work out where the guest is - is the VM running?"
 
-    # An application titles its window after the document, so the file's own
-    # name is what to watch for. Both forms: some show the extension, some do
-    # not.
-    local MATCHES=("$stem" "$base")
+    local MATCHES=()
+    mapfile -t MATCHES < <(open_matches "$stem" "$base")
     start_daemon MATCHES
     start_agent
     start_parsec
@@ -535,6 +579,12 @@ cmd_open() {
     say "Copying $base into the guest..."
     guest "if not exist \"$OPEN_DIR_WIN\" mkdir \"$OPEN_DIR_WIN\"" >/dev/null 2>&1
     guest_put "$file" "$OPEN_DIR_SCP/$base" || die "could not copy $base into the guest"
+
+    # Where the log has got to, so the windows that appear from here on can be
+    # told from the ones that were already there.
+    local log="${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+    local mark=0
+    [ -f "$log" ] && mark=$(wc -l < "$log")
 
     # Through a scheduled task, not over ssh: an ssh session is not the
     # interactive desktop, and a window opened from one appears on a desktop
@@ -552,13 +602,29 @@ cmd_open() {
     start_watcher
 
     local i
-    for i in $(seq 1 24); do
+    for i in $(seq 1 8); do
         pgrep -x vypr-window >/dev/null && { say "$base is open in Windows."; exit 0; }
-        sleep 5
+        sleep 3
     done
-    echo "vypr: nothing appeared within two minutes." >&2
-    echo "vypr: the guest may have opened it in a window titled something other" >&2
-    echo "      than '$stem'. 'vypr --debug desktop' shows the whole screen." >&2
+
+    # Nothing matched. Something did open, though - adopt it by the name it
+    # actually gave itself.
+    local found
+    found=$(open_adopt_candidate "$mark")
+    if [ -n "$found" ]; then
+        say "It opened as '$found' - watching for that instead..."
+        MATCHES+=("$found")
+        start_daemon MATCHES
+        start_agent
+        for i in $(seq 1 10); do
+            pgrep -x vypr-window >/dev/null && { say "$base is open in Windows."; exit 0; }
+            sleep 3
+        done
+    fi
+
+    echo "vypr: $base did not put up a window Vypr could find." >&2
+    echo "vypr: 'vypr --debug desktop' shows the guest's whole screen, which is" >&2
+    echo "      the quickest way to see what it actually did." >&2
     exit 1
 }
 
@@ -1017,6 +1083,43 @@ cmd_doctor() {
         bad=1
     fi
 
+    # Administrator approval, which is where installers get stuck.
+    #
+    # Windows draws the User Account Control prompt on the secure desktop, and
+    # the secure desktop is not the one the agent is on - nothing there can be
+    # enumerated, captured or clicked. So an application that asks for approval
+    # waits for an answer to a question nobody was shown, which looks exactly
+    # like the session having died.
+    if resolve_guest 2>/dev/null && guest 'echo ok' >/dev/null 2>&1; then
+        echo "administrator prompts"
+        local secure consent
+        secure=$(guest 'reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v PromptOnSecureDesktop' 2>/dev/null |
+                 tr -d '\r' | awk '/PromptOnSecureDesktop/ { print $3 }')
+        consent=$(guest 'reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin' 2>/dev/null |
+                  tr -d '\r' | awk '/ConsentPromptBehaviorAdmin/ { print $3 }')
+
+        if [ "$consent" = "0x0" ]; then
+            echo "  the guest elevates without asking, so installers just run."
+            echo "  Nothing to do - but note that this is a real reduction in the"
+            echo "  VM's security, and it is only sensible because the VM is"
+            echo "  disposable and single-purpose."
+        elif [ "$secure" = "0x0" ]; then
+            echo "  prompts are drawn on the ordinary desktop, so Vypr can show"
+            echo "  them - but Windows forbids injected input from reaching one,"
+            echo "  so you can see it and not answer it. Answer it on the VM's own"
+            echo "  monitor, or let the guest elevate without asking:"
+            echo
+            echo "    vypr open-elevation"
+        else
+            echo "  prompts are drawn on the secure desktop, which nothing here can"
+            echo "  see. An installer that asks for approval will appear to hang."
+            echo "  Two commands' worth of guest settings fix it:"
+            echo
+            echo "    vypr open-elevation"
+            bad=1
+        fi
+    fi
+
     echo "controllers"
     if [ -x "$BIN/vypr-window" ]; then
         "$BIN/vypr-window" --list-pads 2>/dev/null | sed 's/^/  /'
@@ -1080,6 +1183,53 @@ cmd_doctor() {
     return "$bad"
 }
 
+# Let the guest elevate without asking.
+#
+# This is a security setting and it is weakened deliberately, so it is a
+# command the user runs rather than something an installer does quietly. The
+# reasoning: the prompt cannot be answered through Vypr - Windows will not let
+# injected input reach it, whatever integrity level the agent runs at - so on a
+# VM driven entirely through Vypr the prompt is not a safeguard, it is a
+# deadlock. On a VM you also use directly, leave it alone.
+cmd_open_elevation() {
+    local key='HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+
+    if [ "${1:-}" = "--remove" ]; then
+        resolve_guest || die "cannot reach the guest"
+        guest "reg add \"$key\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 5 /f" >/dev/null 2>&1
+        guest "reg add \"$key\" /v PromptOnSecureDesktop /t REG_DWORD /d 1 /f" >/dev/null 2>&1
+        say "Windows will ask for approval on the secure desktop again."
+        say "Installers launched through Vypr will appear to hang."
+        return 0
+    fi
+
+    cat <<'EOF'
+This turns off two Windows safeguards inside the VM:
+
+  ConsentPromptBehaviorAdmin = 0   elevate without asking
+  PromptOnSecureDesktop      = 0   draw any prompt on the ordinary desktop
+
+After it, a program in the guest that asks for administrator rights gets them
+without a prompt. That is a real reduction in the VM's security and it is worth
+being deliberate about. It is here because the prompt cannot be answered
+through Vypr at all: Windows refuses injected input to it, so what you get
+instead is an installer waiting forever on a question you were never shown.
+
+Only the VM is affected. This machine is untouched.
+EOF
+    printf '\nGo ahead? [y/N] '
+    local reply; read -r reply
+    case "$reply" in [yY]*) ;; *) echo "Left alone."; return 0 ;; esac
+
+    resolve_guest || die "cannot reach the guest - is the VM running?"
+    guest "reg add \"$key\" /v PromptOnSecureDesktop /t REG_DWORD /d 0 /f" >/dev/null 2>&1 ||
+        die "could not write the guest's settings"
+    guest "reg add \"$key\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f" >/dev/null 2>&1 ||
+        die "could not write the guest's settings"
+    say "Done. Installers will now run without asking."
+    say "'vypr open-elevation --remove' puts both back."
+}
+
 cmd_up()   { ensure_region; start_vm; start_agent; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
@@ -1107,6 +1257,7 @@ case "${1:-}" in
         ;;
     detect) cmd_detect ;;
     open)   shift; cmd_open "$@" ;;
+    open-elevation) shift; cmd_open_elevation "$@" ;;
     associate) shift; cmd_associate "$@" ;;
     __sync) shift; watch_and_sync "$@" ;;   # internal: carry saves back out
     status) cmd_status ;;
