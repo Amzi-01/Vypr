@@ -427,6 +427,69 @@ cmd_run() {
     die "$APP_NAME did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
 }
 
+# ----------------------------------------------------- the shared folder
+#
+# When the guest can see the file already, none of the copying below has to
+# happen: the application opens the real thing and saves land on it directly,
+# with no round trip and no window in which the two copies disagree.
+#
+# The share is described by the domain, so the domain is what is asked.
+share_root() {
+    virsh dumpxml --inactive "$VM" 2>/dev/null | python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+for fs in root.iter("filesystem"):
+    target, source = fs.find("target"), fs.find("source")
+    if target is not None and target.get("dir") == "vyprhome" and source is not None:
+        print(source.get("dir") or "")
+        break
+' 2>/dev/null
+}
+
+# Which drive letter Windows gave it.
+#
+# Asked rather than assumed: virtiofs takes the first free letter, which is
+# usually Z but is not promised to be, and a guest with other drives will
+# differ. A marker written from this side and looked for on that one answers it
+# without either end having to be told anything.
+share_drive() {
+    local cache="${XDG_RUNTIME_DIR:-/tmp}/vypr-share-drive"
+    if [ -s "$cache" ]; then cat "$cache"; return 0; fi
+
+    local root; root=$(share_root)
+    [ -n "$root" ] && [ -d "$root" ] || return 1
+
+    printf 'vypr' > "$root/.vypr-share-id" 2>/dev/null || return 1
+
+    # cmd rather than PowerShell, for the dullest of reasons: a PowerShell
+    # variable is a dollar sign, and getting one intact through bash, ssh and
+    # cmd takes four levels of escaping that were wrong every way I wrote them.
+    # This has no sigils in it at all.
+    local letter
+    letter=$(guest 'for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %d:\.vypr-share-id echo %d' 2>/dev/null |
+             tr -d '\r' | grep -E '^[A-Za-z]$' | head -1)
+    rm -f "$root/.vypr-share-id"
+
+    [ -n "$letter" ] || return 1
+    printf '%s' "$letter" > "$cache"
+    printf '%s' "$letter"
+}
+
+# The file as Windows would name it, or nothing if it is not in the share.
+guest_path_for() {
+    local file="$1" root drive rel
+    root=$(share_root) || return 1
+    [ -n "$root" ] || return 1
+    case "$file" in "$root"/*) ;; *) return 1 ;; esac
+
+    drive=$(share_drive) || return 1
+    rel="${file#"$root"/}"
+    printf '%s:\\%s' "$drive" "${rel//\//\\}"
+}
+
 # ------------------------------------------------- opening a Linux file
 #
 # The guest cannot see this filesystem, so the file is copied in, opened with
@@ -577,9 +640,18 @@ cmd_open() {
     start_agent
     start_parsec
 
-    say "Copying $base into the guest..."
-    guest "if not exist \"$OPEN_DIR_WIN\" mkdir \"$OPEN_DIR_WIN\"" >/dev/null 2>&1
-    guest_put "$file" "$OPEN_DIR_SCP/$base" || die "could not copy $base into the guest"
+    # The guest may be able to see the file already.
+    local target
+    target=$(guest_path_for "$file" 2>/dev/null || true)
+
+    if [ -n "$target" ]; then
+        say "Opening $base from the shared folder..."
+    else
+        say "Copying $base into the guest..."
+        guest "if not exist \"$OPEN_DIR_WIN\" mkdir \"$OPEN_DIR_WIN\"" >/dev/null 2>&1
+        guest_put "$file" "$OPEN_DIR_SCP/$base" || die "could not copy $base into the guest"
+        target="$OPEN_DIR_WIN\\$base"
+    fi
 
     # Where the log has got to, so the windows that appear from here on can be
     # told from the ones that were already there.
@@ -590,15 +662,17 @@ cmd_open() {
     # Through a scheduled task, not over ssh: an ssh session is not the
     # interactive desktop, and a window opened from one appears on a desktop
     # nobody is looking at and nothing can capture.
-    say "Opening $base in Windows..."
-    guest "schtasks /delete /tn vypr-open /f >nul 2>&1 & schtasks /create /tn vypr-open /tr \"cmd /c start \\\"\\\" \\\"$OPEN_DIR_WIN\\\\$base\\\"\" /sc once /st 00:00 /it /rl limited /f" \
+    guest "schtasks /delete /tn vypr-open /f >nul 2>&1 & schtasks /create /tn vypr-open /tr \"cmd /c start \\\"\\\" \\\"$target\\\"\" /sc once /st 00:00 /it /rl limited /f" \
         >/dev/null 2>&1 || die "could not create the scheduled task in the guest"
     guest "schtasks /run /tn vypr-open" >/dev/null 2>&1
 
-    # Saves in the guest come back here for as long as the session lasts.
-    nohup "$0" __sync "$file" "$OPEN_DIR_SCP/$base" \
-        >>"${XDG_RUNTIME_DIR:-/tmp}/vypr-sync.log" 2>&1 &
-    disown 2>/dev/null || true
+    # A copy has to be carried back when it is saved. A file opened over the
+    # share is the file itself, and there is nothing to carry.
+    if [ -z "$(guest_path_for "$file" 2>/dev/null || true)" ]; then
+        nohup "$0" __sync "$file" "$OPEN_DIR_SCP/$base" \
+            >>"${XDG_RUNTIME_DIR:-/tmp}/vypr-sync.log" 2>&1 &
+        disown 2>/dev/null || true
+    fi
 
     start_watcher
 
@@ -1118,6 +1192,30 @@ cmd_doctor() {
             echo
             echo "    vypr open-elevation"
             bad=1
+        fi
+
+        # The shared folder, which fails in two halves.
+        #
+        # The domain can describe a share the guest cannot mount, because the
+        # guest end needs WinFsp and the virtiofs service and either can be
+        # absent - and then everything looks configured and no drive appears.
+        echo "shared folder"
+        local sroot sdrive
+        sroot=$(share_root)
+        if [ -z "$sroot" ]; then
+            echo "  not shared. Re-run install/install.sh to add one - the file"
+            echo "  you open in Windows is copied in and back out without it."
+        else
+            sdrive=$(share_drive 2>/dev/null || true)
+            if [ -n "$sdrive" ]; then
+                echo "  $sroot is $sdrive: in the guest"
+            else
+                echo "  the VM is configured to share $sroot, but no drive in the"
+                echo "  guest holds it. The guest end needs WinFsp and the"
+                echo "  VirtioFsSvc service, which the Windows installer sets up"
+                echo "  when its 'home folder' box is ticked."
+                bad=1
+            fi
         fi
 
         # Notifications the guest will not raise in the first place.

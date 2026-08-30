@@ -76,7 +76,7 @@ choice is what most of this table comes down to.
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
 | Microphone into the guest | ✅ | ✅ | ✅ *no extra software* |
 | Clipboard sharing | ✅ | ✅ | ✅ *text only* |
-| A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
+| A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in, appears as a drive* |
 | Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
 | Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
 | Seeing the guest's whole screen when something is wrong | ✅ | ✅ | ✅ *`vypr --debug desktop`* |
@@ -177,10 +177,12 @@ vypr associate
 ```
 
 After that, double-clicking a `.psd`, `.exe`, `.msi` or similar opens it in the
-VM: the file is copied in, opened with whatever Windows associates with it, and
-each time the application saves, the new version is written back over the file
-you double-clicked. `vypr associate --remove` undoes it, and `vypr open <file>`
-does the same thing for one file without changing any defaults.
+VM, and saving writes back to the file you double-clicked. If the file is inside
+the folder you shared with the VM, the application opens it directly over the
+share and saves land on it as they would on any other file; if it is not, Vypr
+copies it in and copies each saved version back out. `vypr associate --remove`
+undoes the association, and `vypr open <file>` does one file without changing
+any defaults.
 
 | | |
 |---|---|
@@ -219,7 +221,9 @@ something during that minute cancels it.
 - Dragging a file from the Linux desktop straight onto a running Windows
   application, for when you want it opened by that application rather than by
   whatever Windows would choose
-- A folder from this machine, mounted in Windows as a drive
+- A folder from this machine, mounted in Windows as a drive over virtiofs.
+  A file inside it is opened by the Windows application directly — no copy, and
+  saving writes to the file itself
 - Finding what is on the guest's desktop and offering to add it
 - Streaming the guest's whole screen, for debugging
 - Minimise, maximise, close and dragging, all acting on the guest window
@@ -256,11 +260,14 @@ something during that minute cancels it.
   Vypr to read — which looks exactly like forwarding being broken.
   `vypr guest-notifications` turns them on and restarts the service that caches
   the setting, which is the step that is easy to miss. `vypr doctor` checks.
-- **An opened file is copied, not shared.** The guest cannot see this
-  filesystem, so `vypr open` copies the file in and copies each saved version
-  back out, usually within a few seconds. That is invisible in ordinary use and
-  wrong in two cases: editing the same file on both sides at once, and an
-  application that expects the file to change underneath it while it is open.
+- **A file outside the shared folder is copied, not shared.** With the folder
+  share set up, `vypr open` hands the guest the real file and there is nothing
+  to carry back. Without it — or for a file that lives somewhere else — the file
+  is copied in and each saved version copied back out, usually within a few
+  seconds. That is invisible in ordinary use and wrong in two cases: editing the
+  same file on both sides at once, and an application that expects the file to
+  change underneath it while it is open. `vypr doctor` says which of the two you
+  are getting.
 
 ## Digging deeper
 
