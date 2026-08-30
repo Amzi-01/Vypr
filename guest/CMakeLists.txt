@@ -22,6 +22,7 @@ add_executable(vypr-agent
     src/ivshmem.cpp
     src/publisher.cpp
     src/clipboard.cpp
+    src/drop.cpp
     src/gamepad.cpp
     src/windows_list.cpp
 )
@@ -37,5 +38,5 @@ target_compile_definitions(vypr-agent PRIVATE
 target_compile_options(vypr-agent PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus /bigobj)
 
 target_link_libraries(vypr-agent PRIVATE
-    d3d11 dxgi windowsapp setupapi ws2_32 dwmapi user32 gdi32
+    d3d11 dxgi windowsapp setupapi ws2_32 dwmapi user32 gdi32 ole32 shell32
 )

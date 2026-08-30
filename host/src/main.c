@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -272,6 +273,179 @@ static int out_flush(int fd)
         g_out.len -= (size_t)n;
     }
     return 0;
+}
+
+/*
+ * Files dragged from the Linux desktop onto this window.
+ *
+ * They are copied into the guest rather than named to it. A host path means
+ * nothing over there: the optional shared folder may not be mounted, and the
+ * file may well be somewhere else anyway. Copying always works, and what the
+ * Windows application ends up opening is an ordinary local file.
+ *
+ * The copy is fed out a chunk at a time from the main loop rather than written
+ * in one go. Queueing a whole file at once would put it all in memory - a
+ * gigabyte of RAM for a gigabyte of video - and park every keystroke behind it.
+ * Feeding it only once the queue has drained means the transfer runs exactly
+ * as fast as the link will take it, and input waits behind one chunk at most.
+ */
+struct drop_xfer {
+    char   **paths;        /* owned */
+    int      count;
+    int      next;         /* the next file to open */
+    FILE    *fp;           /* the file being sent */
+    uint64_t remaining;    /* of that file */
+    uint64_t window_id;
+    float    hx, hy;       /* where the pointer was, in host window pixels */
+    int32_t  gx, gy;       /* the same point, in guest surface pixels */
+    bool     active;       /* a drag has been completed and is being sent */
+};
+
+static void drop_reset(struct drop_xfer *d)
+{
+    if (d->fp) fclose(d->fp);
+    for (int i = 0; i < d->count; i++) free(d->paths[i]);
+    free(d->paths);
+    memset(d, 0, sizeof(*d));
+}
+
+/*
+ * Tell the guest to throw away what it has staged.
+ *
+ * Only worth sending once a file has been announced - before that there is
+ * nothing over there to forget.
+ */
+static void drop_cancel(struct drop_xfer *d)
+{
+    if (d->next > 0) {
+        struct vypr_msg_drop_end end = {0};
+        end.window_id = d->window_id;
+        end.cancelled = 1;
+        send_queued(VYPR_MSG_DROP_END, &end, sizeof(end), false);
+    }
+    drop_reset(d);
+}
+
+static bool drop_add(struct drop_xfer *d, const char *path)
+{
+    if (d->count >= (int)VYPR_DROP_MAX_FILES) return false;
+
+    char **grown = realloc(d->paths, (size_t)(d->count + 1) * sizeof(*grown));
+    if (!grown) return false;
+    d->paths = grown;
+
+    d->paths[d->count] = strdup(path);
+    if (!d->paths[d->count]) return false;
+    d->count++;
+    return true;
+}
+
+static const char *path_leaf(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Opens the next readable file and announces it. False when none are left. */
+static bool drop_next_file(struct drop_xfer *d)
+{
+    while (d->next < d->count) {
+        const char *path = d->paths[d->next++];
+
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            fprintf(stderr, "vypr: cannot read %s: %s\n", path, strerror(errno));
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            /* A folder is a tree, and sending one means deciding what to do
+             * about links, permissions and how deep to go. Dragging files is
+             * the thing people actually do. */
+            fprintf(stderr, "vypr: %s is a folder; only files can be dragged in\n",
+                    path_leaf(path));
+            continue;
+        }
+        if ((uint64_t)st.st_size > VYPR_DROP_MAX_BYTES) {
+            fprintf(stderr, "vypr: %s is too large to drag across (%.1f GiB)\n",
+                    path_leaf(path), (double)st.st_size / 1073741824.0);
+            continue;
+        }
+
+        FILE *fp = fopen(path, "rb");
+        if (!fp) {
+            fprintf(stderr, "vypr: cannot open %s: %s\n", path, strerror(errno));
+            continue;
+        }
+
+        const char *name = path_leaf(path);
+        const size_t name_bytes = strlen(name);
+
+        uint8_t msg[sizeof(struct vypr_msg_drop_begin) + 512];
+        if (name_bytes == 0 || name_bytes > sizeof(msg) - sizeof(struct vypr_msg_drop_begin)) {
+            fclose(fp);
+            continue;
+        }
+
+        struct vypr_msg_drop_begin *b = (struct vypr_msg_drop_begin *)msg;
+        memset(b, 0, sizeof(*b));
+        b->window_id  = d->window_id;
+        b->bytes      = (uint64_t)st.st_size;
+        b->name_bytes = (uint32_t)name_bytes;
+        memcpy(msg + sizeof(*b), name, name_bytes);
+        send_queued(VYPR_MSG_DROP_BEGIN, msg,
+                    (uint32_t)(sizeof(*b) + name_bytes), false);
+
+        d->fp        = fp;
+        d->remaining = (uint64_t)st.st_size;
+        return true;
+    }
+    return false;
+}
+
+/* One chunk per turn round the loop, and only once the queue has drained. */
+static void drop_pump(struct drop_xfer *d)
+{
+    if (!d->active || g_out.len > VYPR_DROP_CHUNK) return;
+
+    if (!d->fp && !drop_next_file(d)) {
+        struct vypr_msg_drop_end end = {0};
+        end.window_id = d->window_id;
+        end.x = d->gx;
+        end.y = d->gy;
+        send_queued(VYPR_MSG_DROP_END, &end, sizeof(end), false);
+        drop_reset(d);
+        return;
+    }
+
+    uint8_t buf[sizeof(struct vypr_msg_drop_data) + VYPR_DROP_CHUNK];
+    struct vypr_msg_drop_data *h = (struct vypr_msg_drop_data *)buf;
+
+    size_t want = VYPR_DROP_CHUNK;
+    if (want > d->remaining) want = (size_t)d->remaining;
+
+    const size_t got = want ? fread(buf + sizeof(*h), 1, want, d->fp) : 0;
+    if (got == 0) {
+        /* Short of what the header promised, so the file changed under us. The
+         * guest discards a file it was not sent all of rather than handing an
+         * application half of one. */
+        if (want)
+            fprintf(stderr, "vypr: a dragged file stopped short; not dropping it\n");
+        fclose(d->fp);
+        d->fp = NULL;
+        d->remaining = 0;
+        return;
+    }
+
+    memset(h, 0, sizeof(*h));
+    h->window_id = d->window_id;
+    h->bytes     = (uint32_t)got;
+    send_queued(VYPR_MSG_DROP_DATA, buf, (uint32_t)(sizeof(*h) + got), false);
+
+    d->remaining -= got;
+    if (d->remaining == 0) {
+        fclose(d->fp);
+        d->fp = NULL;
+    }
 }
 
 struct link {
@@ -871,6 +1045,9 @@ int main(int argc, char **argv)
     struct pad pads[VYPR_MAX_PADS] = {0};
     pads_open(pads);
 
+    /* A drag from the Linux desktop onto this window, in progress. */
+    struct drop_xfer drop = {0};
+
     uint8_t *parked = NULL;
     size_t   parked_cap = 0;
     /* The last clipboard text we set or sent, to tell an echo from a change. */
@@ -1135,6 +1312,44 @@ int main(int argc, char **argv)
                 pads_open(pads);
                 break;
 
+            /*
+             * A file dragged in from the Linux desktop.
+             *
+             * The compositor reports a drag as a run of events: one BEGIN, a
+             * FILE for each path, POSITION as the pointer moves over the
+             * window, and COMPLETE when it is let go. Nothing is sent until
+             * COMPLETE, because a drag that leaves the window again never
+             * arrives at all.
+             */
+            case SDL_EVENT_DROP_BEGIN:
+                /* Whatever was still going is now stale. */
+                drop_cancel(&drop);
+                break;
+
+            case SDL_EVENT_DROP_POSITION:
+                drop.hx = ev.drop.x;
+                drop.hy = ev.drop.y;
+                break;
+
+            case SDL_EVENT_DROP_FILE:
+                if (daemon_fd < 0 || !ev.drop.data) break;
+                drop.window_id = v->window_id;
+                drop.hx = ev.drop.x;
+                drop.hy = ev.drop.y;
+                if (!drop_add(&drop, ev.drop.data))
+                    fprintf(stderr, "vypr: too many files in one drag\n");
+                break;
+
+            case SDL_EVENT_DROP_COMPLETE:
+                if (daemon_fd < 0 || drop.count == 0) { drop_reset(&drop); break; }
+                SDL_GetWindowSize(v->win, &win_w, &win_h);
+                to_guest_coords(win_w, win_h, v->src_w, v->src_h,
+                                drop.hx, drop.hy, &drop.gx, &drop.gy);
+                drop.active = true;
+                fprintf(stderr, "vypr: sending %d dragged file(s) to the guest\n",
+                        drop.count);
+                break;
+
             case SDL_EVENT_CLIPBOARD_UPDATE: {
                 if (daemon_fd < 0) break;
                 char *text = SDL_GetClipboardText();
@@ -1186,6 +1401,7 @@ int main(int argc, char **argv)
         hit.captured   = pointer_locked || capture_forced;
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
+        drop_pump(&drop);
         if (daemon_fd >= 0 && out_flush(daemon_fd) < 0) running = 0;
 
         pads_poll(pads, daemon_fd,
@@ -1399,6 +1615,7 @@ int main(int argc, char **argv)
     free(parked);
     free(clip_last);
     free(g_out.p);
+    drop_reset(&drop);
     pads_close(pads);
     SDL_Quit();
     if (daemon_fd >= 0) close(daemon_fd);

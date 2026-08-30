@@ -15,6 +15,17 @@ void inject_pointer(const vypr_msg_pointer& msg);
 void inject_key(const vypr_msg_key& msg);
 void inject_text(std::uint64_t window_id, const char* utf8, std::uint32_t bytes);
 void focus_window(std::uint64_t window_id);
+
+/*
+ * A point on the captured surface, in screen coordinates.
+ *
+ * The host speaks in offsets into the picture it is showing, which is the
+ * window's DWM frame or, for the whole-screen view, the monitor. Anything that
+ * has to aim at a real place on the guest's desktop - a drop, in particular -
+ * needs that translated the same way pointer events are, so it lands where the
+ * user pointed. False when the target has gone.
+ */
+bool surface_to_screen(std::uint64_t window_id, int cx, int cy, long* sx, long* sy);
 void close_window(std::uint64_t window_id);
 void resize_window(const vypr_msg_resize& msg);
 

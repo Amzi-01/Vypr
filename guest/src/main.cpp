@@ -29,6 +29,7 @@
 #include "gamepad.hpp"
 #include "capture.hpp"
 #include "control.hpp"
+#include "drop.hpp"
 #include "input.hpp"
 #include "ivshmem.hpp"
 #include "publisher.hpp"
@@ -64,6 +65,7 @@ private:
     vypr::AudioCapture audio_;
     vypr::Clipboard    clipboard_;
     vypr::Gamepads     gamepads_;
+    vypr::Drop         drop_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -298,6 +300,31 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     case VYPR_MSG_CLIPBOARD:
         clipboard_.set_text(std::string(reinterpret_cast<const char*>(payload), bytes));
         break;
+
+    /*
+     * A drag lands as a run of messages on the control channel, so the state
+     * between them lives in drop_. They arrive in order on one connection,
+     * which is the only ordering this needs.
+     */
+    case VYPR_MSG_DROP_BEGIN:
+        if (auto* m = as<vypr_msg_drop_begin>(payload, bytes)) {
+            const std::uint32_t head = sizeof(*m);
+            std::uint32_t name = m->name_bytes;
+            if (name > bytes - head) name = bytes - head;
+            drop_.begin(*m, reinterpret_cast<const char*>(payload) + head, name);
+        }
+        break;
+    case VYPR_MSG_DROP_DATA:
+        if (auto* m = as<vypr_msg_drop_data>(payload, bytes)) {
+            const std::uint32_t head = sizeof(*m);
+            std::uint32_t count = m->bytes;
+            if (count > bytes - head) count = bytes - head;
+            drop_.data(payload + head, count);
+        }
+        break;
+    case VYPR_MSG_DROP_END:
+        if (auto* m = as<vypr_msg_drop_end>(payload, bytes)) drop_.end(*m);
+        break;
     case VYPR_MSG_DETACH:
         if (auto* m = as<vypr_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
         break;
@@ -521,6 +548,11 @@ bool Agent::run(const char* host, std::uint16_t port) {
     /* Not fatal when it fails: ViGEmBus may not be installed, and everything
      * except controllers works without it. */
     gamepads_.open();
+
+    /* Files dropped in an earlier session. Cleared now rather than on the way
+     * out, because an application handed a path may still have been holding it
+     * when the session ended. */
+    vypr::Drop::sweep_old();
 
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */

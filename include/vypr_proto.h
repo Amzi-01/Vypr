@@ -75,6 +75,26 @@ enum vypr_msg_type {
     VYPR_MSG_CLIPBOARD        = 75,  /* utf8 text */
     VYPR_MSG_GAMEPAD          = 76,  /* vypr_msg_gamepad */
 
+    /*
+     * A file dragged from the Linux desktop onto a streamed window.
+     *
+     * The file is copied into the guest rather than pointed at. A host path
+     * means nothing over there unless the optional shared folder happens to be
+     * mounted and the file happens to be inside it; copying always works, and
+     * what the Windows application opens is an ordinary local file.
+     *
+     * BEGIN names one file and gives its size, DATA carries it in chunks, and
+     * END performs the drop once everything has arrived. Several BEGIN/DATA
+     * runs may precede a single END - that is a drag holding several files.
+     *
+     * The chunks share the control channel with input, so they are sized to
+     * pass quickly rather than to be efficient: a keystroke waits behind at
+     * most one of them.
+     */
+    VYPR_MSG_DROP_BEGIN       = 77,  /* vypr_msg_drop_begin + utf8 file name */
+    VYPR_MSG_DROP_DATA        = 78,  /* vypr_msg_drop_data + raw file bytes */
+    VYPR_MSG_DROP_END         = 79,  /* vypr_msg_drop_end */
+
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
@@ -253,6 +273,38 @@ struct vypr_msg_pointer {
 };
 
 #define VYPR_PTR_RELATIVE        (1u << 0)  /* pointer-locked; x,y are deltas */
+
+/*
+ * Dragging a file in.
+ *
+ * The chunk size is what is left of a message once the header is paid for,
+ * rounded down to something tidy. The per-file ceiling is a guard against a
+ * mis-sized length, not a policy: a drag is a deliberate act and the file is
+ * whatever the user picked.
+ */
+#define VYPR_DROP_CHUNK      (48u * 1024u)
+#define VYPR_DROP_MAX_BYTES  (8ull * 1024ull * 1024ull * 1024ull)
+#define VYPR_DROP_MAX_FILES  256u
+
+struct vypr_msg_drop_begin {
+    uint64_t window_id;
+    uint64_t bytes;              /* size of this one file */
+    uint32_t name_bytes;         /* UTF-8 name follows; no directory part */
+    uint32_t _pad;
+};
+
+struct vypr_msg_drop_data {
+    uint64_t window_id;
+    uint32_t bytes;              /* raw file bytes follow */
+    uint32_t _pad;
+};
+
+struct vypr_msg_drop_end {
+    uint64_t window_id;
+    int32_t  x, y;               /* drop point, in captured-surface pixels */
+    uint32_t cancelled;          /* non-zero: throw away what was staged */
+    uint32_t _pad;
+};
 
 struct vypr_msg_key {
     uint64_t window_id;

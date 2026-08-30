@@ -320,6 +320,16 @@ void inject_text(std::uint64_t, const char* utf8, std::uint32_t bytes) {
     SendInput(static_cast<UINT>(batch.size()), batch.data(), sizeof(INPUT));
 }
 
+bool surface_to_screen(std::uint64_t window_id, int cx, int cy, long* sx, long* sy) {
+    HWND hwnd = to_hwnd(window_id);
+    if (!whole_desktop(window_id) && !IsWindow(hwnd)) return false;
+
+    const RECT cap = cached_capture_rect(hwnd);
+    if (sx) *sx = cap.left + cx;
+    if (sy) *sy = cap.top  + cy;
+    return true;
+}
+
 void focus_window(std::uint64_t window_id) {
     HWND hwnd = to_hwnd(window_id);
     if (!IsWindow(hwnd)) return;

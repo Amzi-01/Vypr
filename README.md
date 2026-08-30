@@ -80,9 +80,11 @@ choice is what most of this table comes down to.
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
 | Microphone into the guest | ✅ | ✅ | ✅ *no extra software* |
 | Clipboard sharing | ✅ | ✅ | ✅ *text only* |
+| Dragging a Linux file onto a Windows app | ❌ | ❌ | ✅ **copied in and dropped on the app** |
 | A folder from Linux, inside Windows | ✅ | ✅ | ✅ *virtiofs, opt-in* |
 | Finds your apps for you | ✅ | ✅ | ✅ *desktop shortcuts, `vypr detect`* |
 | Fullscreen, minimise and window buttons | ✅ | ✅ | ✅ |
+| Seeing the guest's whole screen when something is wrong | ✅ | ✅ | ✅ *`vypr --debug desktop`* |
 | Setup effort | guided | guided | two installers, plus passthrough |
 
 **Where Vypr wins, it wins on what it was built for.** RDP's video path was
@@ -188,6 +190,11 @@ something during that minute cancels it.
 - Controllers, presented to Windows as real XInput devices
 - Your microphone and speakers, as ordinary Windows devices
 - Clipboard text, shared both ways
+- Dragging a file from the Linux desktop straight onto a Windows application —
+  a `.psd` onto Photoshop, an installer or a `.exe` onto Explorer, a save file
+  onto a game's launcher. The file is copied into the guest and dropped on
+  whatever is under the pointer, so the application opens an ordinary local
+  file rather than a path it cannot reach
 - A folder from this machine, mounted in Windows as a drive
 - Finding what is on the guest's desktop and offering to add it
 - Streaming the guest's whole screen, for debugging
@@ -209,6 +216,11 @@ something during that minute cancels it.
 - **Two apps at once** works, but a second app restarts the session briefly.
 - **Clipboard is text only.** Images and file lists need a format negotiation
   the protocol does not have.
+- **Dragging goes one way, and files only.** A file dragged from Linux lands in
+  the Windows application; dragging back out is not implemented, and neither is
+  dragging a folder. Double-clicking a `.psd` in your Linux file manager does
+  not open it in the guest either — drag it onto the running application
+  instead.
 
 ## Digging deeper
 
