@@ -2,4 +2,4 @@
 # Run a command in the RDPWindows guest over the dedicated build-loop key.
 exec ssh -i "$HOME/.ssh/vypr-guest" \
     -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
-    -o ConnectTimeout=10 Lucy@192.168.122.58 "$@"
+    -o ConnectTimeout=10 Lucy@192.168.122.184 "$@"

@@ -1,4 +1,6 @@
 #include "capture.hpp"
+
+#include "vypr_proto.h"
 #include "geometry.hpp"
 #include "publisher.hpp"
 
@@ -366,7 +368,12 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
 
     TRACE("entered start");
     HWND hwnd = static_cast<HWND>(hwnd_raw);
-    if (!IsWindow(hwnd)) return false;
+
+    /* The whole screen rather than one window - see VYPR_DESKTOP_WINDOW_ID. */
+    const bool whole_desktop =
+        reinterpret_cast<std::uintptr_t>(hwnd_raw) == VYPR_DESKTOP_WINDOW_ID;
+
+    if (!whole_desktop && !IsWindow(hwnd)) return false;
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;  // required for WGC interop
 #ifdef _DEBUG
@@ -390,8 +397,19 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub) {
 
     TRACE("rt device ok");
     auto interop = get_activation_factory<GraphicsCaptureItem, ::IGraphicsCaptureItemInterop>();
-    const HRESULT hr = interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(),
-                                                put_abi(impl_->item));
+    HRESULT hr;
+    if (whole_desktop) {
+        HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        hr = interop->CreateForMonitor(mon, guid_of<GraphicsCaptureItem>(),
+                                       put_abi(impl_->item));
+        if (FAILED(hr))
+            std::fprintf(stderr, "vypr: WGC refused the monitor (0x%08lX)\n",
+                         static_cast<unsigned long>(hr));
+    } else {
+        hr = interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(),
+                                      put_abi(impl_->item));
+    }
+    if (FAILED(hr) && whole_desktop) return false;
     if (FAILED(hr)) {
         wchar_t cls[64] = {0};
         GetClassNameW(hwnd, cls, 64);

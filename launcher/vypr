@@ -6,6 +6,7 @@
 #   vypr add <app>      register a Windows application as a launchable app
 #   vypr remove <app>   undo that - task, profile, menu entry and icons
 #   vypr detect         find apps on the guest desktop and offer to add them
+#   vypr desktop        stream the guest's whole screen, for debugging
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -41,6 +42,36 @@ die() {
     notify-send --app-name="$APP_NAME" --icon=dialog-error -u critical "$APP_NAME" "$*" 2>/dev/null || true
     exit 1
 }
+# Where the guest actually is.
+#
+# A fixed address in the config is a promise the VM does not keep: change the
+# NIC's MAC - to hide the hypervisor from a game, say - and Windows sees a new
+# adapter, takes a new lease, and everything here starts timing out against an
+# address nothing answers on. libvirt already knows, so ask it.
+resolve_guest() {
+    if [ -n "${GUEST:-}" ] && [ "$GUEST" != "auto" ]; then
+        ssh -n -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o LogLevel=ERROR -o ConnectTimeout=4 "$GUEST_USER@$GUEST" \
+            'echo ok' >/dev/null 2>&1 && return 0
+    fi
+
+    local mac found
+    mac=$(virsh dumpxml "$VM" 2>/dev/null | sed -n "s/.*mac address='\([^']*\)'.*/\1/p" | head -1)
+    [ -n "$mac" ] || return 1
+
+    found=$(virsh domifaddr "$VM" 2>/dev/null | awk '/ipv4/ { split($4, a, "/"); print a[1]; exit }')
+    [ -n "$found" ] || found=$(virsh net-dhcp-leases default 2>/dev/null |
+        awk -v m="$mac" 'tolower($3) == tolower(m) { split($5, a, "/"); ip = a[1] } END { if (ip) print ip }')
+    [ -n "$found" ] || return 1
+
+    if [ "$found" != "${GUEST:-}" ]; then
+        echo "vypr: the guest is at $found now; using that"
+        GUEST="$found"
+        [ -w "$CONF" ] && sed -i "s/^GUEST=.*/GUEST=$found/" "$CONF" 2>/dev/null || true
+    fi
+    return 0
+}
+
 guest() {
     # -n so ssh does not read our stdin. Without it, any prompt after a remote
     # command finds its input already eaten - 'vypr detect' listed everything
@@ -178,8 +209,11 @@ start_vm() {
     local i
     for i in $(seq 1 60); do
         guest 'echo ok' >/dev/null 2>&1 && break
+        # Periodically re-ask libvirt, in case it came up somewhere else.
+        [ $((i % 6)) -eq 0 ] && resolve_guest >/dev/null 2>&1
         sleep 5
     done
+    resolve_guest >/dev/null 2>&1 || true
     guest 'echo ok' >/dev/null 2>&1 || die "the guest never answered - check the VM's screen"
 
     # Windows needs a logged-in session: no desktop means nothing to capture,
@@ -706,6 +740,28 @@ PS1
     done
 }
 
+# The whole guest screen, as one window. For seeing what the VM is doing when
+# nothing is matching - an installer waiting on a click, a dialog nobody
+# streamed, a desktop that never finished logging in.
+cmd_desktop() {
+    APP_NAME="Vypr Desktop"; APP_ICON="vypr"
+    local matches=("Vypr Desktop")
+
+    ensure_region
+    start_vm
+    start_daemon matches
+    start_agent
+    start_parsec
+    start_watcher
+
+    local i
+    for i in $(seq 1 24); do
+        pgrep -x vypr-window >/dev/null && { say "The guest desktop is on screen."; return 0; }
+        sleep 5
+    done
+    die "the desktop did not appear - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+}
+
 cmd_apps() {
     [ -d "$APPS" ] && ls -1 "$APPS"/*.conf 2>/dev/null | while read -r f; do
         printf '  %-16s %s\n' "$(basename "$f" .conf)" "$(sed -n 's/^NAME="\(.*\)"/\1/p' "$f")"
@@ -794,6 +850,7 @@ cmd_doctor() {
 
     echo "guest"
     if [ "$state" = "running" ]; then
+        resolve_guest >/dev/null 2>&1 || true
         if guest 'echo ok' >/dev/null 2>&1; then
             echo "  ssh           answering"
 
@@ -848,6 +905,7 @@ case "${1:-}" in
     add)    shift; cmd_add "$@" ;;
     remove) shift; cmd_remove "$@" ;;
     apps)   cmd_apps ;;
+    desktop) cmd_desktop ;;
     detect) cmd_detect ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;

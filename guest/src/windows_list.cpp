@@ -218,6 +218,36 @@ bool describe_window(void* hwnd_raw, WindowInfo* out) {
 std::vector<WindowInfo> list_windows() {
     std::vector<WindowInfo> out;
     EnumWindows(collect, reinterpret_cast<LPARAM>(&out));
+
+    /*
+     * One entry that is not a window: the primary monitor, offered under a
+     * fixed handle so it can be matched and attached like anything else.
+     *
+     * Streaming a window shows that window. Seeing what the VM is actually
+     * doing - a dialog nobody matched, an installer waiting on a click, a
+     * desktop with nothing on it - needs the whole screen, and WGC will
+     * capture a monitor as readily as a window. Nothing else in the protocol
+     * has to know that this one is different.
+     */
+    if (HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(mon, &mi)) {
+            WindowInfo desk{};
+            desk.title              = "Vypr Desktop";
+            desk.desc.window_id     = VYPR_DESKTOP_WINDOW_ID;
+            desk.desc.owner_id      = 0;
+            desk.desc.x             = mi.rcMonitor.left;
+            desk.desc.y             = mi.rcMonitor.top;
+            desk.desc.width         = static_cast<std::uint32_t>(mi.rcMonitor.right - mi.rcMonitor.left);
+            desk.desc.height        = static_cast<std::uint32_t>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            desk.desc.dpi           = 96;
+            desk.desc.pid           = 0;
+            desk.desc.flags         = 0;
+            desk.desc.chrome_top    = 0;   /* no title bar to drag; it is a screen */
+            out.push_back(std::move(desk));
+        }
+    }
     return out;
 }
 

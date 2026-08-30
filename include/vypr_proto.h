@@ -180,6 +180,16 @@ struct vypr_msg_window_id {
  * dialogs tractable: each is its own HWND and so its own stream, and the host
  * needs to know which window to position it against. Zero means top level.
  */
+/*
+ * The primary monitor, offered as though it were a window.
+ *
+ * Chosen well outside the range Windows hands out for real HWNDs, so it cannot
+ * collide with one. Everything downstream - matching, attaching, slots, input -
+ * treats it exactly like any other window; only the agent's capture knows the
+ * difference.
+ */
+#define VYPR_DESKTOP_WINDOW_ID  0xD35C709Full
+
 struct vypr_msg_window {
     uint64_t window_id;
     uint64_t owner_id;
