@@ -40,11 +40,30 @@
 #define VYPR_FMT_BGRA8      1u
 
 enum vypr_slot_state {
-    VYPR_SLOT_FREE   = 0,  /* host may allocate it */
-    VYPR_SLOT_ARMED  = 1,  /* host allocated, guest has not published yet */
-    VYPR_SLOT_LIVE   = 2,  /* guest is publishing frames */
-    VYPR_SLOT_CLOSED = 3   /* guest window is gone; host reclaims */
+    VYPR_SLOT_FREE     = 0,  /* host may allocate it */
+    VYPR_SLOT_ARMED    = 1,  /* host allocated, guest has not published yet */
+    VYPR_SLOT_LIVE     = 2,  /* guest is publishing frames */
+    VYPR_SLOT_CLOSED   = 3,  /* guest window is gone; host reclaims */
+    VYPR_SLOT_RETIRING = 4   /* host dropped the window, waiting for the guest */
 };
+
+/*
+ * RETIRING is the handshake that lets shared memory be reused.
+ *
+ * A publisher writes a whole frame into the ring *before* it publishes it, so
+ * "the host stopped asking for this window" is not the same as "nothing is
+ * writing to it": a 4K copy in flight lands wherever the ring used to be, long
+ * after the host decided the window was gone. Handing that range to a new
+ * window right then is how one window's pixels turn up in another's.
+ *
+ * So the host stores RETIRING instead of FREE and waits. The guest tears the
+ * capture down, which drains any copy in flight, and only then stores CLOSED -
+ * that store is the acknowledgement, and the range is not reusable until it
+ * lands. A slot never goes ARMED again straight from RETIRING.
+ *
+ * An old guest never writes 4 and never reads a state it did not expect, so
+ * adding this state does not break one; the layout is unchanged.
+ */
 
 /*
  * Publish record. The guest writes pixels into ring buffer `index`, then

@@ -7,12 +7,80 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ACQUIRE(p)      __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define RELEASE(p, v)   __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/*
+ * Return a range to the pool, joined to whatever it touches.
+ *
+ * Merging matters more than it looks: windows are closed and reopened at the
+ * same size all day, and without it the region degrades into a scatter of
+ * pieces that are each individually too small to carry a 4K ring, with plenty
+ * of total space free and nothing able to use it.
+ */
+static void freed_insert(struct vypr_shm *s, uint64_t offset, uint64_t bytes)
+{
+    if (bytes == 0) return;
+
+    /* Merge repeatedly rather than once: a range that closes the gap between
+     * two others has to join both of them, not just the first one found. */
+    int merged;
+    do {
+        merged = 0;
+        for (int f = 0; f < s->freed_count; f++) {
+            if (s->freed[f].offset + s->freed[f].bytes == offset) {
+                offset = s->freed[f].offset;
+                bytes += s->freed[f].bytes;
+            } else if (offset + bytes == s->freed[f].offset) {
+                bytes += s->freed[f].bytes;
+            } else {
+                continue;
+            }
+            s->freed[f] = s->freed[--s->freed_count];
+            merged = 1;
+            break;
+        }
+    } while (merged);
+
+    /* Adjoins ground never handed out: rewind the cursor instead of keeping an
+     * entry, so the region really is back to where it started. */
+    if (offset + bytes == s->alloc_cursor) {
+        s->alloc_cursor = offset;
+        for (int f = 0; f < s->freed_count; f++) {
+            if (s->freed[f].offset + s->freed[f].bytes == s->alloc_cursor) {
+                s->alloc_cursor = s->freed[f].offset;
+                s->freed[f] = s->freed[--s->freed_count];
+                f = -1;   /* start again: the rewind may reach another range */
+            }
+        }
+        return;
+    }
+
+    if (s->freed_count < VYPR_MAX_FREE_RANGES) {
+        s->freed[s->freed_count].offset = offset;
+        s->freed[s->freed_count].bytes  = bytes;
+        s->freed_count++;
+        return;
+    }
+
+    /* Nowhere left to record it. Losing the region is bad; losing track of it
+     * while a window is using it would be worse, so the range is simply gone. */
+    s->lost_bytes += bytes;
+    fprintf(stderr, "vypr: free list full, %.1f MiB of region dropped\n",
+            bytes / 1048576.0);
+}
 
 int vypr_shm_open(struct vypr_shm *s, const char *path, int format)
 {
@@ -104,14 +172,17 @@ int vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
     uint64_t frame_bytes = align_up(stride * max_h, VYPR_DATA_ALIGN);
     uint64_t need        = frame_bytes * VYPR_RING_FRAMES;
 
-    /* Reuse a range a closed window gave back before taking new ground.
-     * Without this the region is consumed at roughly 114 MiB per 4K window and
-     * a long session simply runs out - four windows opened and closed is enough
-     * to exhaust 512 MiB, after which nothing can be streamed at all. */
+    /* Reuse a range a closed window gave back before taking new ground. A 4K
+     * ring is about 114 MiB, so without reuse a 512 MiB region is spent after a
+     * handful of windows and nothing can be streamed at all. Only ranges the
+     * guest has finished with are on this list - see vypr_shm_free. */
     uint64_t offset = 0;
     int reused = -1;
     for (int f = 0; f < s->freed_count; f++) {
-        if (s->freed[f].bytes >= need) { reused = f; break; }
+        if (s->freed[f].bytes < need) continue;
+        /* Smallest range that fits, so a big one is left whole for a window
+         * that needs all of it. */
+        if (reused < 0 || s->freed[f].bytes < s->freed[reused].bytes) reused = f;
     }
 
     if (reused >= 0) {
@@ -127,11 +198,20 @@ int vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
         offset = s->alloc_cursor;
         s->alloc_cursor += need;
     } else {
+        uint64_t held = 0;
+        for (int f = 0; f < s->pending_count; f++) held += s->pending[f].bytes;
         fprintf(stderr,
-                "vypr: need %.1f MiB for %ux%u but only %.1f MiB unused and no "
-                "freed range big enough (%d free)\n",
+                "vypr: need %.1f MiB for %ux%u but only %.1f MiB unused, %d "
+                "freed range(s), none big enough\n",
                 need / 1048576.0, max_w, max_h,
                 (s->bytes - s->alloc_cursor) / 1048576.0, s->freed_count);
+        if (held)
+            fprintf(stderr, "vypr: %.1f MiB still waiting on the guest to let "
+                            "go of %d closed window(s)\n",
+                    held / 1048576.0, s->pending_count);
+        if (s->lost_bytes)
+            fprintf(stderr, "vypr: %.1f MiB was never recovered\n",
+                    s->lost_bytes / 1048576.0);
         return -1;
     }
 
@@ -162,47 +242,141 @@ int vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
     return 0;
 }
 
-void vypr_shm_free(struct vypr_shm *s, uint32_t slot)
+/* Hand a slot back for good and, if the range is safe, the range with it. */
+static void slot_retire(struct vypr_shm *s, uint32_t slot)
+{
+    struct vypr_slot *sl = &s->hdr->slots[slot];
+
+    /*
+     * Bump the epoch last, and only here.
+     *
+     * A publisher binds to the epoch it was given and stops for good the moment
+     * it no longer matches, so this store is what makes the slot safe to hand
+     * to another window. It cannot be done when the window is first dropped:
+     * the publisher's own "I have stopped" store is guarded by the same check,
+     * so bumping early would silence the acknowledgement being waited for.
+     */
+    RELEASE(&sl->epoch, sl->epoch + 1);
+    RELEASE(&sl->state, (uint32_t)VYPR_SLOT_FREE);
+}
+
+void vypr_shm_free(struct vypr_shm *s, uint32_t slot, enum vypr_writer writer)
 {
     if (slot >= VYPR_MAX_SLOTS) return;
     struct vypr_slot *sl = &s->hdr->slots[slot];
 
-    /*
-     * Bump the epoch before anything else.
-     *
-     * This is what makes returning the memory safe. A publisher in the guest
-     * binds to the epoch it saw and stops the moment it no longer matches, so
-     * once this store lands nothing can still be writing into that range - and
-     * the range can be handed to another window without one window's pixels
-     * turning up in another's ring.
-     */
-    RELEASE(&sl->epoch, sl->epoch + 1);
-    RELEASE(&sl->state, (uint32_t)VYPR_SLOT_FREE);
-
-    const uint64_t bytes = sl->frame_bytes * VYPR_RING_FRAMES;
-    if (bytes == 0) return;
-
-    /* Give the range back. Adjacent ranges are merged where they meet, so a
-     * window closed and reopened at the same size does not slowly shred the
-     * region into pieces too small to use. */
     const uint64_t offset = sl->ring_offset;
-    for (int f = 0; f < s->freed_count; f++) {
-        if (s->freed[f].offset + s->freed[f].bytes == offset) {
-            s->freed[f].bytes += bytes;
-            return;
-        }
-        if (offset + bytes == s->freed[f].offset) {
-            s->freed[f].offset = offset;
-            s->freed[f].bytes += bytes;
-            return;
-        }
+    const uint64_t bytes  = sl->frame_bytes * VYPR_RING_FRAMES;
+
+    /* Nothing carved means nothing to protect. */
+    if (bytes == 0) writer = VYPR_WRITER_NONE;
+
+    /*
+     * A slot already back in the pool has already given its range up. Freeing
+     * it twice would put the same range on the list twice and hand it to two
+     * windows at once - the very thing all of this exists to prevent - so stop
+     * here. Only the host ever writes FREE, so this is unambiguous.
+     */
+    const uint32_t state = ACQUIRE(&sl->state);
+    if (state == VYPR_SLOT_FREE) return;
+
+    /*
+     * Take it all back at once when nothing in the guest can be mid-frame: the
+     * ATTACH never went out, the guest refused it, or the guest has already
+     * stored CLOSED. That last case is the common one - the guest closes its
+     * own publisher the moment a window disappears, so by the time the host
+     * hears about it the acknowledgement is usually already sitting there.
+     */
+    if (writer == VYPR_WRITER_NONE || state == VYPR_SLOT_CLOSED) {
+        slot_retire(s, slot);
+        freed_insert(s, offset, bytes);
+        return;
     }
 
-    if (s->freed_count < VYPR_MAX_FREE_RANGES) {
-        s->freed[s->freed_count].offset = offset;
-        s->freed[s->freed_count].bytes  = bytes;
-        s->freed_count++;
+    /*
+     * Otherwise the guest may be part-way through a frame right now. A frame is
+     * written into the ring before it is published, so a copy that started
+     * before the detach is still landing in this range for as long as it takes
+     * to move 33 MiB - handing the range straight to a new window is precisely
+     * how one window's pixels end up in another's.
+     *
+     * So park the slot in RETIRING and wait. Nothing reads this window any
+     * more, so a late frame landing in its own ring harms nothing; what matters
+     * is that the ring stays its own until the guest says it is done with it.
+     */
+    RELEASE(&sl->state, (uint32_t)VYPR_SLOT_RETIRING);
+
+    if (s->pending_count >= VYPR_MAX_PENDING_RANGES) {
+        /* No room to remember the wait. Give the slot back and write the range
+         * off rather than reuse ground a live writer may still own. */
+        s->lost_bytes += bytes;
+        fprintf(stderr, "vypr: no room to retire slot %u; %.1f MiB written off\n",
+                slot, bytes / 1048576.0);
+        slot_retire(s, slot);
+        return;
     }
+
+    struct vypr_pending_range *p = &s->pending[s->pending_count++];
+    p->offset    = offset;
+    p->bytes     = bytes;
+    p->slot      = slot;
+    p->since_ns  = mono_ns();
+    p->forfeited = 0;
+}
+
+int vypr_shm_reap(struct vypr_shm *s)
+{
+    const uint64_t now = mono_ns();
+    int reclaimed = 0;
+
+    for (int i = 0; i < s->pending_count; ) {
+        struct vypr_pending_range *p = &s->pending[i];
+
+        /* Already written off; only a departing agent brings these back. */
+        if (p->forfeited) { i++; continue; }
+
+        if (ACQUIRE(&s->hdr->slots[p->slot].state) == VYPR_SLOT_CLOSED) {
+            /* The guest tears the capture down before storing this, which is
+             * what drains any copy in flight. The range is ours again. */
+            slot_retire(s, p->slot);
+            freed_insert(s, p->offset, p->bytes);
+            *p = s->pending[--s->pending_count];
+            reclaimed++;
+            continue;   /* the entry moved into this position needs looking at */
+        }
+
+        if (now - p->since_ns >= VYPR_RETIRE_TIMEOUT_NS) {
+            /*
+             * The guest never answered. Give the slot back so windows can still
+             * be opened - the epoch bump stops the old publisher dead - but not
+             * the range: a guest wedged mid-copy is exactly the one that would
+             * scribble into whoever got it next. It comes back if the agent
+             * ever goes away.
+             */
+            fprintf(stderr,
+                    "vypr: guest never let go of slot %u; holding %.1f MiB back\n",
+                    p->slot, p->bytes / 1048576.0);
+            slot_retire(s, p->slot);
+            p->forfeited = 1;
+            s->lost_bytes += p->bytes;
+            reclaimed++;
+        }
+        i++;
+    }
+    return reclaimed;
+}
+
+void vypr_shm_reap_all(struct vypr_shm *s)
+{
+    /* The agent is gone, so every publisher went with it and no store can land
+     * in the region any more. Even ranges given up on above are safe now. */
+    for (int i = 0; i < s->pending_count; i++) {
+        struct vypr_pending_range *p = &s->pending[i];
+        if (p->forfeited) s->lost_bytes -= p->bytes;
+        else              slot_retire(s, p->slot);
+        freed_insert(s, p->offset, p->bytes);
+    }
+    s->pending_count = 0;
 }
 
 uint32_t vypr_slot_state(struct vypr_shm *s, uint32_t slot)

@@ -12,7 +12,33 @@ struct vypr_free_range {
     uint64_t bytes;
 };
 
-#define VYPR_MAX_FREE_RANGES 64
+/*
+ * A range whose window is gone but whose writer might not be.
+ *
+ * It is not reusable yet - see VYPR_SLOT_RETIRING in vypr_shm.h for why the
+ * guest has to say so first.
+ */
+struct vypr_pending_range {
+    uint64_t offset;
+    uint64_t bytes;
+    uint32_t slot;
+    uint64_t since_ns;    /* when the wait started, for the give-up deadline */
+    int      forfeited;   /* waited too long: slot recycled, range held back */
+};
+
+#define VYPR_MAX_FREE_RANGES    64
+#define VYPR_MAX_PENDING_RANGES 64
+
+/* How long to wait for the guest's acknowledgement before giving up on a
+ * range. A guest that is answering at all acknowledges within a round trip;
+ * this is long enough that only a wedged one hits it. */
+#define VYPR_RETIRE_TIMEOUT_NS (2000ull * 1000000ull)
+
+/* Whether anything in the guest could still be writing into a slot's ring. */
+enum vypr_writer {
+    VYPR_WRITER_NONE  = 0,  /* the guest was never told to attach, or refused */
+    VYPR_WRITER_MAYBE = 1   /* ATTACH went out; wait for the guest to finish */
+};
 
 struct vypr_shm {
     int       fd;
@@ -23,6 +49,11 @@ struct vypr_shm {
 
     struct vypr_free_range freed[VYPR_MAX_FREE_RANGES];
     int                    freed_count;
+
+    struct vypr_pending_range pending[VYPR_MAX_PENDING_RANGES];
+    int                       pending_count;
+
+    uint64_t lost_bytes;      /* forfeited or spilled, for the failure message */
 };
 
 /* A borrowed view of the newest frame. Valid until the next acquire on the same
@@ -44,7 +75,21 @@ void vypr_shm_close(struct vypr_shm *s);
  * attach message to hand the guest. Returns 0, or -1 if the region is full. */
 int  vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
                     uint32_t max_w, uint32_t max_h, struct vypr_msg_attach *out);
-void vypr_shm_free(struct vypr_shm *s, uint32_t slot);
+
+/*
+ * Give a slot up. `writer` says whether the guest could still be writing into
+ * it: with VYPR_WRITER_MAYBE the slot goes to RETIRING and neither it nor its
+ * range comes back until vypr_shm_reap() sees the guest acknowledge.
+ */
+void vypr_shm_free(struct vypr_shm *s, uint32_t slot, enum vypr_writer writer);
+
+/* Collect ranges whose guest has acknowledged. Call it from the event loop;
+ * returns how many slots came back. */
+int  vypr_shm_reap(struct vypr_shm *s);
+
+/* The agent is gone, so nothing in the guest can be writing: take everything
+ * back at once, including ranges an earlier reap had given up on. */
+void vypr_shm_reap_all(struct vypr_shm *s);
 
 /* 0 on success, -1 if the slot is not live, -2 if no new frame since `since`. */
 int  vypr_shm_acquire(struct vypr_shm *s, uint32_t slot, uint32_t since,

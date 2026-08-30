@@ -1331,9 +1331,13 @@ int main(int argc, char **argv)
                     last_frame_ms = SDL_GetTicks();
                     stall_reported = false;
                 }
-            } else if (rc == -1 && !v->is_popup &&
-                       vypr_slot_state(&shm, v->slot) == VYPR_SLOT_CLOSED) {
-                running = 0;
+            } else if (rc == -1 && !v->is_popup) {
+                /* CLOSED is the guest saying the window went away; RETIRING is
+                 * the daemon having dropped it and waiting on the guest. Either
+                 * way there is nothing left to show. */
+                const uint32_t st = vypr_slot_state(&shm, v->slot);
+                if (st == VYPR_SLOT_CLOSED || st == VYPR_SLOT_RETIRING)
+                    running = 0;
             }
 
             presenter_present(v->pres);

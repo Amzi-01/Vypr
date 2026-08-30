@@ -106,7 +106,14 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
 
 void Publisher::close() {
     if (!slot_) return;
-    store_release(slot_->state, VYPR_SLOT_CLOSED);
+
+    // This store is what the host waits for before reusing the ring: the caller
+    // has already torn the capture down, so it means "nothing here is writing
+    // any more". Say it only while the slot is still ours - if the host gave up
+    // waiting and handed the slot to another window, the epoch has moved on and
+    // storing CLOSED now would kill that window instead.
+    if (load_acquire(slot_->epoch) == epoch_)
+        store_release(slot_->state, VYPR_SLOT_CLOSED);
     slot_ = nullptr;
 }
 

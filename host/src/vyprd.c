@@ -62,6 +62,7 @@ struct window {
     uint64_t owner_id;      /* nonzero for popups */
     uint32_t slot;
     int      has_slot;
+    int      attach_sent;   /* the guest was told to attach; it may be writing */
     int      attached;
     int      is_popup;      /* presented by its owner's client, not its own */
     pid_t    child;
@@ -257,7 +258,12 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
         struct vypr_msg_window_id gone = { .window_id = w->id };
         msg_send(d->agent_fd, VYPR_MSG_DETACH, &gone, sizeof(gone));
     }
-    if (w->has_slot) vypr_shm_free(&d->shm, w->slot);
+    /* The allocator has to know whether the guest could still be part-way
+     * through a frame in this window's ring: if it might be, the range is held
+     * until the guest says otherwise rather than handed to the next window. */
+    if (w->has_slot)
+        vypr_shm_free(&d->shm, w->slot,
+                      w->attach_sent ? VYPR_WRITER_MAYBE : VYPR_WRITER_NONE);
     memset(w, 0, sizeof(*w));
     w->client_fd = -1;
 }
@@ -335,10 +341,10 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
     w->fullscreen = (desc->flags & VYPR_WIN_FULLSCREEN) != 0;
     w->chrome_top = desc->chrome_top;
 
-    /* Headroom, so an ordinary resize does not force a re-attach. The bump
-     * allocator never rewinds - reusing a freed range under a live writer is
-     * how one window's pixels end up in another - so each re-attach costs
-     * region permanently. */
+    /* Headroom, so an ordinary resize does not force a re-attach. A closed
+     * window's range does come back now, but only once the guest has finished
+     * with it (see VYPR_SLOT_RETIRING), so a re-attach still costs a stall and
+     * a wait. */
     uint32_t alloc_w = desc->width  + 256;
     uint32_t alloc_h = desc->height + 256;
 
@@ -353,8 +359,13 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
     w->slot = at.slot;
     w->has_slot = 1;
 
-    if (msg_send(d->agent_fd, VYPR_MSG_ATTACH, &at, sizeof(at)) < 0)
+    if (msg_send(d->agent_fd, VYPR_MSG_ATTACH, &at, sizeof(at)) < 0) {
         fprintf(stderr, "vyprd: failed to send ATTACH for '%s'\n", title);
+        return;
+    }
+    /* From here the guest may bind and start writing, and that stays true until
+     * it acknowledges the detach - ATTACH_RESULT has not even arrived yet. */
+    w->attach_sent = 1;
 }
 
 
@@ -566,6 +577,10 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (!w) break;
         if (r->status != 0) {
             fprintf(stderr, "vyprd: agent refused '%s' (status %d)\n", w->title, r->status);
+            /* It never started capturing, so nothing there can be writing and
+             * the ring can go straight back rather than waiting on a detach
+             * acknowledgement that is never coming. */
+            w->attach_sent = 0;
             window_release(d, w, 0);
             break;
         }
@@ -915,6 +930,10 @@ int main(int argc, char **argv)
             break;
         }
 
+        /* Collect the rings of windows the guest has finished with. Cheap: it
+         * reads one word per closed window and usually finds none. */
+        vypr_shm_reap(&d.shm);
+
         /* Re-align periodically: the two clocks drift, and a stale offset shows
          * up as latency slowly wandering away from the truth. */
         if (d.agent_fd >= 0) {
@@ -1057,6 +1076,10 @@ int main(int argc, char **argv)
                 msg_reader_free(&d.agent_rx);
                 for (int i = 0; i < MAX_WINDOWS; i++)
                     window_release(&d, &d.windows[i], 0);
+                /* Every publisher went with the agent, so nothing is left that
+                 * could write into the region: take all of it back now rather
+                 * than waiting for acknowledgements that cannot arrive. */
+                vypr_shm_reap_all(&d.shm);
             } else {
                 struct vypr_msg_head head;
                 const uint8_t *payload;
