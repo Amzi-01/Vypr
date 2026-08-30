@@ -214,7 +214,11 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
     result.window_id = msg.window_id;
     result.slot      = msg.slot;
 
-    if (!IsWindow(hwnd)) {
+    /* The whole screen is offered under a handle that is deliberately not a
+     * window, so it cannot be checked like one - see VYPR_DESKTOP_WINDOW_ID. */
+    const bool whole_desktop = msg.window_id == VYPR_DESKTOP_WINDOW_ID;
+
+    if (!whole_desktop && !IsWindow(hwnd)) {
         result.status = -1;
         control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
@@ -229,7 +233,7 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
      * it - otherwise a game that minimised itself on losing focus can only be
      * recovered from inside the guest, which rather defeats the point.
      */
-    if (IsIconic(hwnd)) {
+    if (!whole_desktop && IsIconic(hwnd)) {
         std::fprintf(stderr, "vypr: HWND %p is minimised; restoring it\n",
                      reinterpret_cast<void*>(hwnd));
         ShowWindow(hwnd, SW_RESTORE);

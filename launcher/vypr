@@ -6,7 +6,7 @@
 #   vypr add <app>      register a Windows application as a launchable app
 #   vypr remove <app>   undo that - task, profile, menu entry and icons
 #   vypr detect         find apps on the guest desktop and offer to add them
-#   vypr desktop        stream the guest's whole screen, for debugging
+#   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -905,7 +905,13 @@ case "${1:-}" in
     add)    shift; cmd_add "$@" ;;
     remove) shift; cmd_remove "$@" ;;
     apps)   cmd_apps ;;
-    desktop) cmd_desktop ;;
+    --debug)
+        shift
+        case "${1:-}" in
+            desktop) cmd_desktop ;;
+            *) echo "vypr: --debug takes: desktop" >&2; exit 2 ;;
+        esac
+        ;;
     detect) cmd_detect ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;

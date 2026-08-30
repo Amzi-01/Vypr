@@ -170,7 +170,7 @@ vypr add cod 'steam://rungameid/3595230' --name 'Call of Duty Modern Warfare II'
 | `vypr run <app>` | start it, bringing up the VM and session if needed |
 | `vypr add <app> <path>` | register a Windows application |
 | `vypr detect` | find apps on the guest desktop and pick which to add |
-| `vypr desktop` | stream the guest's whole screen, for when something is wrong |
+| `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
 | `vypr status` | what is currently running |
