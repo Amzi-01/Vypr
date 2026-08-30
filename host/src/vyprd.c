@@ -717,6 +717,57 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
+    /*
+     * A toast from the guest, raised on this desktop instead.
+     *
+     * notify-send rather than talking to the notification service directly:
+     * it is on every desktop that has notifications at all, it already knows
+     * how to find the session bus, and a notification is rare enough that the
+     * cost of a process is irrelevant. The child is reaped by the same
+     * waitpid loop that reaps window clients.
+     */
+    case VYPR_MSG_NOTIFY: {
+        if (bytes < sizeof(struct vypr_msg_notify)) break;
+        const struct vypr_msg_notify *n = (const void *)payload;
+
+        const uint32_t head = sizeof(*n);
+        if ((uint64_t)n->app_bytes + n->title_bytes + n->body_bytes > bytes - head)
+            break;   /* lengths that do not fit what arrived */
+
+        const char *p = (const char *)payload + head;
+        char app[128] = {0}, title[256] = {0}, body[1024] = {0};
+
+        uint32_t k = n->app_bytes;
+        if (k > sizeof(app) - 1) k = sizeof(app) - 1;
+        memcpy(app, p, k);
+        p += n->app_bytes;
+
+        k = n->title_bytes;
+        if (k > sizeof(title) - 1) k = sizeof(title) - 1;
+        memcpy(title, p, k);
+        p += n->title_bytes;
+
+        k = n->body_bytes;
+        if (k > sizeof(body) - 1) k = sizeof(body) - 1;
+        memcpy(body, p, k);
+
+        /* An app with no title still deserves a heading. */
+        const char *heading = title[0] ? title : (app[0] ? app : "Windows");
+
+        fprintf(stderr, "vyprd: notification from %s: %s\n",
+                app[0] ? app : "the guest", heading);
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("notify-send", "notify-send",
+                   "--app-name", app[0] ? app : "Vypr",
+                   "--icon", "vypr",
+                   heading, body, (char *)NULL);
+            _exit(127);
+        }
+        break;
+    }
+
     case VYPR_MSG_LOG:
         fprintf(stderr, "vyprd: agent: %.*s\n", (int)bytes, payload);
         break;

@@ -51,6 +51,17 @@ enum vypr_msg_type {
     VYPR_MSG_AUDIO_HELLO      = 11,  /* no payload */
     VYPR_MSG_POINTER_LOCK     = 9,   /* vypr_msg_pointer_lock */
 
+    /*
+     * A toast the guest raised, on its way to this desktop's own notifications.
+     *
+     * A notification is the one thing an application says that is not attached
+     * to a window: it can arrive while the app is minimised, behind something
+     * else, or not being streamed at all. Left in the guest it is invisible
+     * unless you happen to be looking at the whole screen, which rather defeats
+     * running one application as if it were native.
+     */
+    VYPR_MSG_NOTIFY           = 12,  /* vypr_msg_notify + utf8 app/title/body */
+
     /* host -> guest */
     VYPR_MSG_ATTACH           = 64,  /* vypr_msg_attach */
     VYPR_MSG_DETACH           = 65,  /* vypr_msg_window_id */
@@ -303,6 +314,18 @@ struct vypr_msg_drop_end {
     uint64_t window_id;
     int32_t  x, y;               /* drop point, in captured-surface pixels */
     uint32_t cancelled;          /* non-zero: throw away what was staged */
+    uint32_t _pad;
+};
+
+/*
+ * Three UTF-8 strings follow the header, in this order and with no separators
+ * or terminators: the application's name, the notification's title, its body.
+ * Any of them may be empty - a toast is not obliged to fill them all in.
+ */
+struct vypr_msg_notify {
+    uint32_t app_bytes;
+    uint32_t title_bytes;
+    uint32_t body_bytes;
     uint32_t _pad;
 };
 

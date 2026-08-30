@@ -30,6 +30,7 @@
 #include "capture.hpp"
 #include "control.hpp"
 #include "drop.hpp"
+#include "notify.hpp"
 #include "input.hpp"
 #include "ivshmem.hpp"
 #include "publisher.hpp"
@@ -66,6 +67,7 @@ private:
     vypr::Clipboard    clipboard_;
     vypr::Gamepads     gamepads_;
     vypr::Drop         drop_;
+    vypr::Notifications notify_;
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
@@ -554,6 +556,33 @@ bool Agent::run(const char* host, std::uint16_t port) {
      * when the session ended. */
     vypr::Drop::sweep_old();
 
+    /*
+     * Toasts, on to the host's own notifications.
+     *
+     * Sent on the control channel: they are small, rare, and there is no
+     * reason for one to overtake anything. Not fatal when it fails - Windows
+     * can refuse access, and everything else works without it.
+     */
+    notify_.start([this](const std::string& app, const std::string& title,
+                         const std::string& body) {
+        std::vector<std::uint8_t> msg(sizeof(vypr_msg_notify) +
+                                      app.size() + title.size() + body.size());
+        auto* h = reinterpret_cast<vypr_msg_notify*>(msg.data());
+        *h = {};
+        h->app_bytes   = static_cast<std::uint32_t>(app.size());
+        h->title_bytes = static_cast<std::uint32_t>(title.size());
+        h->body_bytes  = static_cast<std::uint32_t>(body.size());
+
+        std::uint8_t* p = msg.data() + sizeof(*h);
+        std::memcpy(p, app.data(),   app.size());   p += app.size();
+        std::memcpy(p, title.data(), title.size()); p += title.size();
+        std::memcpy(p, body.data(),  body.size());
+
+        if (msg.size() <= VYPR_MAX_MSG_BYTES)
+            control_.send(VYPR_MSG_NOTIFY, msg.data(),
+                          static_cast<std::uint32_t>(msg.size()));
+    });
+
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */
     clipboard_.start([this](const std::string& text) {
@@ -594,6 +623,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
     });
 
     stop_ = true;
+    notify_.stop();
     audio_.stop();
     watcher.join();
     vypr::restore_pointer_acceleration();

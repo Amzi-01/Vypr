@@ -23,6 +23,7 @@ add_executable(vypr-agent
     src/publisher.cpp
     src/clipboard.cpp
     src/drop.cpp
+    src/notify.cpp
     src/gamepad.cpp
     src/windows_list.cpp
 )
