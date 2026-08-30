@@ -128,7 +128,24 @@ void Agent::poll_pointer_lock() {
     if (GetClipCursor(&clip)) {
         const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        clipped = (clip.right - clip.left) < vw || (clip.bottom - clip.top) < vh;
+
+        /*
+         * A clip a little smaller than the screen is not an application taking
+         * the pointer. Windows keeps the cursor out of a sliver at the edge and
+         * a taskbar is enough to do it: this guest clips to 3840x2110 on a
+         * 3840x2160 desktop, permanently, and treating any shortfall as a
+         * capture put every ordinary window into relative-pointer mode for the
+         * whole session. The mouse then behaves as if it is aiming a camera -
+         * jumpy, and clicks landing wherever the cursor has drifted to - while
+         * games look fine, because relative motion is what they wanted anyway.
+         *
+         * A real capture clips to a window. Requiring a tenth of the screen to
+         * be gone separates the two, and an application that clips to nearly
+         * the whole screen hides the cursor as well, which is caught above.
+         */
+        const int cw = clip.right - clip.left;
+        const int ch = clip.bottom - clip.top;
+        clipped = (cw * 10 < vw * 9) || (ch * 10 < vh * 9);
     }
 
     const HWND fg = GetForegroundWindow();
@@ -242,6 +259,15 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
                      reinterpret_cast<void*>(hwnd));
         ShowWindow(hwnd, SW_RESTORE);
     }
+
+    /*
+     * And a window hanging off the edge of the screen produces a frame that is
+     * partly blank, for the same underlying reason: Windows does not paint what
+     * is outside the desktop. It also cannot be clicked there, because the
+     * pointer would have to be aimed at a negative screen coordinate. Both read
+     * as Vypr rendering or input being broken; neither is.
+     */
+    if (!whole_desktop) vypr::nudge_onscreen(msg.window_id);
 
     auto stream = std::make_unique<Stream>();
     stream->slot = msg.slot;

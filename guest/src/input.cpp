@@ -330,6 +330,49 @@ bool surface_to_screen(std::uint64_t window_id, int cx, int cy, long* sx, long* 
     return true;
 }
 
+void nudge_onscreen(std::uint64_t window_id) {
+    if (whole_desktop(window_id)) return;          // it is the screen
+    HWND hwnd = to_hwnd(window_id);
+    if (!IsWindow(hwnd) || IsIconic(hwnd)) return;
+
+    const RECT cap = cached_capture_rect(hwnd);
+    const LONG w = cap.right - cap.left, h = cap.bottom - cap.top;
+    if (w <= 0 || h <= 0) return;
+
+    const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const LONG vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const LONG vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw <= 0 || vh <= 0) return;
+
+    /* Bigger than the screen is a fullscreen window, not a misplaced one. */
+    if (w >= vw && h >= vh) return;
+
+    LONG x = cap.left, y = cap.top;
+    if (x < vx)            x = vx;
+    if (y < vy)            y = vy;
+    if (x + w > vx + vw)   x = vx + vw - w;
+    if (y + h > vy + vh)   y = vy + vh - h;
+    if (x == cap.left && y == cap.top) return;     // already all on screen
+
+    /* SetWindowPos moves the window, and the window is larger than the
+     * captured frame by the invisible resize border - so the difference is
+     * carried across, exactly as resize_window does. */
+    RECT outer{};
+    GetWindowRect(hwnd, &outer);
+    const LONG pad_x = cap.left - outer.left;
+    const LONG pad_y = cap.top  - outer.top;
+
+    SetWindowPos(hwnd, nullptr, static_cast<int>(x - pad_x), static_cast<int>(y - pad_y),
+                 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    std::fprintf(stderr, "vypr: moved a window on screen, %ld,%ld -> %ld,%ld\n",
+                 cap.left, cap.top, x, y);
+
+    /* The cached rectangle described where it used to be. */
+    g_cap_hwnd = nullptr;
+}
+
 void focus_window(std::uint64_t window_id) {
     HWND hwnd = to_hwnd(window_id);
     if (!IsWindow(hwnd)) return;

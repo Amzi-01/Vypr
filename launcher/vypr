@@ -1277,7 +1277,28 @@ cmd_doctor() {
             # this script and PowerShell, leaving a filter that matches nothing.
             disp=$(guest 'powershell -NoProfile -Command "@(Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution -gt 0).Count"' 2>/dev/null | tr -d '\r' | tr -cd '0-9')
             if [ -n "$disp" ] && [ "$disp" -gt 0 ]; then
-                echo "  display       $disp active"
+                # The count is not the whole story. A GPU whose display has gone
+                # away leaves Windows composing on a fallback adapter at
+                # 1024x768, which still counts as active - and every ordinary
+                # window is then a tiny image blown up on this side, with the
+                # pointer able to land only on the few positions that exist.
+                # It reads as the mouse being inaccurate and clicks missing,
+                # while a game is unaffected because it never uses that path.
+                local res w
+                res=$(guest 'powershell -NoProfile -Command "$s=Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution -gt 0 | Select-Object -First 1; Write-Output ($s.CurrentHorizontalResolution.ToString() + \"x\" + $s.CurrentVerticalResolution.ToString())"' 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+x[0-9]+$' | head -1)
+                w=${res%%x*}
+                if [ -n "$w" ] && [ "$w" -le 1280 ]; then
+                    echo "  display       $disp active, but only ${res}."
+                    echo "                That is the fallback Windows uses when the"
+                    echo "                passed-through GPU has no display to draw on."
+                    echo "                Windows will be usable and imprecise; check the"
+                    echo "                monitor or dummy plug on that GPU."
+                    bad=1
+                elif [ -n "$res" ]; then
+                    echo "  display       $disp active, $res"
+                else
+                    echo "  display       $disp active"
+                fi
             else
                 echo "  display       NONE - nothing to capture. Attach a monitor or a"
                 echo "                dummy plug to the passed-through GPU, or run"

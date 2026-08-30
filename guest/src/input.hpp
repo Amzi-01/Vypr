@@ -26,6 +26,17 @@ void focus_window(std::uint64_t window_id);
  * user pointed. False when the target has gone.
  */
 bool surface_to_screen(std::uint64_t window_id, int cx, int cy, long* sx, long* sy);
+
+/*
+ * Bring a window fully onto the guest's screen.
+ *
+ * A window hanging off an edge is streamed with that part blank, because
+ * Windows does not paint what is outside the desktop - and the same part
+ * cannot be clicked either, since a pointer aimed there works out to a
+ * negative screen coordinate that SendInput cannot express. Both look like
+ * Vypr misbehaving and neither is: the window is simply not all there.
+ */
+void nudge_onscreen(std::uint64_t window_id);
 void close_window(std::uint64_t window_id);
 void resize_window(const vypr_msg_resize& msg);
 

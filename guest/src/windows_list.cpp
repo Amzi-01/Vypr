@@ -93,12 +93,16 @@ bool is_presentable(HWND hwnd) {
      * Xaml Host', and dropping it is why asking Windows for administrator
      * approval looked like the stream had died.
      *
-     * Untitled ones are still dropped. That is what the flag is genuinely good
-     * for: the invisible XAML helper windows an application leaves lying
-     * around, which have nothing to show and no name to show it under.
+     * Only the approval prompt is let through, though, and not every titled
+     * window with the flag. Offering more windows than before means more
+     * chances for two of them to match one application and fight over the
+     * foreground - and when that happens the pointer lock releases and the
+     * mouse stops working properly, which is a far worse trade than a XAML
+     * window nobody asked to stream.
      */
     const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if ((ex & WS_EX_NOREDIRECTIONBITMAP) && GetWindowTextLengthW(hwnd) == 0)
+    if ((ex & WS_EX_NOREDIRECTIONBITMAP) &&
+        wcscmp(cls, L"Credential Dialog Xaml Host") != 0)
         return false;
 
     const RECT cap = vypr_capture_rect(hwnd);
