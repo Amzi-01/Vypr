@@ -471,6 +471,18 @@ gpu_render_node() {
     done
 }
 
+# Which way the domain is configured: a passed-through card, or a virtual
+# adapter. Asked of the domain rather than remembered in the config, so it stays
+# right when someone edits the VM by hand.
+gpu_mode() {
+    if virsh dumpxml --inactive "$VM" 2>/dev/null |
+           grep -q "<hostdev mode='subsystem' type='pci'"; then
+        printf 'passthrough'
+    else
+        printf 'single-gpu'
+    fi
+}
+
 # Where the passthrough domain is kept while the VM is running without it.
 GPU_BACKUP="${XDG_DATA_HOME:-$HOME/.local/share}/vypr/domain-passthrough.xml"
 
@@ -1489,6 +1501,13 @@ cmd_doctor() {
         grep -q "type='tablet'" <<<"$xml" \
             && { echo "  usb tablet    PRESENT - this breaks the mouse in games"; bad=1; } \
             || echo "  usb tablet    absent, as it should be"
+
+        if [ "$(gpu_mode)" = "passthrough" ]; then
+            echo "  graphics      passed-through GPU"
+        else
+            echo "  graphics      virtual GPU - applications yes, games no"
+            echo "                ('vypr --debug gpu-settings' explains this)"
+        fi
     fi
 
     echo "guest"
@@ -1515,7 +1534,12 @@ cmd_doctor() {
                 local res w
                 res=$(guest 'powershell -NoProfile -Command "$s=Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution -gt 0 | Select-Object -First 1; Write-Output ($s.CurrentHorizontalResolution.ToString() + \"x\" + $s.CurrentVerticalResolution.ToString())"' 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+x[0-9]+$' | head -1)
                 w=${res%%x*}
-                if [ -n "$w" ] && [ "$w" -le 1280 ]; then
+                if [ "$(gpu_mode)" != "passthrough" ]; then
+                    # A virtual adapter starts small and is resized from Windows'
+                    # own display settings. Reporting that as the symptom of a
+                    # missing monitor would be exactly wrong here.
+                    echo "  display       $disp active, $res on the virtual GPU"
+                elif [ -n "$w" ] && [ "$w" -le 1280 ]; then
                     echo "  display       $disp active, but only ${res}."
                     echo "                That is the fallback Windows uses when the"
                     echo "                passed-through GPU has no display to draw on."
