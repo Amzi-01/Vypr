@@ -178,43 +178,18 @@ void Agent::poll_pointer_lock() {
      * whether or not the app has hidden the cursor.
      */
     bool abs_impossible = false;
-    bool fills_screen   = false;
     if (fg) {
         const RECT cap = vypr_capture_rect(fg);
+        const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        const int cw = cap.right - cap.left;
-        const int chh = cap.bottom - cap.top;
-
-        /*
-         * Bigger than the desktop, which is the case this was written for.
-         * Merely sitting off an edge used to count too, and that was wrong: an
-         * ordinary window nudged off the left of the screen is not a window
-         * that needs relative motion, it is a window that needs moving back -
-         * which is now done when it is attached. Treating it as a capture put
-         * Notepad into mouselook.
-         */
-        abs_impossible = cw > vw || chh > vh;
-
-        /* Within a hair of the whole desktop: a borderless game, not a window. */
-        fills_screen = cw * 10 >= vw * 9 && chh * 10 >= vh * 9;
+        abs_impossible = cap.right > vx + vw || cap.bottom > vy + vh ||
+                         cap.left < vx || cap.top < vy;
     }
 
-    /*
-     * A hidden cursor only counts for something filling the screen.
-     *
-     * Windows hides the pointer while you type - it is a system setting, on by
-     * default - so Notepad hid it mid-sentence, the agent called that a
-     * capture, and the host switched to relative motion while someone was
-     * typing. What the user sees is their cursor vanish and the window stop
-     * behaving. A game that grabs the pointer is borderless and fills the
-     * screen, so requiring that costs nothing and rules out every ordinary
-     * window.
-     */
-    const bool grabbed = clipped || (hidden && fills_screen);
-
     const bool locked = streaming_fg &&
-                        (grabbed || abs_impossible || lock_state_);
+                        ((hidden || clipped) || abs_impossible || lock_state_);
 
     if (locked == lock_state_ && (!locked || fg_id == lock_window_)) {
         lock_agree_ = 0;
