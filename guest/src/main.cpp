@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -661,11 +662,39 @@ bool Agent::run(const char* host, std::uint16_t port) {
 
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */
-    clipboard_.start([this](const std::string& text) {
-        if (text.size() <= VYPR_MAX_MSG_BYTES)
-            control_.send(VYPR_MSG_CLIPBOARD, text.data(),
-                          static_cast<std::uint32_t>(text.size()));
-    });
+    clipboard_.start(
+        [this](const std::string& text) {
+            if (text.size() <= VYPR_MAX_MSG_BYTES)
+                control_.send(VYPR_MSG_CLIPBOARD, text.data(),
+                              static_cast<std::uint32_t>(text.size()));
+        },
+        /*
+         * An image goes in pieces. It shares the control channel with input, so
+         * the chunks are small enough that a keystroke waits behind one of them
+         * rather than behind a screenshot.
+         */
+        [this](const std::vector<std::uint8_t>& bmp) {
+            if (bmp.empty() || bmp.size() > VYPR_CLIP_IMAGE_MAX) return;
+
+            vypr_msg_clip_image_begin begin{};
+            begin.bytes = bmp.size();
+            if (!control_.send(VYPR_MSG_CLIP_IMAGE_BEGIN, &begin, sizeof(begin))) return;
+
+            std::vector<std::uint8_t> chunk(sizeof(vypr_msg_clip_image_data) + VYPR_DROP_CHUNK);
+            std::size_t sent = 0;
+            while (sent < bmp.size()) {
+                const std::size_t n = std::min<std::size_t>(VYPR_DROP_CHUNK, bmp.size() - sent);
+                auto* h = reinterpret_cast<vypr_msg_clip_image_data*>(chunk.data());
+                *h = {};
+                h->bytes = static_cast<std::uint32_t>(n);
+                std::memcpy(chunk.data() + sizeof(*h), bmp.data() + sent, n);
+                if (!control_.send(VYPR_MSG_CLIP_IMAGE_DATA, chunk.data(),
+                                   static_cast<std::uint32_t>(sizeof(*h) + n)))
+                    return;
+                sent += n;
+            }
+            control_.send(VYPR_MSG_CLIP_IMAGE_END, nullptr, 0);
+        });
 
     if (audio_link_.connect(host, port)) {
         audio_link_.send(VYPR_MSG_AUDIO_HELLO, nullptr, 0);

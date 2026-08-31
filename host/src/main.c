@@ -258,6 +258,43 @@ static void send_queued(uint16_t type, const void *payload, uint32_t bytes,
     if (bytes) bb_append(&g_out, payload, bytes);
 }
 
+/*
+ * Hand the clipboard image over, if anyone asks for it.
+ *
+ * SDL calls this when something on the desktop actually pastes, which is the
+ * whole point of offering data rather than setting it: an image copied in the
+ * guest and never pasted here is never read.
+ */
+static const void *clip_image_provide(void *userdata, const char *mime, size_t *size)
+{
+    (void)mime;
+    static uint8_t *held = NULL;
+    static size_t   held_bytes = 0;
+
+    char *const *path = userdata;
+    *size = 0;
+    if (!path || !*path) return NULL;
+
+    FILE *f = fopen(*path, "rb");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    const long len = ftell(f);
+    rewind(f);
+    if (len <= 0 || (uint64_t)len > VYPR_CLIP_IMAGE_MAX) { fclose(f); return NULL; }
+
+    uint8_t *buf = realloc(held, (size_t)len);
+    if (!buf) { fclose(f); return NULL; }
+    held = buf;
+
+    held_bytes = fread(held, 1, (size_t)len, f);
+    fclose(f);
+    if (held_bytes != (size_t)len) return NULL;
+
+    *size = held_bytes;
+    return held;
+}
+
 /* Returns -1 when the link is gone. */
 static int out_flush(int fd)
 {
@@ -1089,6 +1126,8 @@ int main(int argc, char **argv)
     size_t   parked_cap = 0;
     /* The last clipboard text we set or sent, to tell an echo from a change. */
     char    *clip_last = NULL;
+    /* Where the daemon left the last clipboard image, read only on a paste. */
+    char    *clip_image_path = NULL;
 
     /* Relative pointer mode, driven by the guest telling us an app has taken
      * the pointer. `suspended` is the user's override: a captured pointer must
@@ -1489,6 +1528,31 @@ int main(int argc, char **argv)
                         view_open_popup(views, &view_count, &shm,
                                         (const struct vypr_msg_client_popup *)payload,
                                         opt.backend);
+                    } else if (head.type == VYPR_MSG_CLIENT_CLIPBOARD_IMAGE) {
+                        /*
+                         * An image the guest copied, waiting in a file.
+                         *
+                         * SDL is given a callback rather than the bytes: the
+                         * clipboard is offered to the desktop and only read if
+                         * something actually pastes, so a screenshot copied and
+                         * never used costs a file on disk and nothing else.
+                         */
+                        char *path = malloc(head.bytes + 1);
+                        if (path) {
+                            memcpy(path, payload, head.bytes);
+                            path[head.bytes] = '\0';
+                            free(clip_image_path);
+                            clip_image_path = path;
+
+                            static const char *mimes[] = { "image/bmp" };
+                            if (SDL_SetClipboardData(clip_image_provide, NULL,
+                                                     &clip_image_path, mimes, 1))
+                                fprintf(stderr, "vypr: offered a clipboard image "
+                                                "to the desktop\n");
+                            else
+                                fprintf(stderr, "vypr: clipboard image refused: %s\n",
+                                        SDL_GetError());
+                        }
                     } else if (head.type == VYPR_MSG_CLIENT_CLIPBOARD) {
                         /* Remembered before setting it, so the update this
                          * causes is recognised as our own and not sent back. */
@@ -1658,6 +1722,7 @@ int main(int argc, char **argv)
     free(link.pending.p);
     free(parked);
     free(clip_last);
+    free(clip_image_path);
     free(g_out.p);
     drop_reset(&drop);
     pads_close(pads);

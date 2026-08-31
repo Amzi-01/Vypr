@@ -120,6 +120,12 @@ struct daemon {
         uint64_t at_ns;
     } pending[4];
 
+    /* A clipboard image arriving in pieces. */
+    struct {
+        uint8_t *buf;
+        size_t   len, want;
+    } clip_img;
+
     char unix_path[108];   /* sun_path is 108; anything longer truncates */
 
     struct window windows[MAX_WINDOWS];
@@ -767,6 +773,85 @@ static void on_agent_message(struct daemon *d, uint16_t type,
                    heading, body, (char *)NULL);
             _exit(127);
         }
+        break;
+    }
+
+    /*
+     * A clipboard image from the guest, assembled here and handed on as a file.
+     *
+     * The daemon has to hold the whole thing anyway to know it is complete, so
+     * it writes it once and tells a client where - which is cheaper than a
+     * second chunked protocol saying what the first one just said, and leaves
+     * the client with something it can hand straight to SDL.
+     */
+    case VYPR_MSG_CLIP_IMAGE_BEGIN: {
+        if (bytes < sizeof(struct vypr_msg_clip_image_begin)) break;
+        const struct vypr_msg_clip_image_begin *b = (const void *)payload;
+
+        free(d->clip_img.buf);
+        d->clip_img.buf = NULL;
+        d->clip_img.len = d->clip_img.want = 0;
+
+        if (b->bytes == 0 || b->bytes > VYPR_CLIP_IMAGE_MAX) break;
+        d->clip_img.buf = malloc(b->bytes);
+        if (!d->clip_img.buf) break;
+        d->clip_img.want = b->bytes;
+        break;
+    }
+
+    case VYPR_MSG_CLIP_IMAGE_DATA: {
+        if (bytes < sizeof(struct vypr_msg_clip_image_data)) break;
+        if (!d->clip_img.buf) break;
+        const struct vypr_msg_clip_image_data *h = (const void *)payload;
+
+        uint32_t n = h->bytes;
+        if (n > bytes - sizeof(*h)) n = (uint32_t)(bytes - sizeof(*h));
+        if (d->clip_img.len + n > d->clip_img.want) break;   /* more than promised */
+
+        memcpy(d->clip_img.buf + d->clip_img.len, payload + sizeof(*h), n);
+        d->clip_img.len += n;
+        break;
+    }
+
+    case VYPR_MSG_CLIP_IMAGE_END: {
+        if (!d->clip_img.buf || d->clip_img.len != d->clip_img.want) {
+            /* Short of what was promised: a partial image is not an image. */
+            free(d->clip_img.buf);
+            d->clip_img.buf = NULL;
+            d->clip_img.len = d->clip_img.want = 0;
+            break;
+        }
+
+        const char *runtime = getenv("XDG_RUNTIME_DIR");
+        char path[256];
+        snprintf(path, sizeof(path), "%s/vypr-clipboard.bmp", runtime ? runtime : "/tmp");
+
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            const size_t wrote = fwrite(d->clip_img.buf, 1, d->clip_img.len, f);
+            fclose(f);
+            if (wrote == d->clip_img.len) {
+                fprintf(stderr, "vyprd: clipboard image, %zu bytes -> %s\n",
+                        d->clip_img.len, path);
+                /* One client: the clipboard is the desktop's, not a window's. */
+                int told = 0;
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    struct window *w = &d->windows[i];
+                    if (w->id && w->client_fd >= 0) {
+                        client_send(d, w->client_fd, VYPR_MSG_CLIENT_CLIPBOARD_IMAGE,
+                                    path, (uint32_t)strlen(path));
+                        told = 1;
+                        break;
+                    }
+                }
+                if (!told)
+                    fprintf(stderr, "vyprd: no window client to hand the image to\n");
+            }
+        }
+
+        free(d->clip_img.buf);
+        d->clip_img.buf = NULL;
+        d->clip_img.len = d->clip_img.want = 0;
         break;
     }
 

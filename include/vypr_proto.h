@@ -62,6 +62,23 @@ enum vypr_msg_type {
      */
     VYPR_MSG_NOTIFY           = 12,  /* vypr_msg_notify + utf8 app/title/body */
 
+    /*
+     * An image copied in the guest, on its way to this desktop's clipboard.
+     *
+     * Chunked, because a clipboard image is nothing like a clipboard string: a
+     * screenshot of a 4K desktop is tens of megabytes and a single message
+     * holds 64 KB. Same shape as a dragged file - one BEGIN, as many DATA as
+     * it takes, one END - and for the same reason.
+     *
+     * The wire format is a BMP, which sounds old-fashioned and is exactly
+     * right here: Windows already keeps clipboard images as a DIB, and a DIB
+     * plus a fourteen-byte header is a BMP file. No encoder on either side, no
+     * quality decision to make, nothing to get wrong.
+     */
+    VYPR_MSG_CLIP_IMAGE_BEGIN = 13,  /* vypr_msg_clip_image_begin */
+    VYPR_MSG_CLIP_IMAGE_DATA  = 14,  /* vypr_msg_clip_image_data + raw bytes */
+    VYPR_MSG_CLIP_IMAGE_END   = 15,  /* no payload */
+
     /* host -> guest */
     VYPR_MSG_ATTACH           = 64,  /* vypr_msg_attach */
     VYPR_MSG_DETACH           = 65,  /* vypr_msg_window_id */
@@ -137,7 +154,18 @@ enum vypr_msg_type {
      * given the new title on its command line - which killed the agent, and
      * with it every window already on screen, to learn one string.
      */
-    VYPR_MSG_CLIENT_MATCH     = 136  /* utf8 title fragment */
+    VYPR_MSG_CLIENT_MATCH     = 136, /* utf8 title fragment */
+
+    /*
+     * Where the daemon put a clipboard image, as a path.
+     *
+     * A path rather than the bytes: the daemon has already assembled the whole
+     * image to write it, and sending it on would mean a second chunked
+     * protocol to say what the first one just said. Only one client is told -
+     * the clipboard belongs to the desktop, not to a window, and every client
+     * setting it would be the same work several times over.
+     */
+    VYPR_MSG_CLIENT_CLIPBOARD_IMAGE = 137  /* utf8 path to a BMP */
 };
 
 /*
@@ -342,6 +370,19 @@ struct vypr_msg_drop_end {
  * or terminators: the application's name, the notification's title, its body.
  * Any of them may be empty - a toast is not obliged to fill them all in.
  */
+#define VYPR_CLIP_IMAGE_MAX  (64u * 1024u * 1024u)
+
+struct vypr_msg_clip_image_begin {
+    uint64_t bytes;              /* total image bytes to follow */
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+
+struct vypr_msg_clip_image_data {
+    uint32_t bytes;              /* raw image bytes follow */
+    uint32_t _pad;
+};
+
 struct vypr_msg_notify {
     uint32_t app_bytes;
     uint32_t title_bytes;

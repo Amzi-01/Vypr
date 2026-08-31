@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace vypr {
 
@@ -18,9 +20,11 @@ public:
     Clipboard();
     ~Clipboard();
 
-    // `on_text` is called from the watcher thread whenever the guest clipboard
-    // gains text that did not come from the host.
-    bool start(std::function<void(const std::string&)> on_text);
+    // Both are called from the watcher thread when the guest clipboard gains
+    // something that did not come from the host. `on_image` receives a whole
+    // BMP file, ready to be written out as it stands.
+    bool start(std::function<void(const std::string&)> on_text,
+               std::function<void(const std::vector<std::uint8_t>&)> on_image);
     void stop();
 
     // Text from the host. Ignored if it is already what the clipboard holds,
