@@ -116,7 +116,16 @@ static void render_present(void *impl)
     SDL_RenderClear(p->ren);
     if (p->have_frame) {
         SDL_Texture *show = p->tex[(p->at + TEX_POOL - 1) % TEX_POOL];
-        if (show) SDL_RenderTexture(p->ren, show, NULL, NULL);
+        if (show) {
+            int ww = 0, wh = 0;
+            SDL_GetCurrentRenderOutputSize(p->ren, &ww, &wh);
+
+            int dx, dy, dw, dh;
+            vypr_fit_rect(ww, wh, p->tex_w, p->tex_h, &dx, &dy, &dw, &dh);
+
+            const SDL_FRect dst = { (float)dx, (float)dy, (float)dw, (float)dh };
+            SDL_RenderTexture(p->ren, show, NULL, &dst);
+        }
     }
     SDL_RenderPresent(p->ren);
 

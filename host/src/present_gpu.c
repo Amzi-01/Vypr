@@ -201,10 +201,19 @@ static void gpu_present(void *impl)
     }
 
     if (p->have_frame && p->tex) {
+        int dx, dy, dw, dh;
+        vypr_fit_rect((int)sw, (int)sh, p->src_w, p->src_h, &dx, &dy, &dw, &dh);
+
         SDL_GPUBlitInfo blit = {
-            .source      = { .texture = p->tex,  .w = p->src_w, .h = p->src_h },
-            .destination = { .texture = swap,    .w = sw,       .h = sh },
-            .load_op     = SDL_GPU_LOADOP_DONT_CARE,
+            .source      = { .texture = p->tex, .w = p->src_w, .h = p->src_h },
+            .destination = { .texture = swap,
+                             .x = (Uint32)dx, .y = (Uint32)dy,
+                             .w = (Uint32)dw, .h = (Uint32)dh },
+            /* CLEAR, not DONT_CARE: the margin either side of a fitted picture
+             * is never written by the blit, and whatever the swapchain last
+             * held would show through it. */
+            .load_op     = SDL_GPU_LOADOP_CLEAR,
+            .clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f },
             .filter      = SDL_GPU_FILTER_LINEAR,
         };
         SDL_BlitGPUTexture(cmd, &blit);

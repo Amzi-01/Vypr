@@ -23,6 +23,50 @@
 
 struct presenter;
 
+/*
+ * Where the guest's picture goes inside the host window.
+ *
+ * The two are usually the same shape, because resizing the host window asks the
+ * guest window to follow - but only usually. A guest window has a minimum size,
+ * a maximised one cannot be resized at all, and plenty of applications simply
+ * refuse the size they are given. When that happens the host window keeps the
+ * shape the user dragged it to and the guest keeps its own, and stretching one
+ * onto the other distorts the picture for as long as they disagree.
+ *
+ * So the picture is fitted rather than stretched: same aspect ratio, centred,
+ * with whatever is left over as empty margin. Distortion is always wrong;
+ * a margin is only ever temporary.
+ *
+ * Input is mapped through the same rectangle, or a click would land where the
+ * pointer is not.
+ */
+static inline void vypr_fit_rect(int win_w, int win_h,
+                                 uint32_t src_w, uint32_t src_h,
+                                 int *x, int *y, int *w, int *h)
+{
+    if (win_w <= 0 || win_h <= 0 || src_w == 0 || src_h == 0) {
+        *x = *y = 0;
+        *w = win_w > 0 ? win_w : 0;
+        *h = win_h > 0 ? win_h : 0;
+        return;
+    }
+
+    /* Compare width/height as a cross-multiplication, so this stays exact and
+     * needs no floating point. */
+    if ((int64_t)win_w * src_h > (int64_t)win_h * src_w) {
+        *h = win_h;                                       /* height-limited */
+        *w = (int)(((int64_t)win_h * src_w) / src_h);
+    } else {
+        *w = win_w;                                       /* width-limited */
+        *h = (int)(((int64_t)win_w * src_h) / src_w);
+    }
+    if (*w < 1) *w = 1;
+    if (*h < 1) *h = 1;
+
+    *x = (win_w - *w) / 2;
+    *y = (win_h - *h) / 2;
+}
+
 /* `backend` is "gpu", "render", or NULL for the default.
  *
  * `share` may name an existing presenter to borrow GPU state from. Creating a

@@ -878,13 +878,26 @@ static struct view *view_for_sdl_id(struct view *views, int count, SDL_WindowID 
 
 /* Host window pixel -> guest client-area pixel. The host window is freely
  * resizable while the guest client area is whatever the guest app decided, so
- * every pointer event has to be converted before it means anything over there. */
+ * every pointer event has to be converted before it means anything over there.
+ *
+ * Through the same rectangle the picture is drawn into, not the whole window:
+ * when the two disagree about shape the picture is centred with a margin, and
+ * mapping against the window instead would put every click a little further
+ * from the pointer the nearer it got to an edge. */
 static void to_guest_coords(int win_w, int win_h, uint32_t src_w, uint32_t src_h,
                             float hx, float hy, int32_t *gx, int32_t *gy)
 {
-    if (win_w <= 0 || win_h <= 0) { *gx = *gy = 0; return; }
-    *gx = (int32_t)(hx * (float)src_w / (float)win_w);
-    *gy = (int32_t)(hy * (float)src_h / (float)win_h);
+    if (win_w <= 0 || win_h <= 0 || src_w == 0 || src_h == 0) { *gx = *gy = 0; return; }
+
+    int fx, fy, fw, fh;
+    vypr_fit_rect(win_w, win_h, src_w, src_h, &fx, &fy, &fw, &fh);
+    if (fw <= 0 || fh <= 0) { *gx = *gy = 0; return; }
+
+    *gx = (int32_t)((hx - (float)fx) * (float)src_w / (float)fw);
+    *gy = (int32_t)((hy - (float)fy) * (float)src_h / (float)fh);
+
+    /* A pointer in the margin is outside the picture; the nearest edge is the
+     * only sensible thing it can mean. */
     if (*gx < 0) *gx = 0;
     if (*gy < 0) *gy = 0;
     if (*gx >= (int32_t)src_w) *gx = (int32_t)src_w - 1;
@@ -1194,8 +1207,15 @@ int main(int argc, char **argv)
                     if (ev.type == SDL_EVENT_MOUSE_MOTION) {
                         float sx = 1.0f, sy = 1.0f;
                         if (win_w > 0 && win_h > 0 && v->src_w && v->src_h) {
-                            sx = (float)v->src_w / (float)win_w;
-                            sy = (float)v->src_h / (float)win_h;
+                            /* The picture's scale, not the window's - they are
+                             * the same only while the shapes agree. */
+                            int fx, fy, fw, fh;
+                            vypr_fit_rect(win_w, win_h, v->src_w, v->src_h,
+                                          &fx, &fy, &fw, &fh);
+                            if (fw > 0 && fh > 0) {
+                                sx = (float)v->src_w / (float)fw;
+                                sy = (float)v->src_h / (float)fh;
+                            }
                         }
                         msg.x = (int32_t)(ev.motion.xrel * sx);
                         msg.y = (int32_t)(ev.motion.yrel * sy);
