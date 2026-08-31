@@ -124,6 +124,8 @@ struct daemon {
 
     struct window windows[MAX_WINDOWS];
 
+    /* argv entries and strdup'd runtime ones live here together; nothing frees
+     * them, because they last exactly as long as the process does. */
     const char *match[MAX_MATCH];
     int         match_count;
     int         match_all;
@@ -792,6 +794,39 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         return;
     }
 
+    /*
+     * A title to start watching for, without being restarted to learn it.
+     *
+     * The windows already open were announced before this arrived and were
+     * judged against the old list, so the agent is asked to forget what it has
+     * reported - the next sweep re-offers everything, and the new term gets its
+     * chance at windows that were passed over a moment ago.
+     */
+    if (type == VYPR_MSG_CLIENT_MATCH) {
+        if (bytes == 0 || bytes > 200) return;
+
+        char term[201];
+        memcpy(term, payload, bytes);
+        term[bytes] = 0;
+
+        for (int i = 0; i < d->match_count; i++)
+            if (!strcmp(d->match[i], term)) return;      /* already watching */
+
+        if (d->match_count >= MAX_MATCH) {
+            fprintf(stderr, "vyprd: already watching %d titles; ignoring '%s'\n",
+                    MAX_MATCH, term);
+            return;
+        }
+
+        char *kept = strdup(term);
+        if (!kept) return;
+        d->match[d->match_count++] = kept;
+        fprintf(stderr, "vyprd: now also watching for '%s'\n", kept);
+
+        if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_RESCAN, NULL, 0);
+        return;
+    }
+
     if (type == VYPR_MSG_GAMEPAD) {
         if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_GAMEPAD, payload, bytes);
         return;
@@ -893,8 +928,47 @@ static void usage(void)
           "  --launch ask the agent to start this command once it connects\n", stderr);
 }
 
+/*
+ * Hand a title to a session that is already running, and exit.
+ *
+ * This lives in the daemon rather than in the launcher because the launcher is
+ * a shell script, and the alternative was packing a message header with
+ * printf. The protocol belongs where the structs are.
+ */
+static int send_match(const char *runtime_dir, const char *term)
+{
+    const size_t len = strlen(term);
+    if (len == 0 || len > 200) {
+        fprintf(stderr, "vyprd: '%s' is not a usable title fragment\n", term);
+        return 2;
+    }
+
+    char path[108];
+    snprintf(path, sizeof(path), "%s/vypr.sock", runtime_dir ? runtime_dir : "/tmp");
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        /* No session running is not an error: the caller starts one instead. */
+        close(fd);
+        return 3;
+    }
+
+    const int rc = msg_send(fd, VYPR_MSG_CLIENT_MATCH, term, (uint32_t)len);
+    close(fd);
+    return rc < 0 ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--add-match") && i + 1 < argc)
+            return send_match(getenv("XDG_RUNTIME_DIR"), argv[i + 1]);
+
     struct daemon d = {0};
     d.shm_path   = "/dev/shm/vypr";
     d.agent_fd   = -1;

@@ -208,6 +208,8 @@ something during that minute cancels it.
 - Games, including ones that capture the mouse and read raw input
 - Audio, pinned to whatever the app is actually playing to
 - Menus, popups and dialogs, positioned against the window they belong to
+- Several applications at once, each its own window. Starting a second one does
+  not disturb the first
 - Controllers, presented to Windows as real XInput devices
 - Your microphone and speakers, as ordinary Windows devices
 - Clipboard text, shared both ways
@@ -241,7 +243,6 @@ something during that minute cancels it.
 - **The passed-through GPU needs a display** — a monitor or a dummy plug. The
   compositor has nothing to draw on otherwise, and there is nothing to capture.
   `vypr doctor` checks this.
-- **Two apps at once** works, but a second app restarts the session briefly.
 - **Clipboard is text only.** Images and file lists need a format negotiation
   the protocol does not have.
 - **Dragging goes one way, and files only.** A file dragged from Linux lands in

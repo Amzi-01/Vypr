@@ -106,6 +106,17 @@ enum vypr_msg_type {
     VYPR_MSG_DROP_DATA        = 78,  /* vypr_msg_drop_data + raw file bytes */
     VYPR_MSG_DROP_END         = 79,  /* vypr_msg_drop_end */
 
+    /*
+     * Forget which windows you have already told us about.
+     *
+     * The agent only announces a window once, which is right until the host
+     * changes its mind about what it wants. A session told to watch for a new
+     * title needs the windows that are already open re-offered against it,
+     * and the alternative - restarting the agent to make it forget - throws
+     * away every stream in flight to learn one name.
+     */
+    VYPR_MSG_RESCAN           = 80,  /* no payload */
+
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
      * clients over a unix socket and are never sent to the guest. Sharing the
@@ -117,7 +128,16 @@ enum vypr_msg_type {
     VYPR_MSG_CLIENT_GEOM      = 132, /* vypr_msg_client_geom */
     VYPR_MSG_CLIENT_STATE     = 133, /* vypr_msg_window_state */
     VYPR_MSG_CLIENT_AUDIO     = 134, /* vypr_msg_audio + interleaved float */
-    VYPR_MSG_CLIENT_CLIPBOARD = 135  /* utf8 text */
+    VYPR_MSG_CLIENT_CLIPBOARD = 135, /* utf8 text */
+
+    /*
+     * Another window title to watch for, sent to a running session.
+     *
+     * Launching a second application used to restart the daemon so it could be
+     * given the new title on its command line - which killed the agent, and
+     * with it every window already on screen, to learn one string.
+     */
+    VYPR_MSG_CLIENT_MATCH     = 136  /* utf8 title fragment */
 };
 
 /*

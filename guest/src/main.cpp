@@ -74,6 +74,7 @@ private:
     std::map<std::uint64_t, vypr::WindowInfo>           known_;
 
     std::atomic<bool> stop_{false};
+    std::atomic<bool> rescan_{false};
 
     unsigned long audio_pid_ = 0;
     void start_audio(unsigned long pid);
@@ -378,6 +379,23 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     case VYPR_MSG_DROP_END:
         if (auto* m = as<vypr_msg_drop_end>(payload, bytes)) drop_.end(*m);
         break;
+
+    /*
+     * The host has changed its mind about what it wants to see.
+     *
+     * Windows are announced once, when they appear, and judged against the
+     * titles the host was watching for at that moment. A session that has just
+     * been given a new title needs the ones already open offered again, so the
+     * record of what has been reported is dropped and the next sweep re-offers
+     * everything. Streams in flight are untouched: this only forgets what was
+     * said, not what is running.
+     */
+    case VYPR_MSG_RESCAN:
+        /* Asked for here, done on the watcher thread. known_ belongs to that
+         * thread and is not behind lock_, so clearing it from this one would be
+         * a race against the sweep that is reading it. */
+        rescan_ = true;
+        break;
     case VYPR_MSG_DETACH:
         if (auto* m = as<vypr_msg_window_id>(payload, bytes)) handle_detach(m->window_id);
         break;
@@ -455,6 +473,13 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
 // anyway to notice a resize that WGC reports but nobody sent an event for.
 void Agent::watch_windows() {
     while (!stop_) {
+        /* The host wants everything offered again - see VYPR_MSG_RESCAN. Done
+         * here, where known_ is only ever touched by this thread. */
+        if (rescan_.exchange(false)) {
+            known_.clear();
+            std::fprintf(stderr, "vypr: re-offering every window\n");
+        }
+
         auto current = vypr::list_windows();
 
         std::map<std::uint64_t, vypr::WindowInfo> now;

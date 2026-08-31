@@ -305,19 +305,23 @@ start_daemon() {
 
     # A daemon started for a different app is watching for that app's window
     # titles and will ignore this one - the window is offered and logged as
-    # 'no title match'. Restart it with both sets, so launching a second app
-    # does not silently do nothing and does not stop streaming the first.
+    # 'no title match'. It is told the new titles rather than restarted for
+    # them: a restart drops the agent, and with it every window already on
+    # screen, to learn a string. The daemon asks the guest to re-offer what is
+    # open, so a window that appeared before the title arrived still gets one.
     if pgrep -x vyprd >/dev/null; then
-        local running wanted
+        local running wanted missing term
         running=$(daemon_matches)
         wanted=$(printf '%s\n' "${_m[@]}" | sort -u)
-        if [ -n "$(comm -13 <(printf '%s\n' "$running") <(printf '%s\n' "$wanted"))" ]; then
-            say "Restarting the session to watch for $APP_NAME as well..."
-            # sed, not grep: a title can carry bytes that make grep call the
-            # stream binary and print a warning instead of the lines.
-            mapfile -t _m < <(printf '%s\n%s\n' "$running" "$wanted" | sed '/^$/d' | sort -u)
-            pkill -x vyprd
-            sleep 2
+        # sed, not grep: a title can carry bytes that make grep call the
+        # stream binary and print a warning instead of the lines.
+        missing=$(comm -13 <(printf '%s\n' "$running") <(printf '%s\n' "$wanted") | sed '/^$/d')
+        if [ -n "$missing" ]; then
+            say "Also watching for $APP_NAME..."
+            while IFS= read -r term; do
+                [ -n "$term" ] || continue
+                "$BIN/vyprd" --add-match "$term" >/dev/null 2>&1
+            done <<< "$missing"
         fi
     fi
 
