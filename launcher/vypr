@@ -471,7 +471,77 @@ gpu_render_node() {
     done
 }
 
+# Where the passthrough domain is kept while the VM is running without it.
+GPU_BACKUP="${XDG_DATA_HOME:-$HOME/.local/share}/vypr/domain-passthrough.xml"
+
+# Swap the guest between a passed-through card and a virtual adapter.
+#
+# Proven to work unaccelerated: Windows.Graphics.Capture binds to the virtio-gpu
+# adapter's WDDM device and both whole-screen and per-window capture run, so
+# everything downstream of the capture is unaffected. What it costs is speed -
+# there is no 3D driver behind that adapter, so this is for applications, not
+# for the games Vypr was built for.
+gpu_switch() {
+    local want="$1"
+
+    [ "$(virsh domstate "$VM" 2>/dev/null)" = "shut off" ] ||
+        die "the VM has to be shut down first ('vypr down')"
+
+    if [ "$want" = "passthrough" ]; then
+        [ -f "$GPU_BACKUP" ] || die "no saved passthrough domain to go back to"
+        virsh define "$GPU_BACKUP" >/dev/null 2>&1 ||
+            die "could not restore the passthrough domain"
+        say "Back to the passed-through GPU."
+        return 0
+    fi
+
+    local tmp; tmp=$(mktemp -d)
+    virsh dumpxml --inactive "$VM" > "$tmp/domain.xml"
+
+    # Keep the original, but never overwrite it with an already-converted one.
+    if grep -q "<hostdev mode='subsystem' type='pci'" "$tmp/domain.xml"; then
+        mkdir -p "$(dirname "$GPU_BACKUP")"
+        cp "$tmp/domain.xml" "$GPU_BACKUP"
+    fi
+
+    python3 - "$tmp/domain.xml" <<'ENDOFXML'
+import sys, xml.etree.ElementTree as ET
+for prefix, uri in (("qemu", "http://libvirt.org/schemas/domain/qemu/1.0"),
+                    ("lxc",  "http://libvirt.org/schemas/domain/lxc/1.0")):
+    ET.register_namespace(prefix, uri)
+
+tree = ET.parse(sys.argv[1]); root = tree.getroot()
+dev = root.find("devices")
+
+for hd in list(dev.findall("hostdev")):
+    if hd.get("type") == "pci":
+        dev.remove(hd)
+
+for v in list(dev.findall("video")):
+    dev.remove(v)
+video = ET.SubElement(dev, "video")
+model = ET.SubElement(video, "model")
+model.set("type", "virtio"); model.set("heads", "1"); model.set("primary", "yes")
+
+ET.indent(tree, space="  "); tree.write(sys.argv[1], encoding="unicode")
+ENDOFXML
+
+    virsh define "$tmp/domain.xml" >/dev/null 2>&1 ||
+        die "could not switch the domain to a virtual GPU"
+    rm -rf "$tmp"
+
+    say "The guest will use a virtual GPU. Applications will work; games will not."
+    say "'vypr --debug gpu-settings --passthrough' puts the card back."
+}
+
 cmd_gpu_settings() {
+    case "${1:-}" in
+        --single-gpu)  gpu_switch single-gpu; return ;;
+        --passthrough) gpu_switch passthrough; return ;;
+        "")            ;;
+        *) die "gpu-settings takes: --single-gpu, --passthrough" ;;
+    esac
+
     echo "host GPUs"
     local line addr name drv node vram
     while read -r line; do
@@ -571,10 +641,17 @@ cmd_gpu_settings() {
     fi
 
     echo
+    echo "Vypr can run this guest on a virtual GPU today, without the passed-through"
+    echo "card. Capture works on it and windows stream normally; what is missing is"
+    echo "acceleration, so it suits applications and not games."
+    echo
+    echo "  vypr --debug gpu-settings --single-gpu     use a virtual GPU"
+    echo "  vypr --debug gpu-settings --passthrough    give the card back"
     if [ "$guest_drv" = "not installed" ]; then
-        echo "Nothing to switch on yet: the guest needs a virtio-gpu driver with a"
-        echo "Venus-backed Vulkan ICD, and there is no upstream build of one. The"
-        echo "host side above is what Vypr would need, and it is already here."
+        echo
+        echo "Accelerating it needs a guest virtio-gpu driver with a Venus-backed"
+        echo "Vulkan ICD, and there is no upstream build of one yet. Everything the"
+        echo "host would need for that is already here."
     fi
 }
 
@@ -1561,7 +1638,7 @@ case "${1:-}" in
         shift
         case "${1:-}" in
             desktop) cmd_desktop ;;
-            gpu-settings) cmd_gpu_settings ;;
+            gpu-settings) shift; cmd_gpu_settings "$@" ;;
             *) echo "vypr: --debug takes: desktop, gpu-settings" >&2; exit 2 ;;
         esac
         ;;
