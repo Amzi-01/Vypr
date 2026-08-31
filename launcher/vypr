@@ -1243,6 +1243,28 @@ cmd_doctor() {
         fi
     fi
 
+    # Tearing on X11, which is a driver setting rather than anything Vypr can
+    # fix from inside a window.
+    #
+    # Vypr asks the compositor to stay in charge of its windows, which stops the
+    # tearing that unredirection causes. What it cannot do anything about is
+    # NVIDIA's own scanout: on X11 the driver will happily flip mid-refresh
+    # unless a composition pipeline is turned on, and then the compositor is
+    # syncing to a frame that has already been torn.
+    if [ "${XDG_SESSION_TYPE:-}" = "x11" ] && command -v nvidia-settings >/dev/null 2>&1; then
+        local metamode
+        metamode=$(nvidia-settings -q CurrentMetaMode -t 2>/dev/null | head -1 || true)
+        if [ -n "$metamode" ] && ! grep -qi "ForceFullCompositionPipeline=On\|ForceCompositionPipeline=On" <<<"$metamode"; then
+            echo "tearing"
+            echo "  X11 with no composition pipeline on the NVIDIA driver, which"
+            echo "  is the usual cause of tearing that vsync does not fix. Turn on"
+            echo "  'Force Full Composition Pipeline' for each display in"
+            echo "  nvidia-settings (X Server Display Configuration > Advanced),"
+            echo "  then save it to your X configuration."
+            echo "  Wayland does not have this problem at all."
+        fi
+    fi
+
     echo "controllers"
     if [ -x "$BIN/vypr-window" ]; then
         "$BIN/vypr-window" --list-pads 2>/dev/null | sed 's/^/  /'

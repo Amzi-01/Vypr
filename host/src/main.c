@@ -992,6 +992,30 @@ int main(int argc, char **argv)
 
     const int daemon_fd = connect_daemon(opt.sock_path, opt.window_id);
 
+    /*
+     * Leave the X11 compositor in charge of our windows.
+     *
+     * SDL sets _NET_WM_BYPASS_COMPOSITOR by default, which asks the window
+     * manager to unredirect the window and let it reach the screen directly.
+     * That is a sensible default for a game rendering its own frames: it saves
+     * a compositing pass. It is the wrong one here, because the frame we are
+     * putting up was produced somewhere else entirely and its timing has
+     * nothing to do with this display - and with the compositor stepped aside
+     * on X11 there is nothing left to align it to the refresh. The result is
+     * tearing across a window that is otherwise perfectly smooth.
+     *
+     * Both present paths already ask for vsync, and on X11 that is not enough
+     * on its own once the window has been unredirected.
+     *
+     * The hint means nothing on Wayland, where the compositor cannot be
+     * bypassed, so it is set unconditionally rather than guessing the session
+     * type before SDL has started. VYPR_X11_BYPASS_COMPOSITOR=1 restores the
+     * old behaviour for anyone who would rather have the frame of latency back
+     * and can live with the tearing.
+     */
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR,
+                getenv("VYPR_X11_BYPASS_COMPOSITOR") ? "1" : "0");
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "vypr: SDL_Init: %s\n", SDL_GetError());
         return 1;
