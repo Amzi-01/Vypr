@@ -11,6 +11,7 @@
 #   vypr open-elevation let the guest elevate without a prompt Vypr cannot answer
 #   vypr guest-notifications  turn the guest's notifications back on
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
+#   vypr --debug gpu-settings  whether this machine could run the guest on one GPU
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -425,6 +426,156 @@ cmd_run() {
         sleep 5
     done
     die "$APP_NAME did not appear within five minutes - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+}
+
+# ------------------------------------------------- the single-GPU path
+#
+# Vypr needs a second GPU because the guest draws on a card passed through with
+# VFIO. It does not have to: a guest can draw on a virtio-gpu adapter instead,
+# with the host's own GPU executing its work through virglrenderer, and
+# everything downstream of that - the capture, the shared-memory ring, the
+# window on this desktop - carries on unchanged.
+#
+# That is what this reports on. It is deliberately behind --debug and it
+# deliberately does not offer to turn anything on, because the piece that makes
+# it useful - a Windows guest driver with a Venus-backed Vulkan ICD - is not
+# upstream yet. Everything else is already here, and this says so per machine
+# rather than making anyone reconfigure a VM to find out.
+
+# Total video memory in MiB, or nothing when it cannot be told.
+gpu_vram_mib() {
+    local addr="$1" drv="$2"
+    if [ "$drv" = "nvidia" ] && command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=pci.bus_id,memory.total \
+                   --format=csv,noheader,nounits 2>/dev/null |
+            awk -F', *' -v want="${addr#0000:}" '
+                { bus = tolower($1); sub(/^0+/, "", bus);
+                  if (index(bus, tolower(want))) { print $2; exit } }'
+        return
+    fi
+    # amdgpu and i915 report it in sysfs, in bytes.
+    local f="/sys/bus/pci/devices/$addr/mem_info_vram_total"
+    [ -r "$f" ] && awk '{ printf "%d", $1 / 1048576 }' "$f"
+}
+
+# The render node is how a GPU is reached for rendering. A card bound to
+# vfio-pci has none, which is exactly what being passed through means.
+gpu_render_node() {
+    local addr="$1" node
+    for node in /dev/dri/renderD*; do
+        [ -e "$node" ] || continue
+        if [ "$(basename "$(readlink -f "/sys/class/drm/$(basename "$node")/device")")" = "$addr" ]; then
+            printf '%s' "$node"
+            return
+        fi
+    done
+}
+
+cmd_gpu_settings() {
+    echo "host GPUs"
+    local line addr name drv node vram
+    while read -r line; do
+        [ -n "$line" ] || continue
+        addr=${line%% *}
+        name=$(printf '%s' "$line" | sed -e 's/^[^ ]* //' -e 's/^[^:]*: //' \
+                                         -e 's/ *\[[0-9a-f]\{4\}:[0-9a-f]\{4\}\]//g' \
+                                         -e 's/ (rev [0-9a-f]*)//')
+        # lspci gives the chip and then the marketing name in brackets - 'GA106
+        # [GeForce RTX 3060]'. The bracketed half is the one anyone recognises.
+        [[ "$name" =~ \[(.+)\] ]] && name="${BASH_REMATCH[1]}"
+
+        drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$addr/driver" 2>/dev/null)" 2>/dev/null)
+        [ "$drv" = "." ] && drv="none"
+        node=$(gpu_render_node "$addr")
+        vram=$(gpu_vram_mib "$addr" "$drv")
+
+        printf '  %-20s %-34.34s %s\n' "${node:-(no render node)}" "$name" \
+               "${vram:+${vram} MiB  }${drv}"
+    done < <(lspci -D 2>/dev/null | grep -iE "VGA compatible controller|3D controller")
+
+    echo "this VM"
+    local xml; xml=$(virsh dumpxml --inactive "$VM" 2>/dev/null)
+    if printf '%s' "$xml" | grep -q "<hostdev mode='subsystem' type='pci'"; then
+        echo "  graphics      passed-through GPU"
+        echo "  accelerated   yes, by the card itself"
+    else
+        local model
+        model=$(printf '%s' "$xml" | sed -n "s/.*<model type='\([a-z0-9-]*\)'.*/\1/p" | head -1)
+        echo "  graphics      ${model:-virtual} adapter, no passthrough"
+        echo "  accelerated   no"
+    fi
+
+    # Everything the host needs, checked rather than assumed. All three are
+    # normally present on a desktop distribution; it is the guest that is short.
+    echo "single-GPU readiness"
+    #
+    # Every check below captures its output before matching on it. With
+    # pipefail set, `producer | grep -q` reports failure whenever grep finds
+    # its match early enough to close the pipe under the producer - the
+    # producer dies of SIGPIPE and takes the pipeline's status with it. It is
+    # racy rather than reliably wrong, which is worse: this reported
+    # 'virglrenderer built without Venus' on a machine whose virglrenderer has
+    # Venus, and only sometimes.
+    #
+    local qemu displays devices
+    qemu=$(command -v qemu-system-x86_64 2>/dev/null) || qemu=""
+    displays=$([ -n "$qemu" ] && "$qemu" -display help 2>/dev/null || true)
+    devices=$([ -n "$qemu" ] && "$qemu" -device help 2>/dev/null || true)
+
+    if grep -qx "egl-headless" <<<"$displays"; then
+        echo "  egl-headless  yes"
+    else
+        echo "  egl-headless  NO - qemu cannot render without a window"
+    fi
+    if grep -q "virtio-gpu-gl" <<<"$devices"; then
+        echo "  virtio-gpu-gl yes"
+    else
+        echo "  virtio-gpu-gl NO - qemu has no accelerated virtio GPU"
+    fi
+
+    local virgl=""
+    for virgl in /usr/lib/libvirglrenderer.so.1 /usr/lib64/libvirglrenderer.so.1 ""; do
+        [ -n "$virgl" ] && [ -e "$virgl" ] && break
+    done
+    if [ -z "$virgl" ]; then
+        echo "  virglrenderer NO - not installed"
+    elif grep -qa "venus_protocol" "$virgl" 2>/dev/null; then
+        echo "  virglrenderer yes, with Venus"
+    else
+        echo "  virglrenderer yes, but built without Venus"
+    fi
+
+    # The one that is actually missing, everywhere, today.
+    local guest_drv="unknown - the guest is not answering"
+    if resolve_guest >/dev/null 2>&1 && guest 'echo ok' >/dev/null 2>&1; then
+        local adapters
+        adapters=$(guest 'powershell -NoProfile -Command "@(Get-CimInstance Win32_VideoController | Where-Object Name -match \"VirtIO|Venus|Helios\").Count"' 2>/dev/null | tr -d '\r' || true)
+        if grep -qE '^[1-9]' <<<"$adapters"; then
+            guest_drv="present"
+        else
+            guest_drv="not installed"
+        fi
+    fi
+    echo "  guest driver  $guest_drv"
+
+    echo "settings"
+    local host_mib total_gb reserve=2 max_gb
+    host_mib=$(gpu_vram_mib "$(lspci -D 2>/dev/null | grep -iE 'VGA|3D' | head -1 | cut -d' ' -f1)" nvidia)
+    if [ -n "$host_mib" ] && [ "$host_mib" -gt 0 ]; then
+        total_gb=$(( host_mib / 1024 ))
+        max_gb=$(( total_gb > reserve ? total_gb - reserve : total_gb ))
+        [ "$max_gb" -lt 1 ] && max_gb=1
+        echo "  memory window ${GPU_MEMORY_GB:-4} GiB   (${total_gb} host, ${reserve} reserved, ${max_gb} max)"
+    else
+        echo "  memory window ${GPU_MEMORY_GB:-4} GiB   (host total unknown)"
+    fi
+
+    echo
+    if [ "$guest_drv" = "not installed" ]; then
+        echo "Nothing to switch on yet: the guest needs a virtio-gpu driver with a"
+        echo "Venus-backed Vulkan ICD, and there is no upstream build of one. The"
+        echo "host side above is what Vypr would need, and it is already here."
+    fi
 }
 
 # ----------------------------------------------------- the shared folder
@@ -1410,7 +1561,8 @@ case "${1:-}" in
         shift
         case "${1:-}" in
             desktop) cmd_desktop ;;
-            *) echo "vypr: --debug takes: desktop" >&2; exit 2 ;;
+            gpu-settings) cmd_gpu_settings ;;
+            *) echo "vypr: --debug takes: desktop, gpu-settings" >&2; exit 2 ;;
         esac
         ;;
     detect) cmd_detect ;;
