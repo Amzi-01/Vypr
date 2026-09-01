@@ -917,6 +917,15 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         return;
     }
 
+    /* An image copied on this desktop, in pieces, straight through. Nothing
+     * here needs to understand it - only the guest does. */
+    if (type == VYPR_MSG_SET_CLIP_IMAGE_BEGIN ||
+        type == VYPR_MSG_SET_CLIP_IMAGE_DATA  ||
+        type == VYPR_MSG_SET_CLIP_IMAGE_END) {
+        if (d->agent_fd >= 0) msg_send(d->agent_fd, type, payload, bytes);
+        return;
+    }
+
     if (type == VYPR_MSG_CLIPBOARD) {
         /* Straight through to the agent, and to the other clients so their
          * own idea of the clipboard does not go stale and bounce back. */

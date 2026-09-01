@@ -68,6 +68,7 @@ private:
     vypr::Clipboard    clipboard_;
     vypr::Gamepads     gamepads_;
     vypr::Drop         drop_;
+    std::vector<std::uint8_t> clip_in_;   /* a clipboard image being received */
     vypr::Notifications notify_;
 
     std::mutex                                          lock_;
@@ -391,6 +392,28 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
      * everything. Streams in flight are untouched: this only forgets what was
      * said, not what is running.
      */
+    /* An image copied on the host, arriving in pieces. */
+    case VYPR_MSG_SET_CLIP_IMAGE_BEGIN:
+        if (auto* m = as<vypr_msg_clip_image_begin>(payload, bytes)) {
+            clip_in_.clear();
+            if (m->bytes > 0 && m->bytes <= VYPR_CLIP_IMAGE_MAX)
+                clip_in_.reserve(static_cast<std::size_t>(m->bytes));
+        }
+        break;
+    case VYPR_MSG_SET_CLIP_IMAGE_DATA:
+        if (auto* m = as<vypr_msg_clip_image_data>(payload, bytes)) {
+            std::uint32_t n = m->bytes;
+            if (n > bytes - sizeof(*m)) n = static_cast<std::uint32_t>(bytes - sizeof(*m));
+            if (clip_in_.size() + n <= VYPR_CLIP_IMAGE_MAX)
+                clip_in_.insert(clip_in_.end(), payload + sizeof(*m),
+                                payload + sizeof(*m) + n);
+        }
+        break;
+    case VYPR_MSG_SET_CLIP_IMAGE_END:
+        if (!clip_in_.empty()) clipboard_.set_image(clip_in_);
+        clip_in_.clear();
+        break;
+
     case VYPR_MSG_RESCAN:
         /* Asked for here, done on the watcher thread. known_ belongs to that
          * thread and is not behind lock_, so clearing it from this one would be

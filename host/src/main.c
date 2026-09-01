@@ -258,6 +258,21 @@ static void send_queued(uint16_t type, const void *payload, uint32_t bytes,
     if (bytes) bb_append(&g_out, payload, bytes);
 }
 
+/* Enough of an image to recognise it again: its length mixed with its bytes.
+ * Not a checksum anyone should rely on, just a cheap way to tell "the thing we
+ * just put there" from "something new". */
+static uint64_t clip_image_fingerprint(const void *data, size_t bytes)
+{
+    uint64_t h = 1469598103934665603ULL ^ bytes;
+    const uint8_t *p = data;
+    const size_t step = bytes > 4096 ? bytes / 512 : 1;
+    for (size_t i = 0; i < bytes; i += step) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
 /*
  * Hand the clipboard image over, if anyone asks for it.
  *
@@ -1066,9 +1081,31 @@ int main(int argc, char **argv)
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR,
                 getenv("VYPR_X11_BYPASS_COMPOSITOR") ? "1" : "0");
 
+    /*
+     * A forced video driver that is no longer there.
+     *
+     * SDL_VIDEODRIVER pins SDL to one backend, and it outlives the session that
+     * wanted it: log out of Wayland, log in to X11, and anything inheriting
+     * that variable dies with "wayland not available" and no hint as to why.
+     * The window simply never appears, which reads as Vypr being broken.
+     *
+     * Whatever it names, the display in front of us is the one that counts, so
+     * a failed start is retried without it before giving up.
+     */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
-        fprintf(stderr, "vypr: SDL_Init: %s\n", SDL_GetError());
-        return 1;
+        const char *forced = getenv("SDL_VIDEODRIVER");
+        bool recovered = false;
+
+        if (forced && *forced) {
+            fprintf(stderr, "vypr: SDL_VIDEODRIVER=%s did not work (%s); "
+                            "trying without it\n", forced, SDL_GetError());
+            unsetenv("SDL_VIDEODRIVER");
+            recovered = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD);
+        }
+        if (!recovered) {
+            fprintf(stderr, "vypr: SDL_Init: %s\n", SDL_GetError());
+            return 1;
+        }
     }
 
     /* Start at the slot's maximum and resize down once a frame says otherwise;
@@ -1128,6 +1165,16 @@ int main(int argc, char **argv)
     char    *clip_last = NULL;
     /* Where the daemon left the last clipboard image, read only on a paste. */
     char    *clip_image_path = NULL;
+    /*
+     * The image last seen crossing in either direction, by size and content.
+     *
+     * A one-shot "this next update is ours" flag is not enough: X11 reports a
+     * clipboard change more than once, and the second report found our own
+     * offer, read it back, and sent it to the guest as though someone had
+     * copied it here. Comparing what is on the clipboard against what we last
+     * handled is what the text path already does, and for the same reason.
+     */
+    uint64_t clip_image_mark = 0;
 
     /* Relative pointer mode, driven by the guest telling us an app has taken
      * the pointer. `suspended` is the user's override: a captured pointer must
@@ -1435,6 +1482,58 @@ int main(int argc, char **argv)
 
             case SDL_EVENT_CLIPBOARD_UPDATE: {
                 if (daemon_fd < 0) break;
+
+                /*
+                 * An image copied on this desktop, on its way to the guest.
+                 *
+                 * Checked before text, for the reason the guest checks it
+                 * first too: copying a picture often leaves a caption or a
+                 * filename on the clipboard beside it, and sending that
+                 * instead would turn a copied picture into a copied word.
+                 *
+                 * Our own offer is skipped. The client that holds a clipboard
+                 * image from the guest would otherwise read it straight back
+                 * and send it where it came from, forever.
+                 */
+                {
+                    size_t img_bytes = 0;
+                    void *img = SDL_GetClipboardData("image/bmp", &img_bytes);
+                    if (img) {
+                        const uint64_t mark = clip_image_fingerprint(img, img_bytes);
+                        if (mark != clip_image_mark &&
+                            img_bytes > 0 && img_bytes <= VYPR_CLIP_IMAGE_MAX) {
+                            clip_image_mark = mark;
+                            struct vypr_msg_clip_image_begin begin = {0};
+                            begin.bytes = img_bytes;
+                            send_queued(VYPR_MSG_SET_CLIP_IMAGE_BEGIN,
+                                        &begin, sizeof(begin), false);
+
+                            uint8_t chunk[sizeof(struct vypr_msg_clip_image_data)
+                                          + VYPR_DROP_CHUNK];
+                            struct vypr_msg_clip_image_data *ch = (void *)chunk;
+                            size_t sent = 0;
+                            while (sent < img_bytes) {
+                                size_t n = img_bytes - sent;
+                                if (n > VYPR_DROP_CHUNK) n = VYPR_DROP_CHUNK;
+                                memset(ch, 0, sizeof(*ch));
+                                ch->bytes = (uint32_t)n;
+                                memcpy(chunk + sizeof(*ch), (uint8_t *)img + sent, n);
+                                send_queued(VYPR_MSG_SET_CLIP_IMAGE_DATA, chunk,
+                                            (uint32_t)(sizeof(*ch) + n), false);
+                                sent += n;
+                                /* Drain as we go: the whole image would
+                                 * otherwise sit in the outgoing queue at once. */
+                                if (out_flush(daemon_fd) < 0) { running = 0; break; }
+                            }
+                            send_queued(VYPR_MSG_SET_CLIP_IMAGE_END, NULL, 0, false);
+                            fprintf(stderr, "vypr: sent a clipboard image to the "
+                                            "guest, %zu bytes\n", img_bytes);
+                        }
+                        SDL_free(img);
+                        break;      /* an image is not also text */
+                    }
+                }
+
                 char *text = SDL_GetClipboardText();
                 if (!text) break;
                 const size_t len = strlen(text);
@@ -1543,6 +1642,26 @@ int main(int argc, char **argv)
                             path[head.bytes] = '\0';
                             free(clip_image_path);
                             clip_image_path = path;
+
+                            /* Remembered before it is offered, so the update
+                             * this causes is already recognisable as ours. */
+                            size_t got = 0;
+                            void *bytes = NULL;
+                            FILE *rf = fopen(path, "rb");
+                            if (rf) {
+                                fseek(rf, 0, SEEK_END);
+                                long n = ftell(rf);
+                                rewind(rf);
+                                if (n > 0 && (uint64_t)n <= VYPR_CLIP_IMAGE_MAX &&
+                                    (bytes = malloc((size_t)n))) {
+                                    got = fread(bytes, 1, (size_t)n, rf);
+                                }
+                                fclose(rf);
+                            }
+                            if (bytes) {
+                                clip_image_mark = clip_image_fingerprint(bytes, got);
+                                free(bytes);
+                            }
 
                             static const char *mimes[] = { "image/bmp" };
                             if (SDL_SetClipboardData(clip_image_provide, NULL,

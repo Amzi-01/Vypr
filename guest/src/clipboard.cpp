@@ -66,6 +66,7 @@ struct Clipboard::Impl {
     /* What we last sent or received, so an echo is recognised and dropped. */
     std::mutex  seen_lock;
     std::string seen;
+    bool        seen_image = false;   /* the image on the clipboard is ours */
 
     void run();
     void read_and_report();
@@ -135,6 +136,10 @@ void Clipboard::Impl::read_and_report()
      * would quietly turn a copied picture into a copied word.
      */
     if (IsClipboardFormatAvailable(CF_DIB) && !IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        {
+            std::lock_guard<std::mutex> guard(seen_lock);
+            if (seen_image) { seen_image = false; return; }   /* our own echo */
+        }
         if (!open_clipboard(hwnd)) return;
 
         std::vector<std::uint8_t> bmp;
@@ -240,6 +245,50 @@ void Clipboard::set_text(const std::string& utf8)
 
 Clipboard::Clipboard() : impl_(std::make_unique<Impl>()) {}
 Clipboard::~Clipboard() { stop(); }
+
+/*
+ * A BMP onto the clipboard, as the DIB Windows expects.
+ *
+ * The reverse of the conversion above and just as cheap: drop the fourteen-byte
+ * file header and what remains is exactly a DIB. The pixel offset in the header
+ * is honoured rather than assumed, because a file written elsewhere may carry
+ * masks or a palette this end has not accounted for.
+ */
+void Clipboard::set_image(const std::vector<std::uint8_t>& bmp)
+{
+    if (bmp.size() < 14 + sizeof(BITMAPINFOHEADER)) return;
+    if (bmp[0] != 'B' || bmp[1] != 'M') return;
+
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, bmp.data() + 10, 4);
+    if (bits < 14 || bits > bmp.size()) return;
+
+    const std::size_t dib_bytes = bmp.size() - 14;
+
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, dib_bytes);
+    if (!h) return;
+    if (void* p = GlobalLock(h)) {
+        std::memcpy(p, bmp.data() + 14, dib_bytes);
+        GlobalUnlock(h);
+    } else {
+        GlobalFree(h);
+        return;
+    }
+
+    /* Marked before the clipboard is touched, so the update this causes is
+     * already known to be ours by the time the watcher sees it. */
+    {
+        std::lock_guard<std::mutex> guard(impl_->seen_lock);
+        impl_->seen_image = true;
+    }
+
+    if (!open_clipboard(impl_->hwnd)) { GlobalFree(h); return; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_DIB, h)) GlobalFree(h);
+    CloseClipboard();
+
+    std::fprintf(stderr, "vypr: clipboard image from the host, %zu bytes\n", bmp.size());
+}
 
 bool Clipboard::start(std::function<void(const std::string&)> on_text,
                       std::function<void(const std::vector<std::uint8_t>&)> on_image)

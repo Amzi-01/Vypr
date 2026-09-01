@@ -79,6 +79,16 @@ enum vypr_msg_type {
     VYPR_MSG_CLIP_IMAGE_DATA  = 14,  /* vypr_msg_clip_image_data + raw bytes */
     VYPR_MSG_CLIP_IMAGE_END   = 15,  /* no payload */
 
+    /*
+     * The same three, going the other way: an image copied here, on its way to
+     * the guest's clipboard. Separate ids rather than reusing the ones above,
+     * because a message travelling in both directions on one link is a bounce
+     * waiting to be written by accident.
+     */
+    VYPR_MSG_SET_CLIP_IMAGE_BEGIN = 84,  /* vypr_msg_clip_image_begin */
+    VYPR_MSG_SET_CLIP_IMAGE_DATA  = 85,  /* vypr_msg_clip_image_data + bytes */
+    VYPR_MSG_SET_CLIP_IMAGE_END   = 86,  /* no payload */
+
     /* host -> guest */
     VYPR_MSG_ATTACH           = 64,  /* vypr_msg_attach */
     VYPR_MSG_DETACH           = 65,  /* vypr_msg_window_id */

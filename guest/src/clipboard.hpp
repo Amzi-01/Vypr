@@ -31,6 +31,10 @@ public:
     // so the two sides cannot bounce a value back and forth forever.
     void set_text(const std::string& utf8);
 
+    // A BMP from the host, put on the guest clipboard as a DIB. Recorded as
+    // ours first, so the change it causes is not reported straight back.
+    void set_image(const std::vector<std::uint8_t>& bmp);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
