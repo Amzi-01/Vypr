@@ -25,6 +25,7 @@
 #include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -34,6 +35,7 @@ struct options {
     const char *sock_path;   /* unix socket back to vyprd; NULL = no input path */
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
+    int         never_capture; /* refuse to capture at all, whatever the guest says */
     uint32_t    chrome_top;  /* guest title-bar height, in guest pixels */
     uint64_t    window_id;
     uint32_t    slot;
@@ -256,6 +258,77 @@ static void send_queued(uint16_t type, const void *payload, uint32_t bytes,
     struct vypr_msg_head head = { .bytes = bytes, .type = type, .flags = 0 };
     if (bb_append(&g_out, &head, sizeof head) != 0) return;
     if (bytes) bb_append(&g_out, payload, bytes);
+}
+
+/*
+ * Where a window was last time.
+ *
+ * Windows decides where its own windows go, so a streamed window opens wherever
+ * the guest felt like putting it - cascading down the screen across launches,
+ * and occasionally off the edge entirely. A native window is expected to come
+ * back where you left it, so where you left it is written down.
+ *
+ * Keyed by title, because that is the only thing about a window that is the
+ * same from one launch to the next: the handle is new every time and the slot
+ * is whatever was free.
+ */
+static void geom_path(const char *title, char *out, size_t out_bytes)
+{
+    const char *home = getenv("XDG_CONFIG_HOME");
+    char base[512];
+    if (home && *home) snprintf(base, sizeof(base), "%s/vypr/windows", home);
+    else snprintf(base, sizeof(base), "%s/.config/vypr/windows", getenv("HOME") ? getenv("HOME") : "/tmp");
+
+    /* A window title is arbitrary text and this is a filename, so anything that
+     * is not plainly a letter or a digit becomes an underscore. */
+    char key[128];
+    size_t k = 0;
+    for (const char *p = title; *p && k < sizeof(key) - 1; p++) {
+        const unsigned char c = (unsigned char)*p;
+        key[k++] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') ? (char)c : '_';
+    }
+    key[k] = 0;
+    if (k == 0) snprintf(key, sizeof(key), "window");
+
+    snprintf(out, out_bytes, "%s/%s", base, key);
+}
+
+static bool geom_load(const char *title, int *x, int *y, int *w, int *h)
+{
+    char path[700];
+    geom_path(title, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    const int got = fscanf(f, "%d %d %d %d", x, y, w, h);
+    fclose(f);
+    return got == 4 && *w > 0 && *h > 0;
+}
+
+static void geom_save(const char *title, int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+
+    char path[700];
+    geom_path(title, path, sizeof(path));
+
+    /* mkdir -p, by hand and only as deep as this needs. */
+    char dir[700];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = 0;
+        for (char *p = dir + 1; *p; p++) {
+            if (*p != '/') continue;
+            *p = 0; mkdir(dir, 0755); *p = '/';
+        }
+        mkdir(dir, 0755);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d %d %d %d\n", x, y, w, h);
+    fclose(f);
 }
 
 /* Enough of an image to recognise it again: its length mixed with its bytes.
@@ -701,6 +774,17 @@ static int parse_args(int argc, char **argv, struct options *o)
             o->chrome_top = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--capture"))    o->capture = 1;
         else if (!strcmp(argv[i], "--no-capture")) o->capture = 0;
+        /*
+         * Never take the pointer, whatever the guest says.
+         *
+         * The guest decides an application has grabbed the mouse by watching
+         * the cursor, and it is guessing: a hidden cursor and a clipped one
+         * both have innocent explanations, and most of the mouse trouble this
+         * project has had came from that guess going the wrong way in something
+         * that was never a game. An application can now say so once and be
+         * believed.
+         */
+        else if (!strcmp(argv[i], "--never-capture")) o->never_capture = 1;
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
             o->window_id = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stats"))                 o->stats = 1;
@@ -1133,6 +1217,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Back where it was left, if it has been here before. A popup is a menu and
+     * belongs where its owner puts it, so only this top-level is restored. */
+    {
+        int gx, gy, gw, gh;
+        if (geom_load(opt.title, &gx, &gy, &gw, &gh)) {
+            SDL_SetWindowSize(views[0].win, gw, gh);
+            SDL_SetWindowPosition(views[0].win, gx, gy);
+            win_w = gw;
+            win_h = gh;
+        }
+    }
+
     views[0].pres = presenter_create(views[0].win, opt.backend, NULL);
     if (!views[0].pres) { fprintf(stderr, "vypr: no usable present backend\n"); return 1; }
 
@@ -1281,7 +1377,7 @@ int main(int argc, char **argv)
                 struct vypr_msg_pointer msg = {0};
                 msg.window_id = v->window_id;
 
-                if (pointer_locked || capture_forced) {
+                if (!opt.never_capture && (pointer_locked || capture_forced)) {
                     /* Send motion, not position. The guest app is warping the
                      * cursor itself; telling it where our pointer is would add
                      * a bogus delta on top of its own warp every frame.
@@ -1374,7 +1470,9 @@ int main(int argc, char **argv)
                     ev.key.scancode == SDL_SCANCODE_M &&
                     (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_SHIFT)) {
                     capture_forced = !capture_forced;
-                    set_capture(views[0].win, pointer_locked || capture_forced, true);
+                    set_capture(views[0].win,
+                                !opt.never_capture && (pointer_locked || capture_forced),
+                                true);
 
                     /* The Ctrl and Shift presses already went to the guest, and
                      * the M never will - so release the modifiers explicitly or
@@ -1826,6 +1924,18 @@ int main(int argc, char **argv)
                 stats_at = now;
             }
         }
+    }
+
+    /* Before the windows are destroyed, not after - asking a window where it
+     * is once it has gone gets you nothing, which is exactly what the file
+     * ended up containing the first time this was written. Saved on the way out
+     * rather than on every move, because a resize drag produces a stream of
+     * events and the file would be rewritten for each pixel. */
+    if (views[0].win && !views[0].is_popup) {
+        int gx = 0, gy = 0, gw = 0, gh = 0;
+        SDL_GetWindowPosition(views[0].win, &gx, &gy);
+        SDL_GetWindowSize(views[0].win, &gw, &gh);
+        geom_save(opt.title, gx, gy, gw, gh);
     }
 
     for (int i = view_count - 1; i >= 0; i--) {

@@ -136,6 +136,9 @@ struct daemon {
     int         match_count;
     int         match_all;
     const char *launch;
+    /* How windows in this session should treat the pointer: NULL for the
+     * guest's judgement, "always" to start captured, "never" to refuse. */
+    const char *capture;
 
     /*
      * Windows the user closed.
@@ -315,6 +318,15 @@ static int spawn_client(struct daemon *d, struct window *w)
          * has taken the pointer, or when the user asks for it with
          * Ctrl+Alt+Shift+M. Guessing from "it is fullscreen" was worse than not
          * guessing. */
+        /*
+         * What this window should do with the pointer, decided before the
+         * argument list is built. Patching it afterwards by index is a thing
+         * that goes quietly wrong the next time an argument is added.
+         */
+        const char *cap_flag = "--no-capture";
+        if (d->capture && !strcmp(d->capture, "always"))     cap_flag = "--capture";
+        else if (d->capture && !strcmp(d->capture, "never")) cap_flag = "--never-capture";
+
         char *const argv[] = {
             exe,
             "--shm",       (char *)d->shm_path,
@@ -328,7 +340,7 @@ static int spawn_client(struct daemon *d, struct window *w)
              * forces it - but a captured pointer is locked in place, so while
              * it is held the window cannot be dragged and the cursor is hidden.
              * That is right for a game and wrong for everything before one. */
-            "--no-capture",
+            (char *)cap_flag,
             NULL
         };
         execv(exe, argv);
@@ -1085,6 +1097,7 @@ int main(int argc, char **argv)
             if (d.match_count < MAX_MATCH) d.match[d.match_count++] = argv[++i];
         }
         else if (!strcmp(argv[i], "--all"))  d.match_all = 1;
+        else if (!strcmp(argv[i], "--capture") && i + 1 < argc) d.capture = argv[++i];
         else if (!strcmp(argv[i], "--launch") && i + 1 < argc) d.launch = argv[++i];
         else { usage(); return 2; }
     }

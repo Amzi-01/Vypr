@@ -330,6 +330,8 @@ start_daemon() {
         [ -x "$BIN/vyprd" ] || die "$BIN/vyprd is missing - reinstall"
         local args=() m
         for m in "${_m[@]}"; do args+=(--match "$m"); done
+        # What the application said about the pointer, if it said anything.
+        [ -n "${CAPTURE:-}" ] && args+=(--capture "$CAPTURE")
         nohup "$BIN/vyprd" --shm "$SHM" "${args[@]}" \
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2
@@ -814,6 +816,11 @@ usage: vypr add <name> '<windows path to the .exe or shortcut>'
     --process <exe>    how to tell it is already running, e.g. GTAProcess
     --name <text>      the name to show in your application menu
     --elevated         run it as administrator (most games refuse this)
+    --capture MODE     always | never | auto (default). 'always' starts with the
+                       pointer captured, as a game wants; 'never' refuses to
+                       capture at all, which is right for anything that is not
+                       one - the guest decides by watching the cursor, and it is
+                       guessing
     --icon <file.png>  use this icon instead of the one in the .exe
     --icon-from <path> a Windows file to take the icon from, when the
                        thing being launched is not one (a steam:// URL)
@@ -830,6 +837,7 @@ EOF
             --process) process="$2"; shift 2 ;;
             --name)    label="$2"; shift 2 ;;
             --elevated) elevated=1; shift ;;
+            --capture) capture="${2:-}"; shift 2 ;;
             --icon)    iconfile="$2"; shift 2 ;;
             --icon-from) iconfrom="$2"; shift 2 ;;
             --no-desktop-icon) desktop_icon=0; shift ;;
@@ -866,6 +874,7 @@ EOF
         echo "NAME=\"$label\""
         echo "TASK=$task"
         [ -n "$process" ] && echo "PROCESS=\"$process\""
+        [ -n "${capture:-}" ] && [ "${capture}" != "auto" ] && echo "CAPTURE=$capture"
         printf 'MATCHES=('
         for m in "${matches[@]}"; do printf '"%s" ' "$m"; done
         echo ')'

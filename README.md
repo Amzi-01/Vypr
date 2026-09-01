@@ -161,6 +161,18 @@ register them one at a time:
 vypr add fivem 'C:\Users\You\Desktop\FiveM.lnk' --name FiveM
 ```
 
+An application can say what it wants done with the mouse, rather than leaving
+the guest to work it out by watching the cursor:
+
+```bash
+vypr add photoshop 'C:\...\Photoshop.exe' --name Photoshop --capture never
+```
+
+`--capture always` starts with the pointer captured, which is what a game wants.
+`--capture never` refuses to capture at all, which is right for everything that
+is not one — the guest decides by watching whether the cursor is hidden or
+clipped, and both have innocent explanations.
+
 That pulls the app's real icon out of the guest executable and puts it in your
 application menu and on your desktop, so you launch it like anything else.
 Steam games are registered by their URL instead of a path:
@@ -229,6 +241,7 @@ something during that minute cancels it.
 - Finding what is on the guest's desktop and offering to add it
 - Streaming the guest's whole screen, for debugging
 - Minimise, maximise, close and dragging, all acting on the guest window
+- Windows that come back where you left them, at the size you left them
 - Fullscreen, mirrored from the guest
 
 ## What does not
