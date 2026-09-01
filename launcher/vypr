@@ -420,7 +420,33 @@ cmd_run() {
         say "$APP_NAME is already running."
     else
         say "Launching $APP_NAME..."
+
+        # A steam:// launch is a request handed to Steam, and a Steam that is
+        # not running yet drops it: the URL starts Steam, Steam comes up, and
+        # the game it was asked for never appears. Blender did exactly this -
+        # steam.exe running, blender.exe nowhere, and a five-minute wait for a
+        # window that was never coming. Asking twice is the whole fix: the
+        # first request brings Steam up, the second is received by a Steam that
+        # is listening.
+        local task_args steam_first=""
+        task_args=$(guest "powershell -NoProfile -Command \"(Get-ScheduledTask -TaskName $TASK).Actions.Arguments\"" 2>/dev/null | tr -d '\r')
+        if grep -qi "steam://" <<<"$task_args"; then
+            grep -qi "steam.exe" <<<"$(guest 'tasklist /fi "imagename eq steam.exe"' 2>/dev/null || true)" ||
+                steam_first=yes
+        fi
+
         guest "schtasks /end /tn $TASK >nul 2>&1 & schtasks /run /tn $TASK" >/dev/null 2>&1
+
+        if [ -n "$steam_first" ]; then
+            say "Waiting for Steam, then asking it again..."
+            local i
+            for i in $(seq 1 30); do
+                sleep 2
+                grep -qi "steam.exe" <<<"$(guest 'tasklist /fi "imagename eq steam.exe"' 2>/dev/null || true)" && break
+            done
+            sleep 5          # Steam is up; give it a moment to accept requests
+            guest "schtasks /end /tn $TASK >nul 2>&1 & schtasks /run /tn $TASK" >/dev/null 2>&1
+        fi
     fi
 
     start_watcher
