@@ -412,6 +412,26 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
     w->fullscreen = (desc->flags & VYPR_WIN_FULLSCREEN) != 0;
     w->chrome_top = desc->chrome_top;
 
+    /*
+     * A window bigger than any real display is not a window.
+     *
+     * These numbers come from the guest, and everything below does arithmetic
+     * on them: the headroom added here wraps a uint32 for a width near its
+     * maximum, and a wrapped width asks the allocator for a ring far smaller
+     * than the window it is supposed to hold. Nothing downstream would write
+     * past it - the publish path checks the frame against the slot - but an
+     * allocation whose size came from an overflow is not something to keep and
+     * reason about later.
+     */
+    if (desc->width  == 0 || desc->width  > VYPR_MAX_DIMENSION ||
+        desc->height == 0 || desc->height > VYPR_MAX_DIMENSION) {
+        fprintf(stderr, "vyprd: refusing '%s' at %ux%u\n",
+                title, desc->width, desc->height);
+        memset(w, 0, sizeof(*w));
+        w->client_fd = -1;
+        return;
+    }
+
     /* Headroom, so an ordinary resize does not force a re-attach. A closed
      * window's range does come back now, but only once the guest has finished
      * with it (see VYPR_SLOT_RETIRING), so a re-attach still costs a stall and
@@ -558,6 +578,18 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         if (tlen > bytes - sizeof(*desc)) tlen = (uint32_t)(bytes - sizeof(*desc));
         if (tlen > sizeof(title) - 1) tlen = sizeof(title) - 1;
         memcpy(title, payload + sizeof(*desc), tlen);
+
+        /*
+         * A window title is whatever the guest wants it to be, and it is
+         * written to a log that 'vypr open' reads back to find the window an
+         * application opened. A title containing a newline would write extra
+         * lines into that log, in the log's own format, chosen by whatever is
+         * running in the VM - so control characters become spaces before this
+         * goes anywhere. UTF-8 is untouched: every byte of a multi-byte
+         * sequence has its high bit set.
+         */
+        for (char *c = title; *c; c++)
+            if ((unsigned char)*c < 0x20 || (unsigned char)*c == 0x7f) *c = ' ';
 
         if (type == VYPR_MSG_WINDOW_ADDED)
             fprintf(stderr, "vyprd: guest window '%s' %ux%u at %d,%d "
@@ -814,10 +846,13 @@ static void on_agent_message(struct daemon *d, uint16_t type,
 
         pid_t pid = fork();
         if (pid == 0) {
+            /* '--' first: the heading and body are the guest's words, and a
+             * heading beginning with a dash would otherwise be read as an
+             * option to notify-send rather than as text. */
             execlp("notify-send", "notify-send",
                    "--app-name", app[0] ? app : "Vypr",
                    "--icon", "vypr",
-                   heading, body, (char *)NULL);
+                   "--", heading, body, (char *)NULL);
             _exit(127);
         }
         break;

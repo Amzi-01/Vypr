@@ -23,6 +23,15 @@
 #define VYPR_CONTROL_PORT    47820u
 #define VYPR_MAX_MSG_BYTES   (64u * 1024u)
 
+/*
+ * The largest window edge worth believing.
+ *
+ * Well past any real display, and small enough that the arithmetic done on a
+ * window's size - headroom, stride, a ring of frames - cannot overflow on the
+ * way. Sizes arrive from the guest, so they are checked rather than trusted.
+ */
+#define VYPR_MAX_DIMENSION   32768u
+
 enum vypr_msg_type {
     /* guest -> host */
     VYPR_MSG_HELLO            = 1,   /* vypr_msg_hello */
