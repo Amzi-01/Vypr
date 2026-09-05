@@ -1226,6 +1226,20 @@ int main(int argc, char **argv)
             SDL_SetWindowPosition(views[0].win, gx, gy);
             win_w = gw;
             win_h = gh;
+
+            /*
+             * Throw away the resize event we just caused.
+             *
+             * Restoring a size raises WINDOW_RESIZED exactly as dragging an
+             * edge does, and the loop cannot tell them apart: it starts the
+             * timer that waits for a drag to finish, which suppresses adopting
+             * the size the guest is actually sending, and then asks the guest
+             * to become the restored size instead. Fullscreen an application
+             * and it comes back letterboxed inside the window it had last
+             * time, then gets pulled out of fullscreen a second later.
+             */
+            SDL_PumpEvents();
+            SDL_FlushEvent(SDL_EVENT_WINDOW_RESIZED);
         }
     }
 
