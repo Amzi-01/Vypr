@@ -976,7 +976,19 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
 
 static int listen_tcp(const char *bind_addr, uint16_t port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /*
+     * Close-on-exec, on every socket this process owns.
+     *
+     * The daemon forks and execs a window client for each guest window, and a
+     * descriptor without this is still open in that client afterwards. The
+     * listening sockets are the ones that matter: a client holding the listener
+     * keeps the address alive after the daemon has gone, so the socket file
+     * looks like a working session and connections to it are refused by a
+     * process that will never accept them. Two separate debugging sessions were
+     * spent on that before it was noticed that 'ss' listed vyprd and
+     * vypr-window sharing one fd.
+     */
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) { perror("socket"); return -1; }
 
     int one = 1;
@@ -1004,7 +1016,7 @@ static int listen_tcp(const char *bind_addr, uint16_t port)
 
 static int listen_unix(const char *path)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) { perror("socket"); return -1; }
 
     unlink(path);
@@ -1289,7 +1301,7 @@ int main(int argc, char **argv)
         }
 
         if (pfd[0].revents & POLLIN) {
-            int fd = accept(d.tcp_listen, NULL, NULL);
+            int fd = accept4(d.tcp_listen, NULL, NULL, SOCK_CLOEXEC);
             if (fd >= 0) {
                 int one = 1;
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -1309,7 +1321,7 @@ int main(int argc, char **argv)
         }
 
         if (pfd[1].revents & POLLIN) {
-            int fd = accept(d.unix_listen, NULL, NULL);
+            int fd = accept4(d.unix_listen, NULL, NULL, SOCK_CLOEXEC);
             /* Non-blocking, so a client that stops reading costs it its own
              * audio rather than stalling every other connection. */
             if (fd >= 0) {
