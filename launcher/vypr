@@ -11,6 +11,7 @@
 #   vypr open-elevation let the guest elevate without a prompt Vypr cannot answer
 #   vypr guest-notifications  turn the guest's notifications back on
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
+#   vypr --debug resolution [WxH]  what size that screen is shown at
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -332,6 +333,8 @@ start_daemon() {
         for m in "${_m[@]}"; do args+=(--match "$m"); done
         # What the application said about the pointer, if it said anything.
         [ -n "${CAPTURE:-}" ] && args+=(--capture "$CAPTURE")
+        # A fixed window size, for the whole-screen view.
+        [ -n "${DESKTOP_SIZE:-}" ] && args+=(--window-size "$DESKTOP_SIZE")
         nohup "$BIN/vyprd" --shm "$SHM" "${args[@]}" \
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2
@@ -1144,9 +1147,63 @@ PS1
 # The whole guest screen, as one window. For seeing what the VM is doing when
 # nothing is matching - an installer waiting on a click, a dialog nobody
 # streamed, a desktop that never finished logging in.
+# ------------------------------------- how big the guest's screen comes out
+#
+# The whole-screen view normally takes the guest's own size, and the guest's
+# own size is a monitor: a 4K desktop makes a 4K window, which covers one of
+# your screens entirely in order to show you one of theirs. This picks a size
+# for it instead. The picture is scaled to fit, and input is mapped through the
+# same rectangle, so clicks still land where they are pointed.
+cmd_resolution() {
+    local want="${1:-}"
+
+    if [ -z "$want" ]; then
+        if [ -n "${DESKTOP_SIZE:-}" ]; then
+            echo "vypr: the guest's screen is shown at $DESKTOP_SIZE"
+        else
+            echo "vypr: the guest's screen is shown at its own size"
+        fi
+        echo
+        echo "  vypr --debug resolution WxH    show it at that size instead"
+        echo "  vypr --debug resolution auto   go back to the guest's own size"
+        return 0
+    fi
+
+    if [ "$want" = "auto" ]; then
+        sed -i '/^DESKTOP_SIZE=/d' "$CONF" 2>/dev/null
+        say "The guest's screen will be shown at its own size again."
+        say "Reopen it with 'vypr --debug desktop'."
+        return 0
+    fi
+
+    # Checked here rather than left to the client, which would only fail after
+    # the VM had already been started.
+    if ! [[ "$want" =~ ^[0-9]+x[0-9]+$ ]]; then
+        die "a size looks like 1920x1080, not '$want'"
+    fi
+    local w=${want%x*} h=${want#*x}
+    if [ "$w" -lt 160 ] || [ "$h" -lt 120 ]; then
+        die "$want is too small to be useful"
+    fi
+
+    if grep -q "^DESKTOP_SIZE=" "$CONF" 2>/dev/null; then
+        sed -i "s/^DESKTOP_SIZE=.*/DESKTOP_SIZE=$want/" "$CONF"
+    else
+        printf '\n# The whole-screen view, scaled to fit rather than taking the guest full size.\nDESKTOP_SIZE=%s\n' "$want" >> "$CONF"
+    fi
+    say "The guest's screen will be shown at $want."
+    say "Reopen it with 'vypr --debug desktop'."
+}
+
 cmd_desktop() {
     APP_NAME="Vypr Desktop"; APP_ICON="vypr"
     local matches=("Vypr Desktop")
+
+    # The guest's screen is the size of a monitor, so a window that takes the
+    # guest's size covers one of yours entirely to show you one of theirs.
+    # DESKTOP_SIZE in the config picks a size for it instead; the picture is
+    # scaled to fit and clicks still land where they are pointed.
+    : "${DESKTOP_SIZE:=}"
 
     ensure_region
     start_vm
@@ -1499,7 +1556,8 @@ case "${1:-}" in
         shift
         case "${1:-}" in
             desktop) cmd_desktop ;;
-            *) echo "vypr: --debug takes: desktop" >&2; exit 2 ;;
+            resolution) shift; cmd_resolution "$@" ;;
+            *) echo "vypr: --debug takes: desktop, resolution" >&2; exit 2 ;;
         esac
         ;;
     detect) cmd_detect ;;

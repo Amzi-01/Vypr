@@ -36,6 +36,17 @@ struct options {
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
     int         never_capture; /* refuse to capture at all, whatever the guest says */
+    /*
+     * A window size chosen here rather than taken from the guest.
+     *
+     * A window normally adopts whatever size the guest is sending, which is
+     * right for an application - it is the size the application chose. It is
+     * wrong for the whole screen: a 4K guest desktop makes a 4K window, which
+     * covers a monitor entirely to show you a monitor. Pinning the size scales
+     * the picture down to fit instead, and input is mapped through the same
+     * rectangle so it still lands where it is pointed.
+     */
+    int         size_w, size_h;
     uint32_t    chrome_top;  /* guest title-bar height, in guest pixels */
     uint64_t    window_id;
     uint32_t    slot;
@@ -785,6 +796,13 @@ static int parse_args(int argc, char **argv, struct options *o)
          * believed.
          */
         else if (!strcmp(argv[i], "--never-capture")) o->never_capture = 1;
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &o->size_w, &o->size_h) != 2 ||
+                o->size_w < 160 || o->size_h < 120) {
+                fprintf(stderr, "vypr: --size wants WxH, at least 160x120\n");
+                return -1;
+            }
+        }
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
             o->window_id = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stats"))                 o->stats = 1;
@@ -1219,7 +1237,13 @@ int main(int argc, char **argv)
 
     /* Back where it was left, if it has been here before. A popup is a menu and
      * belongs where its owner puts it, so only this top-level is restored. */
-    {
+    if (opt.size_w && opt.size_h) {
+        SDL_SetWindowSize(views[0].win, opt.size_w, opt.size_h);
+        win_w = opt.size_w;
+        win_h = opt.size_h;
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_EVENT_WINDOW_RESIZED);
+    } else {
         int gx, gy, gw, gh;
         if (geom_load(opt.title, &gx, &gy, &gw, &gh)) {
             SDL_SetWindowSize(views[0].win, gw, gh);
@@ -1854,7 +1878,7 @@ int main(int argc, char **argv)
                     /* A popup is sized by the guest. A top-level adopts the
                      * frame size too, but not while the user is still dragging
                      * its edge - that is what made resizing judder. */
-                    if (!v->is_popup && resize_at == 0)
+                    if (!v->is_popup && resize_at == 0 && !(opt.size_w && opt.size_h))
                         SDL_SetWindowSize(v->win, (int)f.width, (int)f.height);
                 }
 

@@ -139,6 +139,9 @@ struct daemon {
     /* How windows in this session should treat the pointer: NULL for the
      * guest's judgement, "always" to start captured, "never" to refuse. */
     const char *capture;
+    /* A size for spawned windows, instead of the guest's own. Used by the
+     * whole-screen view, where the guest's size is a whole monitor. */
+    const char *window_size;
 
     /*
      * Windows the user closed.
@@ -327,6 +330,9 @@ static int spawn_client(struct daemon *d, struct window *w)
         if (d->capture && !strcmp(d->capture, "always"))     cap_flag = "--capture";
         else if (d->capture && !strcmp(d->capture, "never")) cap_flag = "--never-capture";
 
+        /* The size flag is last on purpose: with no size to pass, its two
+         * entries are NULL and execv stops there, which is exactly a list
+         * without them. */
         char *const argv[] = {
             exe,
             "--shm",       (char *)d->shm_path,
@@ -341,6 +347,8 @@ static int spawn_client(struct daemon *d, struct window *w)
              * it is held the window cannot be dragged and the cursor is hidden.
              * That is right for a game and wrong for everything before one. */
             (char *)cap_flag,
+            d->window_size ? (char *)"--size" : NULL,
+            d->window_size ? (char *)d->window_size : NULL,
             NULL
         };
         execv(exe, argv);
@@ -1098,6 +1106,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--all"))  d.match_all = 1;
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) d.capture = argv[++i];
+        else if (!strcmp(argv[i], "--window-size") && i + 1 < argc) d.window_size = argv[++i];
         else if (!strcmp(argv[i], "--launch") && i + 1 < argc) d.launch = argv[++i];
         else { usage(); return 2; }
     }

@@ -206,6 +206,7 @@ any defaults.
 | `vypr open-elevation` | let the guest elevate without a prompt Vypr cannot answer |
 | `vypr guest-notifications` | turn the guest's notifications back on |
 | `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
+| `vypr --debug resolution [WxH]` | what size that screen is shown at |
 | `vypr remove <app>` | undo that — task, profile, menu entry and icons |
 | `vypr apps` | list what is registered |
 | `vypr status` | what is currently running |
@@ -239,7 +240,9 @@ something during that minute cancels it.
   A file inside it is opened by the Windows application directly — no copy, and
   saving writes to the file itself
 - Finding what is on the guest's desktop and offering to add it
-- Streaming the guest's whole screen, for debugging
+- Streaming the guest's whole screen, for debugging — at its own size, or
+  scaled down to a window that fits, since a 4K guest otherwise fills one of
+  your monitors to show you one of its
 - Minimise, maximise, close and dragging, all acting on the guest window
 - Windows that come back where you left them, at the size you left them
 - Fullscreen, mirrored from the guest
