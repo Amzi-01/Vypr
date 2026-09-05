@@ -800,6 +800,29 @@ steam_app_name() {
         sed -n 's/^[[:space:]]*Name[[:space:]]*REG_SZ[[:space:]]*//p' | tr -d '\r'
 }
 
+# What a shortcut is called, minus the parts Windows added.
+#
+# Right-clicking an executable and choosing "Create shortcut" produces
+# 'CodeX.exe - Shortcut.lnk', and a desktop full of those is what 'vypr detect'
+# reads. Taken literally it gives an application called 'CodeX.exe - Shortcut'
+# and a window title to watch for that no window will ever have - the window is
+# called 'CodeX'. The application launches perfectly and Vypr ignores it.
+clean_label() {
+    local name="$1"
+    name="${name%.lnk}"
+    name="${name%.url}"
+    # Repeated, because 'thing.exe - Shortcut (2)' is a real filename.
+    local before=""
+    while [ "$name" != "$before" ]; do
+        before="$name"
+        name="${name%% - Shortcut}"
+        name="$(sed -E 's/ \([0-9]+\)$//' <<<"$name")"
+        name="${name% }"
+    done
+    name="${name%.exe}"
+    printf '%s' "$name"
+}
+
 derive_matches() {
     local app="$1" label="$2" path="$3"
     local base="${path##*\\}"      # drop the Windows directories
@@ -814,8 +837,13 @@ derive_matches() {
         base=""
     fi
 
+    # The cleaned forms first: they are what a window is actually called.
+    local clean_l clean_b
+    clean_l=$(clean_label "$label")
+    clean_b=$(clean_label "$base")
+
     local out=() cand have dup
-    for cand in "$label" "$steam_name" "$app" "$base"; do
+    for cand in "$clean_l" "$clean_b" "$label" "$steam_name" "$app" "$base"; do
         [ -n "$cand" ] || continue
         # A bare number is an id, not a title.
         [[ "$cand" =~ ^[0-9]+$ ]] && continue
