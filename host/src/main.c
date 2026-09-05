@@ -32,6 +32,11 @@
 struct options {
     const char *shm_path;
     const char *title;
+    /* What this window is remembered under. The daemon sends the watched title
+     * that matched, which survives the window renaming itself; the title does
+     * not, and a window called '(Unsaved) - Blender' becomes a different one
+     * the moment you save, or the moment it stops responding. */
+    const char *app_key;
     const char *sock_path;   /* unix socket back to vyprd; NULL = no input path */
     const char *backend;     /* "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
@@ -795,6 +800,7 @@ static int parse_args(int argc, char **argv, struct options *o)
          * that was never a game. An application can now say so once and be
          * believed.
          */
+        else if (!strcmp(argv[i], "--app-key") && i + 1 < argc) o->app_key = argv[++i];
         else if (!strcmp(argv[i], "--never-capture")) o->never_capture = 1;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &o->size_w, &o->size_h) != 2 ||
@@ -1244,8 +1250,12 @@ int main(int argc, char **argv)
         SDL_PumpEvents();
         SDL_FlushEvent(SDL_EVENT_WINDOW_RESIZED);
     } else {
+        const char *key = opt.app_key && *opt.app_key ? opt.app_key : opt.title;
         int gx, gy, gw, gh;
-        if (geom_load(opt.title, &gx, &gy, &gw, &gh)) {
+        /* Anything filed under the old scheme is still read once, so a window
+         * that was placed before this change does not forget where it was. */
+        if (geom_load(key, &gx, &gy, &gw, &gh) ||
+            geom_load(opt.title, &gx, &gy, &gw, &gh)) {
             SDL_SetWindowSize(views[0].win, gw, gh);
             SDL_SetWindowPosition(views[0].win, gx, gy);
             win_w = gw;
@@ -1973,7 +1983,8 @@ int main(int argc, char **argv)
         int gx = 0, gy = 0, gw = 0, gh = 0;
         SDL_GetWindowPosition(views[0].win, &gx, &gy);
         SDL_GetWindowSize(views[0].win, &gw, &gh);
-        geom_save(opt.title, gx, gy, gw, gh);
+        geom_save(opt.app_key && *opt.app_key ? opt.app_key : opt.title,
+                  gx, gy, gw, gh);
     }
 
     for (int i = view_count - 1; i >= 0; i--) {

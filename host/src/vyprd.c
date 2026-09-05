@@ -71,6 +71,8 @@ struct window {
     uint32_t width, height;
     uint32_t chrome_top;
     int      minimized;
+    /* The watched title this window matched: what it is remembered under. */
+    char     key[96];
     int      is_fullscreen;
     char     title[192];
 };
@@ -240,6 +242,27 @@ static void title_key(const char *in, char *out, size_t cap)
     out[j] = '\0';
 }
 
+/*
+ * Which of the watched titles this window matched, or NULL.
+ *
+ * The matched term is the closest thing a window has to a stable name. Its own
+ * title is not: it carries the open document, the zoom level, and the word
+ * "Not Responding" when the application hangs. Anything remembered per window
+ * has to be filed under something that survives all of that.
+ */
+static const char *title_match_term(struct daemon *d, const char *title)
+{
+    char tkey[1024];
+    title_key(title, tkey, sizeof tkey);
+
+    for (int i = 0; i < d->match_count; i++) {
+        char pkey[256];
+        title_key(d->match[i], pkey, sizeof pkey);
+        if (pkey[0] && strstr(tkey, pkey)) return d->match[i];
+    }
+    return NULL;
+}
+
 static int title_matches(struct daemon *d, const char *title)
 {
     if (d->match_all) return 1;
@@ -264,12 +287,7 @@ static int title_matches(struct daemon *d, const char *title)
 
     if (d->match_count == 0) return 0;
 
-    for (int i = 0; i < d->match_count; i++) {
-        char pkey[256];
-        title_key(d->match[i], pkey, sizeof pkey);
-        if (pkey[0] && strstr(tkey, pkey)) return 1;
-    }
-    return 0;
+    return title_match_term(d, title) != NULL;
 }
 
 static void window_release(struct daemon *d, struct window *w, int tell_agent)
@@ -341,6 +359,7 @@ static int spawn_client(struct daemon *d, struct window *w)
             "--window-id", id,
             "--sock",       d->unix_path,
             "--chrome-top", chrome,
+            "--app-key",    w->key[0] ? w->key : (char *)"vypr",
             /* Direct control to begin with. Capture engages by itself when the
              * guest reports an app has taken the pointer, and Ctrl+Alt+Shift+M
              * forces it - but a captured pointer is locked in place, so while
@@ -376,6 +395,14 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
     }
 
     snprintf(w->title, sizeof(w->title), "%s", title);
+
+    /* Filed under the term that matched, which does not change when the
+     * window's own title does. Without a term - the whole-screen view, or
+     * --all - the title is all there is. */
+    {
+        const char *term = title_match_term(d, title);
+        snprintf(w->key, sizeof(w->key), "%s", term ? term : title);
+    }
     w->width    = desc->width;
     w->height   = desc->height;
     w->gx       = desc->x;
