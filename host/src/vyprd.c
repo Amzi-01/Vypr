@@ -348,6 +348,18 @@ static int spawn_client(struct daemon *d, struct window *w)
         if (d->capture && !strcmp(d->capture, "always"))     cap_flag = "--capture";
         else if (d->capture && !strcmp(d->capture, "never")) cap_flag = "--never-capture";
 
+        /*
+         * The configured size belongs to the whole-screen view alone.
+         *
+         * It is the size to show the guest's screen at, and the guest's screen
+         * is not something a window can resize - so that view is scaled to fit
+         * and everything else is left at its natural size. Passed to every
+         * window instead, it pinned each application to the screen view's
+         * dimensions: a 1024x768 window arrived stretched across 3400x1912.
+         */
+        const char *size_flag = (d->window_size && w->id == VYPR_DESKTOP_WINDOW_ID)
+                                    ? d->window_size : NULL;
+
         /* The size flag is last on purpose: with no size to pass, its two
          * entries are NULL and execv stops there, which is exactly a list
          * without them. */
@@ -366,8 +378,8 @@ static int spawn_client(struct daemon *d, struct window *w)
              * it is held the window cannot be dragged and the cursor is hidden.
              * That is right for a game and wrong for everything before one. */
             (char *)cap_flag,
-            d->window_size ? (char *)"--size" : NULL,
-            d->window_size ? (char *)d->window_size : NULL,
+            size_flag ? (char *)"--size" : NULL,
+            size_flag ? (char *)size_flag : NULL,
             NULL
         };
         execv(exe, argv);

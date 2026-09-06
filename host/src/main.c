@@ -1370,8 +1370,12 @@ int main(int argc, char **argv)
      * guest is told to match, once, as soon as a frame proves the agent is
      * publishing and the window id is real. After that the two agree and the
      * picture is 1:1.
+     *
+     * The whole-screen view is the exception and keeps being scaled: its size
+     * is the guest's screen, which no window can resize.
      */
-    bool size_ask = opt.size_w > 0 && opt.size_h > 0;
+    bool size_ask = opt.size_w > 0 && opt.size_h > 0 &&
+                    opt.window_id != VYPR_DESKTOP_WINDOW_ID;
 
     /* What the guest last told us, so a state we applied ourselves is not
      * reported straight back to it as though the user had done it. */
