@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="launcher/vypr.png" width="96" height="96" alt="">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/vypr-mark-white.svg">
+    <img src="docs/brand/vypr-mark-black.svg" width="104" alt="">
+  </picture>
 </p>
 
 <h1 align="center">Vypr</h1>

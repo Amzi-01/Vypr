@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vypr">
   <title>Vypr</title>
-<g fill="#ffffff" fill-rule="evenodd">
+<g fill="#000000" fill-rule="evenodd">
   <g transform="translate(74.00,107.16) scale(1.47368)">
     <path d="M0 0 H56 L151 155 L123.5 202 Z"/>
     <path d="M191 0 H247 L165 135 L137 88 Z"/>

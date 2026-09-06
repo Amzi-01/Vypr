@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 329" width="420" height="329" role="img" aria-label="Vypr">
+  <title>Vypr</title>
+<g fill="#000000" fill-rule="evenodd">
+  <g transform="translate(87,0)">
+    <path d="M0 0 H56 L151 155 L123.5 202 Z"/>
+    <path d="M191 0 H247 L165 135 L137 88 Z"/>
+  </g>
+  <g transform="translate(0,260)">
+    <path transform="translate(0,0)" d="M0 0 H17 L43 49 L69 0 H86 L49 69 H37 Z"/>
+    <path transform="translate(125,0)" d="M0 0 H18 L39 28 L61 0 H79 L47 39 V69 H31 V39 Z"/>
+    <path transform="translate(246,0)" d="M0 0 H44 A22 21 0 0 1 44 42 H15 V69 H0 Z M15 15 H41 A8 8 0 0 1 41 31 H15 Z"/>
+    <path transform="translate(353,0)" d="M0 0 H44 A22 21 0 0 1 44 42 L68 69 H51 L33 44 H15 V69 H0 Z M15 15 H41 A8 8 0 0 1 41 31 H15 Z"/>
+  </g>
+</g>
+</svg>
