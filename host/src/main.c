@@ -1361,6 +1361,18 @@ int main(int argc, char **argv)
     uint32_t resize_w = 0, resize_h = 0;
     uint64_t resize_at = 0;
 
+    /*
+     * --size asks for a window of a given size, not a picture stretched to it.
+     *
+     * Sizing the host window alone leaves the guest rendering at whatever size
+     * the application opened - 1024x768, say - and every frame is then scaled
+     * up to fill, which is soft and gets softer the larger the ask. So the
+     * guest is told to match, once, as soon as a frame proves the agent is
+     * publishing and the window id is real. After that the two agree and the
+     * picture is 1:1.
+     */
+    bool size_ask = opt.size_w > 0 && opt.size_h > 0;
+
     /* What the guest last told us, so a state we applied ourselves is not
      * reported straight back to it as though the user had done it. */
     bool guest_minimized = false;
@@ -1930,6 +1942,17 @@ int main(int argc, char **argv)
             }
 
             presenter_present(v->pres);
+        }
+
+        /* The one-shot --size request. A frame has arrived, so the agent is
+         * alive and listening; ask it for a surface the size of this window. */
+        if (size_ask && daemon_fd >= 0 && views[0].src_w && views[0].window_id) {
+            struct vypr_msg_resize rs = {0};
+            rs.window_id = views[0].window_id;
+            rs.width     = (uint32_t)opt.size_w;
+            rs.height    = (uint32_t)opt.size_h;
+            send_queued(VYPR_MSG_RESIZE, &rs, sizeof(rs), false);
+            size_ask = false;
         }
 
         /*
