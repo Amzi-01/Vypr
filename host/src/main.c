@@ -1233,9 +1233,19 @@ int main(int argc, char **argv)
      * second set of chrome for one window. Undecorated, what the user sees and
      * clicks is Windows' own title bar - close, minimise and maximise reach the
      * guest app because the input goes straight through.
+     *
+     * The whole-screen view is the exception. A screen has no title bar inside
+     * it to grab, so undecorated it could only be moved by the invented strip
+     * in the hit test below - which costs the guest a band of clicks across the
+     * top of its own desktop, where Windows keeps the things one actually
+     * clicks. Given real decorations it is dragged by them instead, and every
+     * pixel of the picture stays the guest's.
      */
+    const bool decorated = opt.window_id == VYPR_DESKTOP_WINDOW_ID;
+
     views[0].win = SDL_CreateWindow(opt.title, win_w, win_h,
-                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
+                                    SDL_WINDOW_RESIZABLE |
+                                    (decorated ? 0 : SDL_WINDOW_BORDERLESS));
     if (!views[0].win) {
         fprintf(stderr, "vypr: SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
@@ -1334,9 +1344,12 @@ int main(int argc, char **argv)
      * - it changes when a window is maximised, restored or goes fullscreen. */
     uint32_t chrome_reported = opt.chrome_top;
 
-    /* Kept current for the hit test, which decides what is title bar. */
+    /* Kept current for the hit test, which decides what is title bar. A
+     * decorated window has a real one and wants no strip stolen from the
+     * picture, so it gets no hit test at all. */
     struct hit_ctx hit = { opt.chrome_top, 0, 0, false };
-    SDL_SetWindowHitTest(views[0].win, title_hit_test, &hit);
+    if (!decorated)
+        SDL_SetWindowHitTest(views[0].win, title_hit_test, &hit);
 
     /*
      * Audio, opened on the first block that arrives rather than up front: the
