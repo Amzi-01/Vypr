@@ -144,6 +144,10 @@ struct daemon {
     /* A size for spawned windows, instead of the guest's own. Used by the
      * whole-screen view, where the guest's size is a whole monitor. */
     const char *window_size;
+    /* "Z:=/home/you" - where the guest's view of the shared folder lands on
+     * this side. Only the launcher knows it, and only a client needs it, so it
+     * passes straight through. */
+    const char *share;
 
     /*
      * Windows the user closed.
@@ -360,28 +364,35 @@ static int spawn_client(struct daemon *d, struct window *w)
         const char *size_flag = (d->window_size && w->id == VYPR_DESKTOP_WINDOW_ID)
                                     ? d->window_size : NULL;
 
-        /* The size flag is last on purpose: with no size to pass, its two
-         * entries are NULL and execv stops there, which is exactly a list
-         * without them. */
-        char *const argv[] = {
-            exe,
-            "--shm",       (char *)d->shm_path,
-            "--slot",      slot,
-            "--title",     w->title[0] ? w->title : (char *)"vypr",
-            "--window-id", id,
-            "--sock",       d->unix_path,
-            "--chrome-top", chrome,
-            "--app-key",    w->key[0] ? w->key : (char *)"vypr",
-            /* Direct control to begin with. Capture engages by itself when the
-             * guest reports an app has taken the pointer, and Ctrl+Alt+Shift+M
-             * forces it - but a captured pointer is locked in place, so while
-             * it is held the window cannot be dragged and the cursor is hidden.
-             * That is right for a game and wrong for everything before one. */
-            (char *)cap_flag,
-            size_flag ? (char *)"--size" : NULL,
-            size_flag ? (char *)size_flag : NULL,
-            NULL
-        };
+        /*
+         * Built rather than declared.
+         *
+         * This used to be a fixed list with the optional flag last, because a
+         * NULL in the middle ends the argument list at that point and execv
+         * never sees what follows. That works for exactly one optional flag
+         * and quietly swallows the second, so the list is assembled instead
+         * and the order stops mattering.
+         */
+        char *argv[26];
+        int n = 0;
+        argv[n++] = exe;
+        argv[n++] = "--shm";        argv[n++] = (char *)d->shm_path;
+        argv[n++] = "--slot";       argv[n++] = slot;
+        argv[n++] = "--title";      argv[n++] = w->title[0] ? w->title : (char *)"vypr";
+        argv[n++] = "--window-id";  argv[n++] = id;
+        argv[n++] = "--sock";       argv[n++] = (char *)d->unix_path;
+        argv[n++] = "--chrome-top"; argv[n++] = chrome;
+        argv[n++] = "--app-key";    argv[n++] = w->key[0] ? w->key : (char *)"vypr";
+        /* Direct control to begin with. Capture engages by itself when the
+         * guest reports an app has taken the pointer, and Ctrl+Alt+Shift+M
+         * forces it - but a captured pointer is locked in place, so while it
+         * is held the window cannot be dragged and the cursor is hidden. That
+         * is right for a game and wrong for everything before one. */
+        argv[n++] = (char *)cap_flag;
+        if (size_flag) { argv[n++] = "--size";  argv[n++] = (char *)size_flag; }
+        if (d->share)  { argv[n++] = "--share"; argv[n++] = (char *)d->share; }
+        argv[n] = NULL;
+
         execv(exe, argv);
         fprintf(stderr, "vyprd: cannot exec %s: %s\n", exe, strerror(errno));
         _exit(127);
@@ -949,6 +960,17 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
+    /* The answer, to the window it came from and no other: a drag belongs to
+     * the window the user dragged out of. */
+    case VYPR_MSG_DRAG_FILES: {
+        if (bytes < sizeof(struct vypr_msg_drag_files)) break;
+        const struct vypr_msg_drag_files *m = (const void *)payload;
+        struct window *w = window_find(d, m->window_id);
+        if (w && w->client_fd >= 0)
+            client_send(d, w->client_fd, VYPR_MSG_CLIENT_DRAG_FILES, payload, bytes);
+        break;
+    }
+
     case VYPR_MSG_LOG:
         fprintf(stderr, "vyprd: agent: %.*s\n", (int)bytes, payload);
         break;
@@ -1003,6 +1025,16 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         fprintf(stderr, "vyprd: now also watching for '%s'\n", kept);
 
         if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_RESCAN, NULL, 0);
+        return;
+    }
+
+    /*
+     * The client's pointer left a window with a button held, so ask the guest
+     * whether a drag is on its way out. Straight through: only the guest can
+     * answer, and the daemon has nothing to add.
+     */
+    if (type == VYPR_MSG_DRAG_PROBE) {
+        if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_DRAG_PROBE, payload, bytes);
         return;
     }
 
@@ -1193,6 +1225,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--all"))  d.match_all = 1;
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) d.capture = argv[++i];
         else if (!strcmp(argv[i], "--window-size") && i + 1 < argc) d.window_size = argv[++i];
+        else if (!strcmp(argv[i], "--share") && i + 1 < argc) d.share = argv[++i];
         else if (!strcmp(argv[i], "--launch") && i + 1 < argc) d.launch = argv[++i];
         else { usage(); return 2; }
     }

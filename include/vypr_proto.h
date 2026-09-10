@@ -211,7 +211,16 @@ enum vypr_msg_type {
      * the clipboard belongs to the desktop, not to a window, and every client
      * setting it would be the same work several times over.
      */
-    VYPR_MSG_CLIENT_CLIPBOARD_IMAGE = 137  /* utf8 path to a BMP */
+    VYPR_MSG_CLIENT_CLIPBOARD_IMAGE = 137, /* utf8 path to a BMP */
+
+    /*
+     * A drag leaving the guest, relayed to the client that owns the window.
+     *
+     * Same payload as VYPR_MSG_DRAG_FILES; a separate number because the
+     * daemon and its clients speak their own dialect over the unix socket,
+     * and mixing the two directions on one number makes the reader guess.
+     */
+    VYPR_MSG_CLIENT_DRAG_FILES      = 138  /* vypr_msg_drag_files + utf8 paths */
 };
 
 /*

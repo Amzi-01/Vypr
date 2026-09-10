@@ -60,6 +60,9 @@ struct options {
     /* Debug hook: offer this file as a drag on Ctrl+Shift+D, so the drag
      * source can be exercised before the guest half exists to feed it. */
     const char *drag_test;
+    /* "Z:=/home/you": where the guest's shared folder lands on this side.
+     * The launcher is the only thing that knows it. */
+    const char *share;
 };
 
 static void usage(void)
@@ -807,6 +810,7 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--app-key") && i + 1 < argc) o->app_key = argv[++i];
         else if (!strcmp(argv[i], "--never-capture")) o->never_capture = 1;
         else if (!strcmp(argv[i], "--drag-test") && i + 1 < argc) o->drag_test = argv[++i];
+        else if (!strcmp(argv[i], "--share") && i + 1 < argc) o->share = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &o->size_w, &o->size_h) != 2 ||
                 o->size_w < 160 || o->size_h < 120) {
@@ -987,6 +991,51 @@ static SDL_HitTestResult SDLCALL title_hit_test(SDL_Window *win,
     if (pt->x > w - buttons) return SDL_HITTEST_NORMAL;
 
     return SDL_HITTEST_DRAGGABLE;
+}
+
+/*
+ * A guest path, as a path on this side.
+ *
+ *   Z:\Pictures\a.png  ->  /home/you/Pictures/a.png
+ *
+ * The shared folder is the one place where a guest path and a host path name
+ * the same bytes, so it is the only thing that can be translated. A file
+ * anywhere else exists solely inside the VM: there is no host path to offer,
+ * and inventing one would hand the desktop a URI that opens nothing. Those are
+ * skipped rather than guessed at, which is why dragging out of the guest works
+ * for the shared folder and not yet for anything else.
+ */
+static bool share_map(const char *share, const char *guest, char *out, size_t cap)
+{
+    if (!share || !guest || !*guest) return false;
+
+    const char *eq = strchr(share, '=');
+    if (!eq || eq == share) return false;
+    const size_t dlen = (size_t)(eq - share);       /* "Z:" */
+    if (strlen(guest) < dlen) return false;
+
+    /* Drive letters are not case sensitive, and the guest is inconsistent
+     * about which it sends. */
+    for (size_t i = 0; i < dlen; i++) {
+        char a = guest[i], b = share[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+
+    const char *root = eq + 1;
+    const char *rest = guest + dlen;                /* "\Pictures\a.png" */
+
+    /* The drive may arrive as "Z" or as "Z:" depending on who asked - the
+     * launcher probes for a letter, not a prefix. Either way the colon is
+     * separator, not path. */
+    if (*rest == ':') rest++;
+    const int len = snprintf(out, cap, "%s%s", root, *rest ? rest : "/");
+    if (len < 0 || (size_t)len >= cap) return false;
+
+    for (char *c = out + strlen(root); *c; c++)
+        if (*c == '\\') *c = '/';
+    return true;
 }
 
 /*
@@ -1359,6 +1408,7 @@ int main(int argc, char **argv)
     struct drag_source *drag = drag_source_create(views[0].win);
     float dragtest_x = 0, dragtest_y = 0;
     bool  dragtest_armed = false;
+    uint64_t drag_probe_ms = 0;      /* so one crossing is not a flurry of asks */
     if (drag && opt.stats)
         fprintf(stderr, "vypr: drag source: %s\n", drag_source_backend(drag));
 
@@ -1460,6 +1510,40 @@ int main(int argc, char **argv)
             case SDL_EVENT_MOUSE_BUTTON_UP:
             case SDL_EVENT_MOUSE_WHEEL: {
                 if (daemon_fd < 0) break;
+
+                /*
+                 * A drag on its way out of the window.
+                 *
+                 * Judged on where the pointer is, not on a leave event. Pressing
+                 * a button takes an implicit grab, and a grab keeps pointer focus
+                 * on this surface until every button is released - so no leave
+                 * event is ever sent while dragging, which is precisely the case
+                 * that matters. Motion keeps arriving throughout, with
+                 * coordinates that walk outside the window, so that is what to
+                 * watch.
+                 *
+                 * Asking costs the guest a window under the user's cursor and a
+                 * pixel of mouse nudging, so it is asked once per crossing
+                 * rather than per motion event.
+                 */
+                if (ev.type == SDL_EVENT_MOUSE_MOTION && drag &&
+                    !drag_source_active(drag) &&
+                    (ev.motion.state & SDL_BUTTON_LMASK)) {
+                    const float mx = ev.motion.x, my = ev.motion.y;
+                    const bool outside = mx < 0 || my < 0 ||
+                                         mx >= (float)win_w || my >= (float)win_h;
+                    const uint64_t now_ms = SDL_GetTicks();
+                    if (outside && now_ms - drag_probe_ms >= 400) {
+                        drag_probe_ms = now_ms;
+                        struct vypr_msg_drag_probe pr = {0};
+                        pr.window_id = views[0].window_id;
+                        to_guest_coords(win_w, win_h, views[0].src_w, views[0].src_h,
+                                        mx, my, &pr.x, &pr.y);
+                        send_queued(VYPR_MSG_DRAG_PROBE, &pr, sizeof(pr), false);
+                        fprintf(stderr, "vypr: pointer left the window with a button "
+                                        "held; asking whether a drag is leaving\n");
+                    }
+                }
 
                 /* The hit test handles the title bar; anything arriving here
                  * is either content or a caption button, and both are the
@@ -1900,6 +1984,50 @@ drop_pump(&drop);
                                 fprintf(stderr, "vypr: clipboard image refused: %s\n",
                                         SDL_GetError());
                         }
+                    } else if (head.type == VYPR_MSG_CLIENT_DRAG_FILES &&
+                               head.bytes >= sizeof(struct vypr_msg_drag_files)) {
+                        /*
+                         * A drag really was leaving, and these are the files.
+                         * Only the ones on the shared folder can be offered -
+                         * see share_map - so a drag of something else ends up
+                         * offering nothing, and the user's drag simply does not
+                         * take. Better than handing the desktop a path into a
+                         * filesystem it cannot see.
+                         */
+                        struct vypr_msg_drag_files df;
+                        memcpy(&df, payload, sizeof(df));
+
+                        const char *blob = (const char *)payload + sizeof(df);
+                        const uint32_t blob_len = head.bytes - (uint32_t)sizeof(df);
+
+                        char *paths[VYPR_DROP_MAX_FILES];
+                        int   npaths = 0;
+                        uint32_t at = 0;
+                        while (at < blob_len && npaths < (int)VYPR_DROP_MAX_FILES) {
+                            const char *g = blob + at;
+                            const uint32_t left = blob_len - at;
+                            const void *nul = memchr(g, '\0', left);
+                            if (!nul) break;                 /* truncated: stop */
+                            at += (uint32_t)((const char *)nul - g) + 1;
+
+                            char host_path[4096];
+                            if (share_map(opt.share, g, host_path, sizeof host_path)) {
+                                char *dup = strdup(host_path);
+                                if (dup) paths[npaths++] = dup;
+                            } else {
+                                fprintf(stderr, "vypr: '%s' is not on the shared "
+                                                "folder, so it cannot be dragged out\n", g);
+                            }
+                        }
+
+                        if (npaths > 0) {
+                            const bool ok = drag_source_start(
+                                drag, (const char *const *)paths, npaths);
+                            fprintf(stderr, "vypr: dragging out %d file(s): %s\n",
+                                    npaths, ok ? "offered" : "refused");
+                        }
+                        for (int i = 0; i < npaths; i++) free(paths[i]);
+
                     } else if (head.type == VYPR_MSG_CLIENT_CLIPBOARD) {
                         /* Remembered before setting it, so the update this
                          * causes is recognised as our own and not sent back. */
