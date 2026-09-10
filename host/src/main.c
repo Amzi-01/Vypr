@@ -17,6 +17,7 @@
 
 #include "msg.h"
 #include "present.h"
+#include "dragsource.h"
 #include "shm.h"
 
 #include <fcntl.h>
@@ -56,6 +57,9 @@ struct options {
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
+    /* Debug hook: offer this file as a drag on Ctrl+Shift+D, so the drag
+     * source can be exercised before the guest half exists to feed it. */
+    const char *drag_test;
 };
 
 static void usage(void)
@@ -802,6 +806,7 @@ static int parse_args(int argc, char **argv, struct options *o)
          */
         else if (!strcmp(argv[i], "--app-key") && i + 1 < argc) o->app_key = argv[++i];
         else if (!strcmp(argv[i], "--never-capture")) o->never_capture = 1;
+        else if (!strcmp(argv[i], "--drag-test") && i + 1 < argc) o->drag_test = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &o->size_w, &o->size_h) != 2 ||
                 o->size_w < 160 || o->size_h < 120) {
@@ -1344,6 +1349,19 @@ int main(int argc, char **argv)
      * - it changes when a window is maximised, restored or goes fullscreen. */
     uint32_t chrome_reported = opt.chrome_top;
 
+    /*
+     * The drag source, bound to this window.
+     *
+     * Every streamed window is its own process, so each one carries its own -
+     * a drag has to be able to start from whichever window the user is
+     * actually dragging out of.
+     */
+    struct drag_source *drag = drag_source_create(views[0].win);
+    float dragtest_x = 0, dragtest_y = 0;
+    bool  dragtest_armed = false;
+    if (drag && opt.stats)
+        fprintf(stderr, "vypr: drag source: %s\n", drag_source_backend(drag));
+
     /* Kept current for the hit test, which decides what is title bar. A
      * decorated window has a real one and wants no strip stolen from the
      * picture, so it gets no hit test at all. */
@@ -1543,6 +1561,40 @@ int main(int argc, char **argv)
                  * and the chord silently never fires. The scancode is the
                  * physical key regardless of what is held down with it.
                  */
+                /*
+                 * --drag-test offers its file once the pointer has been pulled
+                 * far enough with a button held.
+                 *
+                 * Not a key chord: a drag has to begin from a serial whose
+                 * implicit grab is still open, so the button must still be
+                 * down. Triggering on the drag gesture is also the shape the
+                 * real thing will have - the host noticing the pointer leave
+                 * the window with a button held - so this exercises the path
+                 * that will actually be used.
+                 */
+                if (opt.drag_test && drag) {
+                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                        dragtest_x = ev.button.x;
+                        dragtest_y = ev.button.y;
+                        dragtest_armed = true;
+                        fprintf(stderr, "vypr: drag-test armed at %.0f,%.0f\n",
+                                dragtest_x, dragtest_y);
+                    } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                        dragtest_armed = false;
+                    } else if (ev.type == SDL_EVENT_MOUSE_MOTION && dragtest_armed &&
+                               !drag_source_active(drag)) {
+                        const float dx = ev.motion.x - dragtest_x;
+                        const float dy = ev.motion.y - dragtest_y;
+                        if (dx * dx + dy * dy > 256.0f) {
+                            const char *one[1] = { opt.drag_test };
+                            const bool ok = drag_source_start(drag, one, 1);
+                            fprintf(stderr, "vypr: drag of '%s' %s\n",
+                                    opt.drag_test, ok ? "started" : "refused");
+                            dragtest_armed = false;
+                        }
+                    }
+                }
+
                 if (ev.type == SDL_EVENT_KEY_DOWN &&
                     ev.key.scancode == SDL_SCANCODE_M &&
                     (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_SHIFT)) {
@@ -1758,7 +1810,8 @@ int main(int argc, char **argv)
         hit.captured   = pointer_locked || capture_forced;
 
         pointer_flush(daemon_fd, views[0].window_id, &pointer);
-        drop_pump(&drop);
+drop_pump(&drop);
+        drag_source_pump(drag);
         if (daemon_fd >= 0 && out_flush(daemon_fd) < 0) running = 0;
 
         pads_poll(pads, daemon_fd,
@@ -2028,7 +2081,8 @@ int main(int argc, char **argv)
     }
 
     for (int i = view_count - 1; i >= 0; i--) {
-        if (views[i].pres) presenter_destroy(views[i].pres);
+if (drag) { drag_source_destroy(drag); drag = NULL; }
+                if (views[i].pres) presenter_destroy(views[i].pres);
         if (views[i].win)  SDL_DestroyWindow(views[i].win);
     }
     if (link_running) {
