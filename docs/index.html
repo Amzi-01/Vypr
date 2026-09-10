@@ -27,8 +27,8 @@
     --muted:#868c98;
     --line:#23262d;
     --line-soft:#181b21;
-    --yes:#7fae89;
-    --no:#b4737c;
+    --yes:#5cbf80;
+    --no:#cf6f7a;
     --shadow:0 1px 0 rgba(255,255,255,.04);
   }
   @media (prefers-color-scheme: light){
@@ -41,8 +41,8 @@
       --muted:#666d7a;
       --line:#dcdfe5;
       --line-soft:#ebedf1;
-      --yes:#3f7a51;
-      --no:#9c4450;
+      --yes:#237d43;
+      --no:#ad3f4a;
       --shadow:0 1px 2px rgba(16,18,24,.06);
     }
   }
@@ -182,13 +182,19 @@
     font-weight:500;background:var(--sunken);position:sticky;top:0;
   }
   tbody tr:last-child td{border-bottom:0}
-  td.c{text-align:center;width:104px;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px}
-  td.feat{color:var(--ink-soft)}
+  td.c{text-align:center;width:112px;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px}
+  td.v{width:210px;text-align:center}
+  td.feat{color:var(--ink)}
+  .mk{font-weight:500;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px}
   .mk-y{color:var(--yes)}
   .mk-n{color:var(--no)}
-  .note{color:var(--muted);font-size:12.5px;display:block;margin-top:2px}
-  tr.win td.feat{color:var(--ink)}
-  tr.win td:last-child{color:var(--ink)}
+  .note{color:var(--muted);font-size:12px;display:block;margin-top:3px;line-height:1.45;
+        font-family:"IBM Plex Sans",sans-serif;letter-spacing:0}
+  td.v .note{color:var(--ink-soft)}
+  .sub{color:var(--muted);font-size:12.5px;display:block;margin-top:2px;
+       font-family:"IBM Plex Sans",sans-serif}
+  .plainval{color:var(--ink-soft)}
+  td.v .plainval{color:var(--ink)}
 
   /* ---------- code ---------- */
   pre{
@@ -357,8 +363,9 @@
     <div class="col">
       <h2>Where it wins, it wins on what it was built for.</h2>
       <p>
-        Rows Vypr cannot claim are grouped at the foot, rather than left for you to find.
-        Compared against WinApps and WinBoat documentation as of August&nbsp;2026.
+        Arranged as the README has it: everything all three do sits at the top, and the
+        rows where they part company are at the foot. Compared against WinApps and
+        WinBoat documentation as of August&nbsp;2026.
       </p>
 
       <div class="tablewrap">
@@ -367,24 +374,24 @@
             <tr><th scope="col">&nbsp;</th><th scope="col" style="text-align:center">WinApps</th><th scope="col" style="text-align:center">WinBoat</th><th scope="col" style="text-align:center">Vypr</th></tr>
           </thead>
           <tbody>
-            <tr><td class="feat">Windows apps as native Linux windows</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
-            <tr class="win"><td class="feat">How the picture travels</td><td class="c">RDP codec</td><td class="c">RDP codec</td><td class="c">shared memory</td></tr>
-            <tr class="win"><td class="feat">Frame latency</td><td class="c">encode + decode</td><td class="c">encode + decode</td><td class="c">no codec</td></tr>
-            <tr class="win"><td class="feat">GPU acceleration inside the guest</td><td class="c mk-n">no</td><td class="c mk-n">planned</td><td class="c mk-y">passed-through GPU</td></tr>
-            <tr class="win"><td class="feat">Demanding games</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">4K at 60 fps</td></tr>
-            <tr class="win"><td class="feat">Games that read raw mouse input</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
-            <tr class="win"><td class="feat">Controllers</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">real XInput</td></tr>
-            <tr class="win"><td class="feat">Opening a Linux file in a Windows app<span class="note">and saves come back to it</span></td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
-            <tr class="win"><td class="feat">Dragging a file onto a running Windows app</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
-            <tr class="win"><td class="feat">Windows notifications on the Linux desktop</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
-            <tr><td class="feat">Audio<span class="note">Vypr pins it to the app's own device</span></td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
-            <tr><td class="feat">Microphone into the guest</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
-            <tr><td class="feat">A folder from Linux, inside Windows</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">virtiofs</td></tr>
-            <tr><td class="feat">Finds your apps for you</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y"><code>vypr detect</code></td></tr>
-            <tr><td class="feat">Fullscreen, minimise and window buttons</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
-            <tr><td class="feat">Seeing the guest's whole screen</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
-            <tr><td class="feat">Clipboard sharing</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c" style="color:var(--muted)">text only</td></tr>
-            <tr><td class="feat">Setup effort</td><td class="c">guided</td><td class="c">guided</td><td class="c" style="color:var(--muted)">two installers,<br>plus passthrough</td></tr>
+            <tr><td class="feat">Windows apps as native Linux windows</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span></td></tr>
+            <tr><td class="feat">How the picture travels</td><td class="c"><span class="plainval">RDP codec</span></td><td class="c"><span class="plainval">RDP codec</span></td><td class="v"><span class="plainval">shared memory,<br>uncompressed</span></td></tr>
+            <tr><td class="feat">Frame latency</td><td class="c"><span class="plainval">encode + decode</span></td><td class="c"><span class="plainval">encode + decode</span></td><td class="v"><span class="plainval">no codec<br>in the path</span></td></tr>
+            <tr><td class="feat">Audio</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">pinned to the app&rsquo;s own device</span></td></tr>
+            <tr><td class="feat">Microphone into the guest</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">no extra software</span></td></tr>
+            <tr><td class="feat">Clipboard sharing</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">text only</span></td></tr>
+            <tr><td class="feat">A folder from Linux, inside Windows</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">virtiofs, opt-in, appears as a drive</span></td></tr>
+            <tr><td class="feat">Finds your apps for you</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">desktop shortcuts, <code>vypr detect</code></span></td></tr>
+            <tr><td class="feat">Fullscreen, minimise and window buttons</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span></td></tr>
+            <tr><td class="feat">Seeing the guest&rsquo;s whole screen when something is wrong</td><td class="c"><span class="mk mk-y">yes</span></td><td class="c"><span class="mk mk-y">yes</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note"><code>vypr --debug desktop</code></span></td></tr>
+            <tr><td class="feat">Setup effort</td><td class="c"><span class="plainval">guided</span></td><td class="c"><span class="plainval">guided</span></td><td class="v"><span class="plainval">two installers,<br>plus passthrough</span></td></tr>
+            <tr><td class="feat">GPU acceleration inside the guest</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span><span class="sub">planned</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">passed-through GPU</span></td></tr>
+            <tr><td class="feat">Demanding games</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">4K at 60&nbsp;fps, measured</span></td></tr>
+            <tr><td class="feat">Games that read raw mouse input</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">kernel-level HID injection</span></td></tr>
+            <tr><td class="feat">Controllers</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">as real XInput devices</span></td></tr>
+            <tr><td class="feat">Opening a Linux file in a Windows app<span class='note'><code>.psd</code>, <code>.exe</code>, anything</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">double-click it, and saves come back</span></td></tr>
+            <tr><td class="feat">Dragging a file onto a running Windows app</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">copied in and dropped where you point</span></td></tr>
+            <tr><td class="feat">Windows notifications on the Linux desktop</td><td class="c"><span class="mk mk-n">no</span></td><td class="c"><span class="mk mk-n">no</span></td><td class="v"><span class="mk mk-y">yes</span><span class="note">raised as ordinary desktop notifications</span></td></tr>
           </tbody>
         </table>
       </div>
