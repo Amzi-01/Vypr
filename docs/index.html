@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vypr</title>
+<meta name="description" content="Windows applications as native Linux windows, over shared memory. No RDP, no video codec in the path.">
+<meta property="og:title" content="Vypr">
+<meta property="og:description" content="Windows applications as native Linux windows, over shared memory. No RDP, no video codec in the path.">
+<meta property="og:image" content="https://amzi-01.github.io/Vypr/images/fivem.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="brand/vypr-icon-black.svg" media="(prefers-color-scheme: light)">
+<link rel="icon" href="brand/vypr-icon-white.svg" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="brand/vypr-icon-black.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+  /* Dark is the primary world here: the tool lives in one, and the mark was
+     drawn white-on-black. Light is a full re-declaration, not an inversion. */
+  :root{
+    --ground:#0a0b0d;
+    --raised:#131519;
+    --sunken:#07080a;
+    --ink:#f2f3f5;
+    --ink-soft:#c3c7cf;
+    --muted:#868c98;
+    --line:#23262d;
+    --line-soft:#181b21;
+    --yes:#7fae89;
+    --no:#b4737c;
+    --shadow:0 1px 0 rgba(255,255,255,.04);
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --ground:#fbfbfc;
+      --raised:#ffffff;
+      --sunken:#f1f2f4;
+      --ink:#101218;
+      --ink-soft:#3a3f4a;
+      --muted:#666d7a;
+      --line:#dcdfe5;
+      --line-soft:#ebedf1;
+      --yes:#3f7a51;
+      --no:#9c4450;
+      --shadow:0 1px 2px rgba(16,18,24,.06);
+    }
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;
+    background:var(--ground);
+    color:var(--ink);
+    font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:16.5px;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  img{max-width:100%;display:block}
+  a{color:var(--ink);text-decoration-color:var(--muted);text-underline-offset:3px}
+  a:hover{text-decoration-color:var(--ink)}
+  :focus-visible{outline:2px solid var(--ink);outline-offset:3px;border-radius:2px}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:0 28px}
+
+  /* The rail is the seam from the mark: a hairline with labels hung off it. */
+  .band{border-top:1px solid var(--line)}
+  .band-inner{
+    display:grid;
+    grid-template-columns:172px minmax(0,1fr);
+    gap:0 44px;
+    padding:76px 0;
+  }
+  .rail{
+    font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--muted);
+    padding-top:.55em;
+  }
+  .rail span{display:block;border-left:1px solid var(--line);padding-left:14px}
+  .col{min-width:0}
+
+  h2{
+    font-family:"Archivo","Helvetica Neue",Arial,sans-serif;
+    font-variation-settings:"wdth" 112,"wght" 700;
+    font-size:clamp(24px,3vw,32px);
+    line-height:1.12;letter-spacing:-.014em;
+    margin:0 0 18px;text-wrap:balance;
+  }
+  h3{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:11.5px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--muted);margin:0 0 10px;
+  }
+  p{margin:0 0 16px;max-width:64ch;color:var(--ink-soft)}
+  p strong{color:var(--ink);font-weight:500}
+  .lede{font-size:19px;line-height:1.55;color:var(--ink)}
+
+  /* ---------- masthead ---------- */
+  header.top{padding:64px 0 0}
+  .brandrow{display:flex;align-items:center;gap:18px;margin-bottom:40px}
+  .brandrow img{width:96px;height:auto}
+  .brandrow .tag{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    border-left:1px solid var(--line);padding-left:18px;
+  }
+  h1{
+    font-family:"Archivo","Helvetica Neue",Arial,sans-serif;
+    font-variation-settings:"wdth" 108,"wght" 780;
+    font-size:clamp(38px,6.4vw,68px);
+    line-height:1.02;letter-spacing:-.026em;
+    margin:0 0 24px;max-width:15ch;text-wrap:balance;
+  }
+  .claim{font-size:clamp(18px,2vw,21px);line-height:1.5;color:var(--ink-soft);max-width:56ch;margin:0 0 32px}
+  .claim b{color:var(--ink);font-weight:500}
+
+  .actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:56px}
+  .btn{
+    display:inline-block;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:12.5px;letter-spacing:.08em;text-transform:uppercase;
+    padding:12px 20px;border:1px solid var(--line);border-radius:2px;
+    text-decoration:none;color:var(--ink);background:var(--raised);
+    box-shadow:var(--shadow);
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .btn:hover{border-color:var(--muted)}
+  .btn.primary{background:var(--ink);color:var(--ground);border-color:var(--ink)}
+  .btn.primary:hover{opacity:.88}
+
+  /* The only colour on this page is the screenshots. */
+  figure{margin:0}
+  .shot{
+    border:1px solid var(--line);border-radius:3px;overflow:hidden;background:var(--sunken);
+  }
+  figcaption{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:11.5px;color:var(--muted);margin-top:10px;letter-spacing:.03em;
+  }
+  .shots{display:grid;grid-template-columns:1fr 1fr;gap:22px;padding-bottom:64px}
+
+  /* ---------- the path diagram ---------- */
+  .diagram{width:100%;height:auto;margin:6px 0 22px}
+  .diagram text{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.04em}
+  .d-label{fill:var(--muted)}
+  .d-ink{fill:var(--ink)}
+  .d-box{fill:var(--raised);stroke:var(--line)}
+  .d-box-cost{fill:none;stroke:var(--no);stroke-dasharray:3 3}
+  .d-box-win{fill:var(--raised);stroke:var(--ink)}
+  .d-arrow{stroke:var(--muted);fill:none}
+  .d-seam{stroke:var(--line)}
+
+  /* ---------- lists ---------- */
+  ul.plain{list-style:none;margin:0;padding:0;display:grid;gap:14px}
+  ul.plain li{
+    padding-left:20px;position:relative;color:var(--ink-soft);max-width:64ch;
+  }
+  ul.plain li::before{
+    content:"";position:absolute;left:0;top:.62em;
+    width:7px;height:7px;background:var(--ink);border-radius:1px;
+  }
+  ul.plain li b{color:var(--ink);font-weight:500}
+
+  ul.caveats{list-style:none;margin:0;padding:0;display:grid;gap:20px}
+  ul.caveats li{max-width:66ch;color:var(--ink-soft);padding-left:20px;position:relative}
+  ul.caveats li::before{
+    content:"";position:absolute;left:0;top:.62em;
+    width:7px;height:7px;border:1px solid var(--no);border-radius:1px;
+  }
+  ul.caveats b{color:var(--ink);font-weight:500;display:block}
+
+  /* ---------- table ---------- */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:3px;background:var(--raised)}
+  table{border-collapse:collapse;width:100%;min-width:660px;font-size:14.5px}
+  th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  thead th{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+    font-weight:500;background:var(--sunken);position:sticky;top:0;
+  }
+  tbody tr:last-child td{border-bottom:0}
+  td.c{text-align:center;width:104px;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px}
+  td.feat{color:var(--ink-soft)}
+  .mk-y{color:var(--yes)}
+  .mk-n{color:var(--no)}
+  .note{color:var(--muted);font-size:12.5px;display:block;margin-top:2px}
+  tr.win td.feat{color:var(--ink)}
+  tr.win td:last-child{color:var(--ink)}
+
+  /* ---------- code ---------- */
+  pre{
+    margin:0 0 16px;padding:16px 18px;background:var(--sunken);
+    border:1px solid var(--line);border-radius:3px;overflow-x:auto;
+  }
+  code{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13.5px;color:var(--ink)}
+  p code,li code,td code{background:var(--sunken);border:1px solid var(--line-soft);padding:1px 5px;border-radius:2px;font-size:13px}
+
+  dl.cmds{display:grid;grid-template-columns:auto 1fr;gap:10px 22px;margin:0;font-size:14.5px}
+  dl.cmds dt{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px;color:var(--ink);white-space:nowrap}
+  dl.cmds dd{margin:0;color:var(--ink-soft)}
+
+  /* ---------- gate ---------- */
+  .gate{border:1px solid var(--line);border-left:2px solid var(--no);border-radius:3px;padding:22px 24px;background:var(--raised)}
+  .gate p:last-child{margin-bottom:0}
+
+  footer{border-top:1px solid var(--line);padding:44px 0 72px;color:var(--muted);font-size:14px}
+  .foot{display:flex;flex-wrap:wrap;gap:26px;align-items:baseline;justify-content:space-between}
+  .foot nav{display:flex;flex-wrap:wrap;gap:22px}
+  .foot a{color:var(--ink-soft);text-decoration:none;border-bottom:1px solid var(--line)}
+  .foot a:hover{color:var(--ink);border-color:var(--muted)}
+  .foot small{display:block;max-width:52ch;line-height:1.6}
+
+  @media (max-width:860px){
+    .band-inner{grid-template-columns:1fr;gap:18px;padding:56px 0}
+    .rail span{border-left:0;padding-left:0}
+    .shots{grid-template-columns:1fr}
+    dl.cmds{grid-template-columns:1fr;gap:4px}
+    dl.cmds dd{margin-bottom:12px}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none!important;animation:none!important}
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brandrow">
+      <picture>
+        <source media="(prefers-color-scheme: light)" srcset="brand/vypr-mark-black.svg">
+        <img src="brand/vypr-mark-white.svg" alt="Vypr" width="96">
+      </picture>
+      <span class="tag">Public domain &middot; Unlicense</span>
+    </div>
+
+    <h1>Windows apps, as native Linux windows.</h1>
+    <p class="claim">
+      An application running inside a Windows VM appears on your Linux desktop as an
+      ordinary window &mdash; its own taskbar entry, its own place in the stacking order.
+      <b>No RDP, and no video codec anywhere in the path.</b> The picture goes from the
+      guest's memory to your screen uncompressed.
+    </p>
+
+    <div class="actions">
+      <a class="btn primary" href="https://github.com/Amzi-01/Vypr">View on GitHub</a>
+      <a class="btn" href="https://github.com/Amzi-01/Vypr/releases/latest">Latest release</a>
+      <a class="btn" href="https://github.com/Amzi-01/Vypr/blob/master/docs/technical.md">How it works</a>
+    </div>
+
+    <div class="shots">
+      <figure>
+        <div class="shot"><img src="images/fivem.png" alt="FiveM running through Vypr as a native window on the Linux desktop" width="2000" height="1126" loading="eager"></div>
+        <figcaption>FiveM &mdash; the application this was built for</figcaption>
+      </figure>
+      <figure>
+        <div class="shot"><img src="images/cod.png" alt="Call of Duty: Modern Warfare II running through Vypr" width="2000" height="1126" loading="lazy"></div>
+        <figcaption>Call of Duty: Modern Warfare II, launched from Steam in the guest</figcaption>
+      </figure>
+    </div>
+  </header>
+</div>
+
+<!-- ============================= the path ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>The path</span></div>
+    <div class="col">
+      <h2>Everything else re-encodes the picture. This doesn't.</h2>
+      <p class="lede">
+        WinApps and WinBoat solve the same shape of problem, and both do it over RDP
+        RemoteApp. That one choice is what most of the difference comes down to.
+      </p>
+      <p>
+        RDP's video path was designed for documents. It is fine for a text editor and it
+        falls apart on anything that moves, because every frame is encoded on one side and
+        decoded on the other before you see it. Vypr writes frames into a region of memory
+        the host and guest both hold, and the host draws them. There is no encoder to wait
+        for and nothing to lose.
+      </p>
+
+      <svg class="diagram" viewBox="0 0 720 208" role="img" aria-label="Diagram comparing the RDP path, which encodes and decodes every frame, with Vypr's path through shared memory">
+        <title>How the picture travels</title>
+        <defs>
+          <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 1 L7 4 L0 7" fill="none" stroke="currentColor" stroke-width="1.2" class="d-arrow"/>
+          </marker>
+        </defs>
+
+        <!-- RDP row -->
+        <text x="0" y="14" class="d-label">OVER RDP</text>
+        <rect x="0"   y="28" width="118" height="34" rx="2" class="d-box"/>
+        <text x="59"  y="49" class="d-ink" text-anchor="middle">guest GPU</text>
+        <path d="M124 45 H150" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="156" y="28" width="96" height="34" rx="2" class="d-box-cost"/>
+        <text x="204" y="49" class="d-label" text-anchor="middle">encode</text>
+        <path d="M258 45 H284" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="290" y="28" width="96" height="34" rx="2" class="d-box"/>
+        <text x="338" y="49" class="d-label" text-anchor="middle">network</text>
+        <path d="M392 45 H418" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="424" y="28" width="96" height="34" rx="2" class="d-box-cost"/>
+        <text x="472" y="49" class="d-label" text-anchor="middle">decode</text>
+        <path d="M530 45 H556" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="562" y="28" width="118" height="34" rx="2" class="d-box"/>
+        <text x="621" y="49" class="d-ink" text-anchor="middle">your screen</text>
+        <text x="204" y="78" class="d-label" text-anchor="middle">latency, and artefacts on anything that moves</text>
+
+        <!-- seam: the boundary both rows cross -->
+        <path d="M0 104 H720" class="d-seam" stroke-dasharray="2 6"/>
+
+        <!-- Vypr row -->
+        <text x="0" y="140" class="d-label">WITH VYPR</text>
+        <rect x="0"   y="154" width="118" height="34" rx="2" class="d-box-win"/>
+        <text x="59"  y="175" class="d-ink" text-anchor="middle">guest GPU</text>
+        <path d="M124 171 H150" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="156" y="154" width="230" height="34" rx="2" class="d-box-win"/>
+        <text x="271" y="175" class="d-ink" text-anchor="middle">shared memory, uncompressed</text>
+        <path d="M392 171 H418" class="d-arrow" marker-end="url(#ah)"/>
+        <rect x="424" y="154" width="118" height="34" rx="2" class="d-box-win"/>
+        <text x="483" y="175" class="d-ink" text-anchor="middle">your screen</text>
+        <text x="560" y="175" class="d-label">4K at 60 fps, measured</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= what it does ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>What it does</span></div>
+    <div class="col">
+      <h2>A window, not a desktop.</h2>
+      <ul class="plain">
+        <li><b>Any Windows application, as its own native window.</b> Several at once, each its own. Starting a second does not disturb the first.</li>
+        <li><b>Games, including ones that capture the mouse</b> and read raw input, through kernel-level HID injection.</li>
+        <li><b>Controllers</b>, presented to Windows as real XInput devices.</li>
+        <li><b>Audio</b>, pinned to whatever the application is actually playing to &mdash; and your microphone, as an ordinary Windows device.</li>
+        <li><b>Notifications the guest raises</b> appear as ordinary desktop notifications here, even from an app that is minimised or not being streamed at all.</li>
+        <li><b>Double-click a Linux file to open it in a Windows application</b> &mdash; a <code>.psd</code> in Photoshop, an installer, a document. Saving writes back to the file you opened, not to a copy stranded in the VM.</li>
+        <li><b>Drag a file from the Linux desktop</b> straight onto a running Windows application.</li>
+        <li><b>A folder from this machine, mounted in Windows as a drive</b> over virtiofs. Files inside it are opened directly &mdash; no copy anywhere.</li>
+        <li><b>Menus, popups and dialogs</b>, positioned against the window they belong to.</li>
+        <li><b>Windows come back where you left them</b>, at the size you left them.</li>
+        <li><b>The guest's whole screen when something is wrong</b>, at its own size or scaled to a window that fits.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= comparison ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>How it compares</span></div>
+    <div class="col">
+      <h2>Where it wins, it wins on what it was built for.</h2>
+      <p>
+        Rows Vypr cannot claim are grouped at the foot, rather than left for you to find.
+        Compared against WinApps and WinBoat documentation as of August&nbsp;2026.
+      </p>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th scope="col">&nbsp;</th><th scope="col" style="text-align:center">WinApps</th><th scope="col" style="text-align:center">WinBoat</th><th scope="col" style="text-align:center">Vypr</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="feat">Windows apps as native Linux windows</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
+            <tr class="win"><td class="feat">How the picture travels</td><td class="c">RDP codec</td><td class="c">RDP codec</td><td class="c">shared memory</td></tr>
+            <tr class="win"><td class="feat">Frame latency</td><td class="c">encode + decode</td><td class="c">encode + decode</td><td class="c">no codec</td></tr>
+            <tr class="win"><td class="feat">GPU acceleration inside the guest</td><td class="c mk-n">no</td><td class="c mk-n">planned</td><td class="c mk-y">passed-through GPU</td></tr>
+            <tr class="win"><td class="feat">Demanding games</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">4K at 60 fps</td></tr>
+            <tr class="win"><td class="feat">Games that read raw mouse input</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
+            <tr class="win"><td class="feat">Controllers</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">real XInput</td></tr>
+            <tr class="win"><td class="feat">Opening a Linux file in a Windows app<span class="note">and saves come back to it</span></td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
+            <tr class="win"><td class="feat">Dragging a file onto a running Windows app</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
+            <tr class="win"><td class="feat">Windows notifications on the Linux desktop</td><td class="c mk-n">no</td><td class="c mk-n">no</td><td class="c mk-y">yes</td></tr>
+            <tr><td class="feat">Audio<span class="note">Vypr pins it to the app's own device</span></td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
+            <tr><td class="feat">Microphone into the guest</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
+            <tr><td class="feat">A folder from Linux, inside Windows</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">virtiofs</td></tr>
+            <tr><td class="feat">Finds your apps for you</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y"><code>vypr detect</code></td></tr>
+            <tr><td class="feat">Fullscreen, minimise and window buttons</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
+            <tr><td class="feat">Seeing the guest's whole screen</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td></tr>
+            <tr><td class="feat">Clipboard sharing</td><td class="c mk-y">yes</td><td class="c mk-y">yes</td><td class="c" style="color:var(--muted)">text only</td></tr>
+            <tr><td class="feat">Setup effort</td><td class="c">guided</td><td class="c">guided</td><td class="c" style="color:var(--muted)">two installers,<br>plus passthrough</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p style="margin-top:22px">
+        <strong>Where it loses, it loses on reach.</strong> It needs a second GPU, which most
+        machines do not have and which cannot be worked around. There is no graphical
+        manager. If you want Office or Photoshop occasionally on an ordinary laptop, WinApps
+        or WinBoat will cost you far less effort and serve you better. Vypr is for the case
+        they cannot reach &mdash; when the thing you are running has to be fast, and you have
+        a second GPU to give it.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= what it doesn't ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>What it doesn't</span></div>
+    <div class="col">
+      <h2>The parts that don't work, in full.</h2>
+      <p>
+        Every one of these is checked for and explained by <code>vypr doctor</code> rather
+        than left to fail quietly.
+      </p>
+      <ul class="caveats">
+        <li><b>Exclusive fullscreen has nothing to capture.</b> The game bypasses the compositor entirely. Set it to borderless or windowed &mdash; Vypr says so when it happens instead of showing a black window.</li>
+        <li><b>Games that read raw mouse input need Parsec running in the guest</b>, for its driver only. Nothing in userspace can produce the mouse deltas they expect. Everything else works without it.</li>
+        <li><b>The passed-through GPU needs a display</b> &mdash; a monitor or a dummy plug. The compositor has nothing to draw on otherwise.</li>
+        <li><b>Clipboard is text only.</b> Images and file lists need a format negotiation the protocol does not have.</li>
+        <li><b>Dragging goes one way, and files only.</b> Out of Windows is not implemented, and neither are folders.</li>
+        <li><b>Administrator prompts cannot be answered through Vypr.</b> Windows draws the UAC prompt on the secure desktop and refuses injected input to it. <code>vypr open-elevation</code> turns the prompt off inside the VM, which is what makes installers work.</li>
+        <li><b>A file outside the shared folder is copied, not shared.</b> Each saved version is copied back out, usually within seconds &mdash; invisible in ordinary use, and wrong if you edit the same file on both sides at once.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= requirements ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>What you need</span></div>
+    <div class="col">
+      <h2>Vypr does not create your VM. It makes an existing one useful.</h2>
+      <div class="gate">
+        <p><strong>A second GPU, passed through to a Windows VM under libvirt, with IOMMU on.</strong>
+        This is the hard requirement and the reason Vypr is not for everyone. It cannot be
+        worked around &mdash; the guest renders on real hardware, and that hardware has to be
+        given to it.</p>
+        <p>Beyond that: a Linux desktop with SDL3, CMake, Ninja and a C++ compiler, and
+        Windows&nbsp;10 1903 or newer in the guest. Both installers check for all of it and
+        say plainly what is missing rather than failing halfway through.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= install ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>Getting started</span></div>
+    <div class="col">
+      <h2>Two installers, one per side.</h2>
+
+      <h3>On Linux, from a clone</h3>
+      <pre><code>./install/install.sh</code></pre>
+      <p>
+        It builds and installs the binaries, configures your VM, generates a key for the
+        guest, and prints the two commands that need root rather than asking for your
+        password. It only changes the VM where something is actually missing, and saves the
+        original settings first.
+      </p>
+
+      <h3>In Windows</h3>
+      <p>
+        Run <code>vypr-setup.exe</code> from the
+        <a href="https://github.com/Amzi-01/Vypr/releases/latest">latest release</a> inside
+        the VM. One file, nothing to unpack: it carries the agent, installs the two drivers
+        Vypr needs, and authorises the key the Linux installer printed.
+      </p>
+
+      <h3>Then let it find your apps</h3>
+      <pre><code>vypr detect</code></pre>
+      <p>
+        That reads the guest's desktop &mdash; shortcuts and Steam entries alike &mdash;
+        lists what it found, and adds the ones you pick, pulling each app's real icon out of
+        the guest executable so it lands in your application menu like anything else.
+      </p>
+
+      <h3>Day to day</h3>
+      <dl class="cmds">
+        <dt>vypr run &lt;app&gt;</dt><dd>start it, bringing up the VM and session if needed</dd>
+        <dt>vypr add &lt;app&gt; &lt;path&gt;</dt><dd>register a Windows application by path, or a Steam URL</dd>
+        <dt>vypr open &lt;file&gt;</dt><dd>open a Linux file in the Windows app that handles it</dd>
+        <dt>vypr associate</dt><dd>make double-clicking <code>.psd</code>, <code>.exe</code> and friends do that</dd>
+        <dt>vypr --debug desktop</dt><dd>stream the guest's whole screen, for when something is wrong</dd>
+        <dt>vypr doctor</dt><dd>check the setup for the things that fail quietly</dd>
+      </dl>
+      <p style="margin-top:22px">
+        Close the last window and the VM shuts itself down a minute later. Launching
+        something during that minute cancels it.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= origin ============================= -->
+<section class="band">
+  <div class="wrap band-inner">
+    <div class="rail"><span>Where it came from</span></div>
+    <div class="col">
+      <h2>It started with one goal: play FiveM on Linux.</h2>
+      <p>
+        FiveM does not run under Wine, and the usual answers were all unsatisfying. A
+        whole-desktop stream means alt-tabbing inside someone else's desktop. RDP hands over
+        individual windows properly, but its video path was built for documents and falls
+        apart on anything that moves. Running the game on a second machine means owning a
+        second machine.
+      </p>
+      <p>
+        What was actually wanted was narrower than any of those: <strong>one window, from the
+        VM, behaving like a native one.</strong> Vypr is that, and it turned out to work for
+        everything else in the VM too.
+      </p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <small>
+      Vypr is in the public domain under the Unlicense. No rights reserved &mdash; copy it,
+      change it, sell it, with or without credit. No warranty of any kind.
+    </small>
+    <nav>
+      <a href="https://github.com/Amzi-01/Vypr">Source</a>
+      <a href="https://github.com/Amzi-01/Vypr/releases/latest">Releases</a>
+      <a href="https://github.com/Amzi-01/Vypr/blob/master/docs/technical.md">Technical notes</a>
+      <a href="https://github.com/Amzi-01/Vypr/blob/master/docs/vm-setup.md">VM setup</a>
+      <a href="https://github.com/Amzi-01/Vypr/blob/master/LICENSE">Unlicense</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>
