@@ -234,6 +234,14 @@ input goes straight through to Windows. Decorating it with the compositor as
 well would mean two sets of chrome for one window, with the outer set operating
 on a picture of the inner one.
 
+The whole-screen view is the exception and is decorated normally. A screen has
+no title bar inside it to grab, so undecorated its only handle was the strip the
+hit test invents for windows that report no chrome of their own - 32 guest pixels
+across the top, taken out of the picture and turned into a drag handle. That band
+is the top of the guest's desktop, which is somewhere one actually clicks. Given
+a real title bar it is dragged by that instead, and it gets no hit test at all,
+so the whole picture stays the guest's.
+
 ## Audio
 
 The guest captures its default playback endpoint with WASAPI loopback and sends
