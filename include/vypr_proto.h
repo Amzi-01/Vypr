@@ -89,6 +89,19 @@ enum vypr_msg_type {
     VYPR_MSG_CLIP_IMAGE_END   = 15,  /* no payload */
 
     /*
+     * What a drag leaving the guest is carrying.
+     *
+     * Sent in answer to VYPR_MSG_DRAG_PROBE, and only when a drag really was
+     * in flight. Paths rather than bytes: most of what anyone drags out of a
+     * streamed window is already visible to the host through the shared
+     * folder, and for those there is nothing to copy - the host makes a
+     * file:// URI out of the same file. A path that is not on the share
+     * cannot be offered yet; sending its contents is a separate exchange and
+     * is not implemented.
+     */
+    VYPR_MSG_DRAG_FILES       = 16,  /* vypr_msg_drag_files + NUL-separated utf8 */
+
+    /*
      * The same three, going the other way: an image copied here, on its way to
      * the guest's clipboard. Separate ids rather than reusing the ones above,
      * because a message travelling in both directions on one link is a bounce
@@ -152,6 +165,20 @@ enum vypr_msg_type {
      * away every stream in flight to learn one name.
      */
     VYPR_MSG_RESCAN           = 80,  /* no payload */
+
+    /*
+     * Ask whether a drag is leaving the window.
+     *
+     * The host cannot see into the guest's drag loop, and the guest cannot see
+     * the host's pointer. What the host does know is that its pointer crossed
+     * the edge of the window with a button held, which is the only moment a
+     * drag can be on its way out - so it asks then, and only then.
+     *
+     * Answering means putting a window under the guest's cursor and letting
+     * OLE deliver the drag to it, which is intrusive enough that it must not
+     * happen on speculation.
+     */
+    VYPR_MSG_DRAG_PROBE       = 81,  /* vypr_msg_drag_probe */
 
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
@@ -375,6 +402,24 @@ struct vypr_msg_drop_data {
     uint64_t window_id;
     uint32_t bytes;              /* raw file bytes follow */
     uint32_t _pad;
+};
+
+/* Where the pointer left the window, in captured-surface pixels. */
+struct vypr_msg_drag_probe {
+    uint64_t window_id;
+    int32_t  x, y;
+};
+
+/*
+ * Followed by `bytes` of UTF-8 paths, each NUL-terminated, `count` of them.
+ * Guest paths as the guest sees them: translating to something the host can
+ * open is the host's job, because only the host knows where the share is
+ * mounted on its side.
+ */
+struct vypr_msg_drag_files {
+    uint64_t window_id;
+    uint32_t count;
+    uint32_t bytes;
 };
 
 struct vypr_msg_drop_end {

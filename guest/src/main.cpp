@@ -31,6 +31,7 @@
 #include "capture.hpp"
 #include "control.hpp"
 #include "drop.hpp"
+#include "dragout.hpp"
 #include "notify.hpp"
 #include "input.hpp"
 #include "ivshmem.hpp"
@@ -68,6 +69,7 @@ private:
     vypr::Clipboard    clipboard_;
     vypr::Gamepads     gamepads_;
     vypr::Drop         drop_;
+    vypr::DragOut dragout_;
     std::vector<std::uint8_t> clip_in_;   /* a clipboard image being received */
     vypr::Notifications notify_;
 
@@ -462,6 +464,46 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
             pong.guest_qpc_freq = static_cast<std::uint64_t>(freq.QuadPart);
             control_.send(VYPR_MSG_PONG, &pong, sizeof(pong));
         }
+        break;
+    }
+
+    /*
+     * The host's pointer left a window with a button held, so a drag may be on
+     * its way out. Look, and answer only if there was something to find - an
+     * empty answer would still cost a round trip on the control channel for
+     * every stray mouse movement past a window edge.
+     */
+    case VYPR_MSG_DRAG_PROBE: {
+        const auto* m = as<vypr_msg_drag_probe>(payload, bytes);
+        if (!m) break;
+
+        const std::vector<std::wstring> files = dragout_.probe();
+        if (files.empty()) break;
+
+        std::string blob;
+        std::uint32_t count = 0;
+        for (const std::wstring& w : files) {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1,
+                                              nullptr, 0, nullptr, nullptr);
+            if (n <= 0) continue;
+            const std::size_t at = blob.size();
+            blob.resize(at + static_cast<std::size_t>(n));   /* n includes the NUL */
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, blob.data() + at, n,
+                                nullptr, nullptr);
+            count++;
+        }
+        if (!count) break;
+
+        vypr_msg_drag_files hdr{};
+        hdr.window_id = m->window_id;
+        hdr.count     = count;
+        hdr.bytes     = static_cast<std::uint32_t>(blob.size());
+
+        std::vector<std::uint8_t> out(sizeof(hdr) + blob.size());
+        std::memcpy(out.data(), &hdr, sizeof(hdr));
+        std::memcpy(out.data() + sizeof(hdr), blob.data(), blob.size());
+        control_.send(VYPR_MSG_DRAG_FILES, out.data(),
+                      static_cast<std::uint32_t>(out.size()));
         break;
     }
 
