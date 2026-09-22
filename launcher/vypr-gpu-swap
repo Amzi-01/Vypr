@@ -113,6 +113,17 @@ bind_to() {
 
     cur=$(driver_of "$d")
     if [ "$want" = "auto" ]; then
+        # Verified, not just reported. If a vfio.conf named this card's ids at
+        # boot, those ids are still in vfio-pci's live table and it re-claims
+        # the device the instant it is re-probed - so the card never comes back
+        # and the only sign is a line that reads like success.
+        if [ "$cur" = "vfio-pci" ]; then
+            say "$d is still on vfio-pci - it was claimed straight back."
+            say "  vfio-pci was loaded with ids= for this card; deleting the"
+            say "  modprobe.d file does not clear the running module. Run:"
+            say "    echo '<vendor> <device>' > /sys/bus/pci/drivers/vfio-pci/remove_id"
+            return 1
+        fi
         say "$d -> ${cur:-(none)}"
     elif [ "$cur" != "$want" ]; then
         die "$d: wanted $want, ended up on ${cur:-nothing}"
