@@ -164,28 +164,35 @@ cmd_to_host() {
 
 [ $# -ge 1 ] || die "usage: vypr-gpu-swap {to-vm|to-host|status} <domain>"
 action="$1"; shift
-
 domain="${1:-}"
-if [ -z "$domain" ] && [ -r "$CONF" ]; then
-    # shellcheck source=/dev/null
-    . "$CONF"
-    domain="${DOMAIN:-}"
-fi
-[ -n "$domain" ] || die "no domain given and none in $CONF"
 
-# Only ever act on the domain that was opted in. The hook fires for every VM on
-# the machine, and silently rebinding somebody else's GPU would be rude.
+# The conf is the opt-in, and the only opt-in. Nothing here acts on a domain
+# that is not named in it.
+opted_in=""
 if [ -r "$CONF" ]; then
     # shellcheck source=/dev/null
     . "$CONF"
-    if [ -n "${DOMAIN:-}" ] && [ "$domain" != "$DOMAIN" ]; then
-        exit 0
-    fi
+    opted_in="${DOMAIN:-}"
 fi
 
 case "$action" in
-    to-vm)   [ "$(id -u)" = 0 ] || die "needs root"; cmd_to_vm   "$domain" ;;
-    to-host) [ "$(id -u)" = 0 ] || die "needs root"; cmd_to_host "$domain" ;;
-    status)  cmd_status "$domain" ;;
-    *)       die "unknown action '$action'" ;;
+    to-vm|to-host)
+        # The hook runs for every guest on the machine, so both of these are
+        # ordinary "not mine" cases and must leave without a word and without a
+        # failure. An exit code here aborts somebody else's VM: when this
+        # returned "needs root" for an unconfigured machine, installing the
+        # hook without the conf stopped every guest on the box from starting.
+        [ -n "$opted_in" ]          || exit 0
+        [ "$domain" = "$opted_in" ] || exit 0
+        [ "$(id -u)" = 0 ] || die "needs root"
+        [ "$action" = to-vm ] && cmd_to_vm "$domain" || cmd_to_host "$domain"
+        ;;
+    status)
+        # Readable by anyone, about any domain, so the setup can be inspected
+        # before any of it is turned on.
+        [ -n "$domain" ] || domain="$opted_in"
+        [ -n "$domain" ] || die "no domain given and none in $CONF"
+        cmd_status "$domain"
+        ;;
+    *) die "unknown action '$action'" ;;
 esac
