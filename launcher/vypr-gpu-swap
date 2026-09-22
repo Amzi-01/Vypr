@@ -159,7 +159,9 @@ cmd_status() {
         local users; users=$(gpu_users "$d")
         printf '  %s  driver=%-14s %s\n' "$d" "$(driver_of "$d" || echo none)" \
             "$([ -n "$users" ] && echo "IN USE" || echo free)"
-        [ -n "$users" ] && printf '%s\n' "$users"
+        # if, not &&: a trailing test that fails is the loop's exit status, and
+        # reporting a free card made `status` exit 1 as though it had failed.
+        if [ -n "$users" ]; then printf '%s\n' "$users"; fi
     done
 }
 
