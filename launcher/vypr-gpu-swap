@@ -35,9 +35,16 @@ die()  { printf 'vypr-gpu-swap: %s\n' "$*" >&2; exit 1; }
 # of them - the display function and its HDMI audio - and they have to move
 # together, because they share an IOMMU group and vfio takes the group or
 # nothing.
-domain_devices() {
-    local domain="$1"
-    virsh --connect qemu:///system dumpxml --inactive "$domain" 2>/dev/null | python3 -c '
+#
+# The XML comes from stdin when libvirt supplies it, and only otherwise from
+# virsh. That is not a preference, it is the difference between working and
+# hanging forever: libvirtd holds the domain's lock for the whole time the hook
+# runs, so a `virsh dumpxml` from inside the hook waits on a lock that cannot
+# be released until the hook it is blocking returns. Every later virsh command
+# against that domain then queues behind it, and the VM never starts. libvirt
+# already feeds the hook the full domain XML on stdin for exactly this reason.
+devices_from_xml() {
+    python3 -c '
 import sys, xml.etree.ElementTree as ET
 try:
     root = ET.fromstring(sys.stdin.read())
@@ -53,6 +60,18 @@ for hd in root.iter("hostdev"):
         return format(int(a.get(x, "0"), 16), "0%dx" % w)
     print("%s:%s:%s.%s" % (n("domain", 4), n("bus", 2), n("slot", 2), n("function", 1)))
 '
+}
+
+# Set once at entry: the XML libvirt handed us, or nothing.
+DOMAIN_XML=""
+
+domain_devices() {
+    local domain="$1"
+    if [ -n "$DOMAIN_XML" ]; then
+        printf '%s' "$DOMAIN_XML" | devices_from_xml
+    else
+        virsh --connect qemu:///system dumpxml --inactive "$domain" 2>/dev/null | devices_from_xml
+    fi
 }
 
 driver_of() {
@@ -210,6 +229,13 @@ fi
 
 case "$action" in
     to-vm|to-host)
+        # Whatever libvirt put on stdin. A terminal is not it - run by hand
+        # there is no hook and no lock, so falling back to virsh is safe - and
+        # neither is an empty pipe, which is what a hook of another shape, or
+        # a caller redirecting from /dev/null, leaves behind.
+        if [ ! -t 0 ]; then DOMAIN_XML=$(cat); fi
+        case "$DOMAIN_XML" in *"<domain"*) ;; *) DOMAIN_XML="" ;; esac
+
         # The hook runs for every guest on the machine, so both of these are
         # ordinary "not mine" cases and must leave without a word and without a
         # failure. An exit code here aborts somebody else's VM: when this
