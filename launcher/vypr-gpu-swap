@@ -65,14 +65,17 @@ for hd in root.iter("hostdev"):
 # Set once at entry: the XML libvirt handed us, or nothing.
 DOMAIN_XML=""
 
-domain_devices() {
-    local domain="$1"
+# What libvirt handed us, or - only outside a hook, where there is no lock to
+# deadlock against - what virsh can fetch.
+domain_xml_text() {
     if [ -n "$DOMAIN_XML" ]; then
-        printf '%s' "$DOMAIN_XML" | devices_from_xml
+        printf '%s' "$DOMAIN_XML"
     else
-        virsh --connect qemu:///system dumpxml --inactive "$domain" 2>/dev/null | devices_from_xml
+        virsh --connect qemu:///system dumpxml --inactive "$1" 2>/dev/null
     fi
 }
+
+domain_devices() { domain_xml_text "$1" | devices_from_xml; }
 
 driver_of() {
     local d="$1" p
@@ -112,8 +115,14 @@ gpu_users() {
         }'
 }
 
-# Kept as a second opinion only. When it does fire it is right; it just cannot
-# be relied on to fire, for the reason above.
+# The sysfs fallback, for cards nvidia-smi has never heard of.
+#
+# Only for those. Under the nvidia driver this attribute is wrong in both
+# directions and cannot be used at all: it read "disabled" for two 4K panels
+# that were lit, and later "enabled" for an output with a cable in it that the
+# compositor had switched off - which refused every swap on this machine with
+# "it is driving a display" while nvidia-smi showed nothing on the card at all.
+# On amdgpu and i915 it means what it says.
 drives_a_display() {
     local d="$1" c st en
     for c in "$SYSPCI/devices/$d"/drm/card*/card*-*; do
@@ -123,6 +132,27 @@ drives_a_display() {
         [ "$st" = "connected" ] && [ "$en" = "enabled" ] && return 0
     done
     return 1
+}
+
+# Does libvirt move these devices itself?
+#
+# managed='yes' on a <hostdev> means libvirt detaches the device from its host
+# driver before the guest starts and reattaches it afterwards - the swap,
+# already implemented, by the thing that owns the domain. Doing it as well is
+# not redundant so much as a race: both sides take the same PCI device lock,
+# and the hook's write to drivers_probe waits for a reattach that is waiting
+# for the hook to return. So when libvirt manages them, this checks and gets
+# out of the way.
+domain_managed() {
+    domain_xml_text "$1" | python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+pci = [h for h in root.iter("hostdev") if h.get("type") == "pci"]
+sys.exit(0 if pci and all(h.get("managed") == "yes" for h in pci) else 1)
+'
 }
 
 bind_to() {
@@ -192,15 +222,24 @@ cmd_to_vm() {
     # Checked before anything is unbound, so a refusal leaves the machine
     # exactly as it was rather than half-swapped.
     for d in $devs; do
-        if drives_a_display "$d"; then
-            die "$d is driving a display. Moving it would take your desktop with it - plug the monitors into the other card first."
-        fi
         users=$(gpu_users "$d")
         if [ -n "$users" ]; then
             printf 'vypr-gpu-swap: %s is still in use:\n%s\n' "$d" "$users" >&2
             die "$d: nothing may be holding the card. An X server opens every GPU it can see unless told not to - Option \"AutoAddGPU\" \"false\" in xorg.conf keeps it off this one."
         fi
+        # Only where nvidia-smi could not answer. Asking sysfs about an nvidia
+        # card contradicts the check above and loses to it. Emptiness is the
+        # test, not the exit status: the function succeeds and prints nothing
+        # for a card nvidia-smi does not list.
+        if [ -z "$(nvidia_index_of "$d")" ] && drives_a_display "$d"; then
+            die "$d is driving a display. Moving it would take your desktop with it - plug the monitors into the other card first."
+        fi
     done
+
+    if domain_managed "$domain"; then
+        say "the card is free; libvirt will move it (managed='yes')"
+        return 0
+    fi
 
     for d in $devs; do bind_to "$d" vfio-pci; done
 }
@@ -209,7 +248,18 @@ cmd_to_host() {
     local domain="$1" d
     # No refusals on the way back: the guest has stopped, the card is free, and
     # failing here would leave it bound to nothing at all.
-    for d in $(domain_devices "$domain"); do bind_to "$d" auto; done
+    #
+    # Devices on vfio-pci only. A card that is already back on its host driver
+    # is not something to put back - unbinding it to rebind the same driver is
+    # a long wait at best, and on a failed start, where the card never left, it
+    # took the card away from a working desktop driver and hung in the probe.
+    for d in $(domain_devices "$domain"); do
+        if [ "$(driver_of "$d")" = "vfio-pci" ]; then
+            bind_to "$d" auto
+        else
+            say "$d is on $(driver_of "$d" || echo nothing) already; leaving it"
+        fi
+    done
 }
 
 # --------------------------------------------------------------------- entry
