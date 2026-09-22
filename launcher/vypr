@@ -33,7 +33,11 @@ SHM_SIZE_MB_DEFAULT=512
 # shellcheck source=/dev/null
 . "$CONF"
 : "${VM:?VM is not set in $CONF}"
-: "${GUEST:?GUEST is not set in $CONF}"
+# Not fatal when empty. A VM that has just been rebuilt has no address yet, and
+# refusing to start meant none of the host-side commands ran either - including
+# the ones you would use while setting it up. resolve_guest treats "auto" as
+# "ask libvirt", which is the right answer here anyway.
+: "${GUEST:=auto}"
 : "${GUEST_USER:=Lucy}"
 
 APP_NAME="Vypr"; APP_ICON="vypr"
@@ -1229,6 +1233,77 @@ cmd_desktop() {
     die "the desktop did not appear - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
 }
 
+# ---------------------------------------------------- experimental: gpu swap
+#
+# Move the passed-through GPU between this machine and the VM, instead of
+# surrendering it at boot and not seeing it again until a reboot.
+#
+# Experimental, and under --debug on purpose. It rebinds a PCI device out from
+# under a running system: when it goes wrong on a card that turns out to be
+# drawing your desktop, it goes wrong in the most visible way there is. The
+# helper refuses that case, but "refuses" is a promise made by a script.
+cmd_gpu_swap() {
+    local helper=/usr/local/bin/vypr-gpu-swap
+    local hookdir=/etc/libvirt/hooks/qemu.d
+    local conf=/etc/vypr/gpu-swap.conf
+    local src_helper="$BIN/vypr-gpu-swap"
+    local src_hook; src_hook="$(dirname "$BIN")/share/vypr/hooks/vypr-gpu"
+    [ -f "$src_hook" ] || src_hook="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/install/hooks/vypr-gpu"
+
+    case "${1:-status}" in
+    status)
+        if [ -x "$helper" ] && [ -x "$hookdir/vypr-gpu" ] && [ -r "$conf" ]; then
+            echo "  enabled for $(sed -n 's/^DOMAIN="\(.*\)"/\1/p' "$conf" 2>/dev/null)"
+        else
+            echo "  not enabled - 'vypr --debug gpu-swap --enable' prints how"
+        fi
+        if [ -x "$helper" ]; then
+            "$helper" status "$VM" 2>/dev/null
+        else
+            # Readable without the helper installed, so you can see what would
+            # move before agreeing to anything.
+            virsh dumpxml --inactive "$VM" 2>/dev/null |
+                grep -A3 "<hostdev" | grep -oE "bus='0x[0-9a-f]+' slot='0x[0-9a-f]+' function='0x[0-9a-f]+'" |
+                sed "s/bus='0x\(..\)' slot='0x\(..\)' function='0x\(.\)'/  0000:\1:\2.\3/"
+        fi
+        ;;
+    --enable)
+        [ -f "$src_helper" ] || die "$src_helper is missing - reinstall"
+        [ -f "$src_hook" ]   || die "$src_hook is missing - reinstall"
+        cat <<EOF
+
+  EXPERIMENTAL. This hands the VM's GPU over when it starts and takes
+  it back when it stops. It refuses to move a card that is driving a display,
+  so plug your monitors into the other one first.
+
+  These need root, so they are yours to run:
+
+    sudo install -Dm755 $src_helper $helper
+    sudo install -Dm755 $src_hook $hookdir/vypr-gpu
+    printf 'DOMAIN="%s"\n' '$VM' | sudo install -Dm644 /dev/stdin $conf
+
+  And the card must not be claimed by vfio-pci at boot any more, or there is
+  nothing to swap - it is already gone. Check /etc/modprobe.d for a vfio.conf
+  naming its ids, and rebuild the initramfs after changing it.
+
+EOF
+        ;;
+    --disable)
+        cat <<EOF
+
+  These need root:
+
+    sudo rm -f $hookdir/vypr-gpu $conf
+
+  The helper itself is harmless left in place; without the hook nothing calls
+  it. Put the vfio.conf back if you want the card surrendered at boot again.
+
+EOF
+        ;;
+    *) echo "vypr: --debug gpu-swap takes: status, --enable, --disable" >&2; return 2 ;;
+    esac
+}
+
 cmd_apps() {
     [ -d "$APPS" ] && ls -1 "$APPS"/*.conf 2>/dev/null | while read -r f; do
         printf '  %-16s %s\n' "$(basename "$f" .conf)" "$(sed -n 's/^NAME="\(.*\)"/\1/p' "$f")"
@@ -1566,7 +1641,8 @@ case "${1:-}" in
         case "${1:-}" in
             desktop) cmd_desktop ;;
             resolution) shift; cmd_resolution "$@" ;;
-            *) echo "vypr: --debug takes: desktop, resolution" >&2; exit 2 ;;
+            gpu-swap) shift; cmd_gpu_swap "$@" ;;
+            *) echo "vypr: --debug takes: desktop, resolution, gpu-swap" >&2; exit 2 ;;
         esac
         ;;
     detect) cmd_detect ;;

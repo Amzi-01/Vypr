@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+#
+# libvirt hook: hand the passed-through GPU to the guest and take it back.
+#
+# Installed as /etc/libvirt/hooks/qemu.d/vypr-gpu rather than as the hook
+# itself. libvirt runs every executable in that directory, so this sits
+# alongside whatever hook is already there instead of replacing it - this
+# machine already has one keeping the Windows disk mount in step with the
+# guest's power state, and that must keep working.
+#
+# prepare runs before the guest starts and release after it has fully stopped,
+# which is exactly when the card is free at each end.
+#
+# A non-zero exit from prepare aborts the start. That is deliberate: booting a
+# guest whose GPU is still bound to the host driver gets you a VM with no
+# display and a long look through the logs, and the helper refuses precisely
+# when moving the card would have taken the desktop with it.
+set -uo pipefail
+
+domain=$1
+operation=$2
+
+SWAP=/usr/local/bin/vypr-gpu-swap
+[ -x "$SWAP" ] || exit 0
+
+case $operation in
+    prepare)
+        "$SWAP" to-vm "$domain" || exit 1
+        ;;
+    release)
+        # Never fatal. The guest has already stopped by now, so failing here
+        # would achieve nothing except an error in the log - and the card being
+        # left unbound is better reported than it is retried blindly.
+        "$SWAP" to-host "$domain" || true
+        ;;
+esac
+
+exit 0

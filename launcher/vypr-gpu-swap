@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# vypr-gpu-swap - move the passed-through GPU between the host and the VM.
+#
+# EXPERIMENTAL. Off unless you turn it on with `vypr gpu-swap --enable`.
+#
+# Without this, a GPU given to a VM is given to it at boot: vfio-pci claims it
+# by device id before the nvidia driver is loaded, and Linux never sees it
+# again until you reboot. That is a whole graphics card doing nothing whenever
+# the VM is off.
+#
+# This unbinds it on demand instead. libvirt calls it from a hook: `prepare`
+# hands the card to vfio-pci before the guest starts, `release` hands it back
+# once the guest has stopped. Nothing needs a reboot and nothing needs the
+# display manager restarted - provided the card is not the one drawing your
+# desktop, which is checked rather than assumed.
+#
+#   vypr-gpu-swap to-vm   <domain>
+#   vypr-gpu-swap to-host <domain>
+#   vypr-gpu-swap status  <domain>
+#
+# The devices are read from the domain's own <hostdev> entries, so there is no
+# second list to keep in step with the XML.
+set -uo pipefail
+
+CONF=/etc/vypr/gpu-swap.conf
+SYSPCI=/sys/bus/pci
+
+say()  { printf 'vypr-gpu-swap: %s\n' "$*"; }
+die()  { printf 'vypr-gpu-swap: %s\n' "$*" >&2; exit 1; }
+
+# --------------------------------------------------------------- the devices
+#
+# Every PCI hostdev the domain asks for, as 0000:BB:DD.F. A GPU is at least two
+# of them - the display function and its HDMI audio - and they have to move
+# together, because they share an IOMMU group and vfio takes the group or
+# nothing.
+domain_devices() {
+    local domain="$1"
+    virsh --connect qemu:///system dumpxml --inactive "$domain" 2>/dev/null | python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+for hd in root.iter("hostdev"):
+    if hd.get("type") != "pci":
+        continue
+    a = hd.find("./source/address")
+    if a is None:
+        continue
+    def n(x, w):
+        return format(int(a.get(x, "0"), 16), "0%dx" % w)
+    print("%s:%s:%s.%s" % (n("domain", 4), n("bus", 2), n("slot", 2), n("function", 1)))
+'
+}
+
+driver_of() {
+    local d="$1" p
+    p=$(readlink -f "$SYSPCI/devices/$d/driver" 2>/dev/null) || return 0
+    [ -n "$p" ] && basename "$p"
+}
+
+# Is this card drawing something right now?
+#
+# The one way this goes badly wrong is unbinding the GPU that is running your
+# session: the screens go black and the compositor dies with them. A card with
+# an enabled connector is one somebody is looking at, so that is the test.
+drives_a_display() {
+    local d="$1" c st en
+    for c in "$SYSPCI/devices/$d"/drm/card*/card*-*; do
+        [ -e "$c/status" ] || continue
+        st=$(cat "$c/status" 2>/dev/null)
+        en=$(cat "$c/enabled" 2>/dev/null)
+        [ "$st" = "connected" ] && [ "$en" = "enabled" ] && return 0
+    done
+    return 1
+}
+
+# Anything still using it through the nvidia stack - a CUDA job, a game, an
+# encoder - will make the unbind fail with EBUSY and a useless message, so look
+# first and say something better.
+nvidia_users() {
+    local d="$1"
+    command -v nvidia-smi >/dev/null || return 0
+    nvidia-smi --query-compute-apps=pid,used_memory,name \
+               --format=csv,noheader --id="$d" 2>/dev/null | grep -v '^\s*$'
+}
+
+bind_to() {
+    local d="$1" want="$2" cur
+    cur=$(driver_of "$d")
+
+    if [ "$cur" = "$want" ]; then
+        say "$d already on $want"
+        return 0
+    fi
+
+    if [ -n "$cur" ]; then
+        echo "$d" > "$SYSPCI/drivers/$cur/unbind" 2>/dev/null \
+            || die "$d: could not unbind from $cur (something is still using it)"
+    fi
+
+    # driver_override pins the next probe to exactly one driver. Without it the
+    # kernel picks by id table and nvidia takes the card straight back.
+    if [ "$want" = "auto" ]; then
+        echo "" > "$SYSPCI/devices/$d/driver_override"
+    else
+        echo "$want" > "$SYSPCI/devices/$d/driver_override"
+    fi
+
+    echo "$d" > "$SYSPCI/drivers_probe" 2>/dev/null || true
+
+    cur=$(driver_of "$d")
+    if [ "$want" = "auto" ]; then
+        say "$d -> ${cur:-(none)}"
+    elif [ "$cur" != "$want" ]; then
+        die "$d: wanted $want, ended up on ${cur:-nothing}"
+    else
+        say "$d -> $want"
+    fi
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_status() {
+    local domain="$1" d
+    for d in $(domain_devices "$domain"); do
+        printf '  %s  driver=%-10s display=%s\n' \
+            "$d" "$(driver_of "$d" || echo none)" \
+            "$(drives_a_display "$d" && echo yes || echo no)"
+    done
+}
+
+cmd_to_vm() {
+    local domain="$1" devs d users
+    devs=$(domain_devices "$domain")
+    [ -n "$devs" ] || { say "$domain passes through no PCI devices; nothing to move"; return 0; }
+
+    # Checked before anything is unbound, so a refusal leaves the machine
+    # exactly as it was rather than half-swapped.
+    for d in $devs; do
+        if drives_a_display "$d"; then
+            die "$d is driving a display. Moving it would take your desktop with it - plug the monitors into the other card first."
+        fi
+        users=$(nvidia_users "$d")
+        if [ -n "$users" ]; then
+            printf 'vypr-gpu-swap: %s is in use:\n%s\n' "$d" "$users" >&2
+            die "$d: close those first"
+        fi
+    done
+
+    for d in $devs; do bind_to "$d" vfio-pci; done
+}
+
+cmd_to_host() {
+    local domain="$1" d
+    # No refusals on the way back: the guest has stopped, the card is free, and
+    # failing here would leave it bound to nothing at all.
+    for d in $(domain_devices "$domain"); do bind_to "$d" auto; done
+}
+
+# --------------------------------------------------------------------- entry
+
+[ $# -ge 1 ] || die "usage: vypr-gpu-swap {to-vm|to-host|status} <domain>"
+action="$1"; shift
+
+domain="${1:-}"
+if [ -z "$domain" ] && [ -r "$CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+    domain="${DOMAIN:-}"
+fi
+[ -n "$domain" ] || die "no domain given and none in $CONF"
+
+# Only ever act on the domain that was opted in. The hook fires for every VM on
+# the machine, and silently rebinding somebody else's GPU would be rude.
+if [ -r "$CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+    if [ -n "${DOMAIN:-}" ] && [ "$domain" != "$DOMAIN" ]; then
+        exit 0
+    fi
+fi
+
+case "$action" in
+    to-vm)   [ "$(id -u)" = 0 ] || die "needs root"; cmd_to_vm   "$domain" ;;
+    to-host) [ "$(id -u)" = 0 ] || die "needs root"; cmd_to_host "$domain" ;;
+    status)  cmd_status "$domain" ;;
+    *)       die "unknown action '$action'" ;;
+esac

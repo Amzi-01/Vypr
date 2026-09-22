@@ -107,6 +107,10 @@ fi
 install -Dm755 "$here/host/build/vyprd"        "$PREFIX/bin/vyprd"
 install -Dm755 "$here/host/build/vypr-window"  "$PREFIX/bin/vypr-window"
 install -Dm755 "$here/launcher/vypr"           "$PREFIX/bin/vypr" 2>/dev/null || true
+# Experimental, and inert until `vypr --debug gpu-swap --enable` puts the hook
+# in place - installed here only so that command has something to point at.
+install -Dm755 "$here/launcher/vypr-gpu-swap"  "$PREFIX/bin/vypr-gpu-swap" 2>/dev/null || true
+install -Dm755 "$here/install/hooks/vypr-gpu"  "$PREFIX/share/vypr/hooks/vypr-gpu" 2>/dev/null || true
 ok "installed to $PREFIX/bin"
 
 case ":$PATH:" in
@@ -374,9 +378,14 @@ read -rp "  Windows username [$USER]: " guest_user; guest_user="${guest_user:-$U
 
 cat > "$CONF_DIR/config" <<EOF
 # Written by the Vypr installer on $(date +%Y-%m-%d).
-VM=$DOMAIN
-GUEST=$guest_ip
-GUEST_USER=$guest_user
+#
+# Quoted, because a libvirt domain may be named anything a person can type.
+# Unquoted, a name with a space in it sources as a command: "Microslop Win 11"
+# set VM to "Microslop" and then tried to run "Win", and every later step failed
+# on a VM that was never set.
+VM="$DOMAIN"
+GUEST="$guest_ip"
+GUEST_USER="$guest_user"
 
 # Must match the <shmem> size in the domain. The launcher grows the region to
 # this before starting anything, because the tmpfiles rule recreates it empty.
