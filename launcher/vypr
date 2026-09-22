@@ -1244,7 +1244,11 @@ cmd_desktop() {
 # helper refuses that case, but "refuses" is a promise made by a script.
 cmd_gpu_swap() {
     local helper=/usr/local/bin/vypr-gpu-swap
-    local hookdir=/etc/libvirt/hooks/qemu.d
+    # libvirt runs exactly one file per driver - /etc/libvirt/hooks/qemu - and
+    # has no qemu.d convention, whatever the internet says. A hook dropped in a
+    # directory is never called, and the feature looks installed while doing
+    # nothing at all, so this deals with the one file and says so.
+    local hook=/etc/libvirt/hooks/qemu
     local conf=/etc/vypr/gpu-swap.conf
     local src_helper="$BIN/vypr-gpu-swap"
     local src_hook; src_hook="$(dirname "$BIN")/share/vypr/hooks/vypr-gpu"
@@ -1252,7 +1256,9 @@ cmd_gpu_swap() {
 
     case "${1:-status}" in
     status)
-        if [ -x "$helper" ] && [ -x "$hookdir/vypr-gpu" ] && [ -r "$conf" ]; then
+        local wired=no
+        [ -r "$hook" ] && grep -q vypr-gpu-swap "$hook" 2>/dev/null && wired=yes
+        if [ -x "$helper" ] && [ "$wired" = yes ] && [ -r "$conf" ]; then
             echo "  enabled for $(sed -n 's/^DOMAIN="\(.*\)"/\1/p' "$conf" 2>/dev/null)"
         else
             echo "  not enabled - 'vypr --debug gpu-swap --enable' prints how"
@@ -1279,8 +1285,25 @@ cmd_gpu_swap() {
   These need root, so they are yours to run:
 
     sudo install -Dm755 $src_helper $helper
-    sudo install -Dm755 $src_hook $hookdir/vypr-gpu
     printf 'DOMAIN="%s"\n' '$VM' | sudo install -Dm644 /dev/stdin $conf
+EOF
+        if [ -e "$hook" ]; then
+            cat <<EOF
+
+  You already have $hook, so it is not overwritten. Add these two
+  lines to its case statement instead - beside whatever it does now, because
+  libvirt will only ever run this one file:
+
+    prepare)  $helper to-vm   "\$domain" || exit 1 ;;
+    release)  $helper to-host "\$domain" || true   ;;
+EOF
+        else
+            cat <<EOF
+
+    sudo install -Dm755 $src_hook $hook
+EOF
+        fi
+        cat <<EOF
 
   And the card must not be claimed by vfio-pci at boot any more, or there is
   nothing to swap - it is already gone. Check /etc/modprobe.d for a vfio.conf
@@ -1293,10 +1316,11 @@ EOF
 
   These need root:
 
-    sudo rm -f $hookdir/vypr-gpu $conf
+    sudo rm -f $conf
 
-  The helper itself is harmless left in place; without the hook nothing calls
-  it. Put the vfio.conf back if you want the card surrendered at boot again.
+  Then take the two vypr-gpu-swap lines back out of $hook.
+  The helper itself is harmless left in place; without those lines nothing
+  calls it. Put the vfio.conf back if you want the card surrendered at boot again.
 
 EOF
         ;;

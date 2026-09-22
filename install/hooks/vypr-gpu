@@ -2,11 +2,14 @@
 #
 # libvirt hook: hand the passed-through GPU to the guest and take it back.
 #
-# Installed as /etc/libvirt/hooks/qemu.d/vypr-gpu rather than as the hook
-# itself. libvirt runs every executable in that directory, so this sits
-# alongside whatever hook is already there instead of replacing it - this
-# machine already has one keeping the Windows disk mount in step with the
-# guest's power state, and that must keep working.
+# Installed as /etc/libvirt/hooks/qemu - the whole hook, because libvirt runs
+# exactly one file per driver and has no qemu.d directory convention. A hook
+# dropped in such a directory is never called at all, which looks identical to
+# the feature being installed and simply not working.
+#
+# So if a hook is already there, this file is not what you want: add the two
+# vypr-gpu-swap calls to that one instead. `vypr --debug gpu-swap --enable`
+# looks and prints whichever applies.
 #
 # prepare runs before the guest starts and release after it has fully stopped,
 # which is exactly when the card is free at each end.
