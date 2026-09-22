@@ -31,6 +31,73 @@ head2(){ printf '\n%s%s%s\n' "$bold" "$*" "$rst"; }
 FAIL=0
 MANUAL=()
 
+# ------------------------------------------------------- GPUs and their groups
+#
+# Handing a card to a VM hands over its whole IOMMU group: vfio takes the group
+# or nothing at all. A group is fit for that when everything in it is either
+# another function of the same card - the display half and its HDMI audio half
+# - or a PCI bridge, which is not an endpoint and stays behind. Anything else
+# in there would have to go to the guest as well, and on consumer boards that
+# is usually the SATA controller or the wired NIC.
+#
+# These are used twice: once to judge whether this machine can pass a card
+# through at all, and once to say which card that should be.
+
+gpu_devices() {
+    # 0300 VGA and 0302 3D both count. A card with no display outputs
+    # enumerates as the latter, and is exactly the kind people buy to pass
+    # through. Two passes, not two -d flags: lspci keeps only the last one and
+    # says so on stderr, which is silenced here and would have gone unnoticed.
+    { lspci -Dn -d ::0300 2>/dev/null; lspci -Dn -d ::0302 2>/dev/null; } |
+        awk '{print $1}' | sort -u
+}
+
+gpu_name() { lspci -Dmm -s "$1" 2>/dev/null | awk -F'"' '{printf "%s %s", $4, $6}'; }
+
+gpu_driver() {
+    local p; p=$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null) || return 0
+    [ -n "$p" ] && basename "$p"
+}
+
+iommu_group_of() {
+    local g
+    g=$(readlink -f "/sys/bus/pci/devices/$1/iommu_group" 2>/dev/null) || return 1
+    [ -n "$g" ] && basename "$g"
+}
+
+# Everything in this card's group that is neither part of the card nor a
+# bridge, one per line. No output means the card can go on its own.
+group_strays() {
+    local dev="$1" grp slot m cls
+    grp=$(iommu_group_of "$dev") || return 0
+    slot="${dev%.*}"
+    for m in /sys/kernel/iommu_groups/"$grp"/devices/*; do
+        [ -e "$m" ] || continue
+        m=$(basename "$m")
+        [ "${m%.*}" = "$slot" ] && continue
+        cls=$(cat "/sys/bus/pci/devices/$m/class" 2>/dev/null)
+        case "$cls" in 0x0600*|0x0604*) continue ;; esac   # host and PCI bridges
+        printf '%s  %s\n' "$m" "$(lspci -mm -s "$m" 2>/dev/null | awk -F'"' '{print $2}')"
+    done
+}
+
+# How many processes are holding the card, according to nvidia-smi - the only
+# thing that knows. The obvious alternative does not work: the sysfs "enabled"
+# flag on a connector reads "disabled" for outputs the compositor is actively
+# driving under the proprietary driver, so it cannot tell the card running your
+# desktop from the spare sitting next to it.
+gpu_clients() {
+    local idx
+    command -v nvidia-smi >/dev/null || return 0
+    idx=$(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>/dev/null |
+          awk -F', *' -v w="$1" 'tolower($2) ~ tolower(w)"$" { print $1; exit }')
+    [ -n "$idx" ] || return 0
+    nvidia-smi 2>/dev/null | sed -n '/Processes:/,$p' | awk -v g="$idx" '
+        /^\| +[0-9]+ / { line = $0; gsub(/^\| */, "", line); split(line, f, / +/)
+                         if (f[1] == g) n++ }
+        END { print n + 0 }'
+}
+
 # ---------------------------------------------------------------- prerequisites
 head2 "Checking what Vypr needs"
 
@@ -45,8 +112,26 @@ vfio_count=$(lspci -nnk 2>/dev/null | grep -c 'Kernel driver in use: vfio-pci')
 if [ "$vfio_count" -gt 0 ]; then
     ok "a GPU is bound to vfio-pci and available to pass through"
 else
-    bad "no device is bound to vfio-pci. Vypr streams from a VM with a passed-through GPU; without one there is nothing to capture."
-    FAIL=1
+    # Not necessarily a broken machine. With the GPU swap the card stays on the
+    # host driver until the VM starts, so a box set up for it correctly shows
+    # nothing on vfio-pci while the VM is off. The real prerequisite is a
+    # second card that is alone in its IOMMU group; only when there is no such
+    # card is there genuinely nothing to pass through.
+    spare=""
+    mapfile -t all_gpus < <(gpu_devices)
+    if [ "${#all_gpus[@]}" -gt 1 ]; then
+        for g in "${all_gpus[@]}"; do
+            [ -n "$(group_strays "$g")" ] || spare="$g"
+        done
+    fi
+    if [ -n "$spare" ]; then
+        warn "nothing is bound to vfio-pci, but $spare is alone in its IOMMU group"
+        info "bind it at boot, or turn on the GPU swap further down and let"
+        info "Vypr hand it over only while the VM is running"
+    else
+        bad "no device is bound to vfio-pci. Vypr streams from a VM with a passed-through GPU; without one there is nothing to capture."
+        FAIL=1
+    fi
 fi
 
 for cmd in virsh cmake ninja gcc g++ ssh ssh-keygen; do
@@ -111,6 +196,8 @@ install -Dm755 "$here/launcher/vypr"           "$PREFIX/bin/vypr" 2>/dev/null ||
 # in place - installed here only so that command has something to point at.
 install -Dm755 "$here/launcher/vypr-gpu-swap"  "$PREFIX/bin/vypr-gpu-swap" 2>/dev/null || true
 install -Dm755 "$here/install/hooks/vypr-gpu"  "$PREFIX/share/vypr/hooks/vypr-gpu" 2>/dev/null || true
+install -Dm644 "$here/install/xorg/20-vypr-gpu-swap.conf" \
+               "$PREFIX/share/vypr/xorg/20-vypr-gpu-swap.conf" 2>/dev/null || true
 ok "installed to $PREFIX/bin"
 
 case ":$PATH:" in
@@ -176,6 +263,112 @@ if [ -n "$changes" ]; then
     fi
 else
     info "the domain already has everything it needs"
+fi
+
+# ------------------------------------------------------ GPU swap (experimental)
+head2 "Graphics cards"
+
+# Ordinarily the card the VM uses is taken by vfio-pci at boot and Linux never
+# sees it again: a whole GPU idle whenever the VM is off. The swap moves it on
+# demand instead - to the guest when the VM starts, back to the host when it
+# stops. Whether that is possible is a question about IOMMU groups, so the
+# answer is worked out here and offered rather than left to be discovered.
+WANT_GPU_SWAP=0
+
+# The host devices this domain already passes through. That settles which card
+# would move, so it is worth more than any guess made from the topology.
+#
+# Parsed rather than grepped. A domain's XML is full of <address type='pci'>
+# elements - every emulated controller has one, and each <hostdev> carries a
+# second one for where the device lands inside the guest - so matching address
+# lines returns mostly guest slots that happen to read like host addresses. The
+# only ones that mean anything here are <hostdev><source><address>.
+passed=$(virsh dumpxml --inactive "$DOMAIN" 2>/dev/null | python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for hd in root.iter("hostdev"):
+    if hd.get("type") != "pci":
+        continue
+    a = hd.find("./source/address")
+    if a is None:
+        continue
+    f = lambda k, w: format(int(a.get(k, "0"), 16), "0%dx" % w)
+    print("%s:%s:%s.%s" % (f("domain", 4), f("bus", 2), f("slot", 2), f("function", 1)))
+')
+
+mapfile -t gpus < <(gpu_devices)
+free_gpus=()        # cards that are alone in their group
+free_clients=()     # and how many processes are on each
+
+for g in "${gpus[@]}"; do
+    strays=$(group_strays "$g")
+    clients=$(gpu_clients "$g")
+    printf '\n  %s  %s\n' "$g" "$(gpu_name "$g")"
+    printf '    IOMMU group %s, driver %s%s\n' \
+        "$(iommu_group_of "$g" || echo '?')" "$(gpu_driver "$g" || echo none)" \
+        "${clients:+, $clients process(es) on it}"
+    grep -qx "$g" <<<"$passed" && printf '    passed through to %s\n' "$DOMAIN"
+
+    if [ -n "$strays" ]; then
+        printf '    cannot be passed through on its own - its group also holds:\n'
+        printf '%s\n' "$strays" | sed 's/^/      /'
+        continue
+    fi
+
+    printf '    alone in its group, so it can be handed over\n'
+    free_gpus+=("$g"); free_clients+=("${clients:-0}")
+done
+
+# Which of those to recommend.
+#
+# The card the domain already passes through, if one of them is: that is not a
+# guess, it is what the VM is configured to take. Otherwise the one with the
+# fewest processes on it, which on a two-card machine is the one not drawing
+# the desktop. Either way it stays a recommendation - the helper checks the
+# card again at swap time and refuses if this was wrong.
+candidate=""
+for i in "${!free_gpus[@]}"; do
+    g="${free_gpus[$i]}"
+    if grep -qx "$g" <<<"$passed"; then candidate="$g"; break; fi
+done
+if [ -z "$candidate" ]; then
+    best=-1
+    for i in "${!free_gpus[@]}"; do
+        if [ "$best" -lt 0 ] || [ "${free_clients[$i]}" -lt "$best" ]; then
+            best="${free_clients[$i]}"; candidate="${free_gpus[$i]}"
+        fi
+    done
+fi
+
+printf '\n'
+if [ "${#gpus[@]}" -lt 2 ]; then
+    info "only one graphics card, so there is nothing to swap"
+elif [ -z "$candidate" ]; then
+    warn "no card is alone in its IOMMU group, so none can be swapped"
+    info "the groups above are set by the board's PCIe layout; moving the card"
+    info "to a different slot sometimes separates it"
+else
+    printf '  The card to enable the swap on is %s%s%s (%s).\n\n' \
+        "$bold" "$candidate" "$rst" "$(gpu_name "$candidate")"
+    cat <<EOF
+  Enabling it means: vfio-pci stops claiming the card at boot, a libvirt hook
+  hands it to '$DOMAIN' when it starts and takes it back when it
+  stops, and the card is yours to use the rest of the time.
+
+  It is experimental. The card must not be the one drawing your desktop - the
+  helper checks that every time and refuses rather than taking your screens
+  with it - and turning this on needs a few commands run as root, which are
+  printed at the end rather than run for you.
+
+EOF
+    read -rp "  Enable the GPU swap? [y/N] " reply
+    case "${reply:-n}" in
+        [Yy]*) WANT_GPU_SWAP=1; ok "the commands to turn it on are printed below" ;;
+        *)     info "not enabled - 'vypr --debug gpu-swap --enable' does it later" ;;
+    esac
 fi
 
 # ------------------------------------------------- microphone and speakers
@@ -406,6 +599,17 @@ ok "wrote $CONF_DIR/config"
 install -Dm644 "$here/launcher/vypr.png" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/vypr.png" 2>/dev/null \
     && ok "installed the icon" || true
+
+# ------------------------------------------------------------- gpu swap, on
+if [ "${WANT_GPU_SWAP:-0}" = 1 ]; then
+    head2 "Turning the GPU swap on"
+    # Printed by the launcher rather than written out again here, so there is
+    # one copy of these instructions and it is the same one you get from
+    # `vypr --debug gpu-swap --enable` afterwards - including the extra file
+    # X11 needs, which depends on the session you are sitting in.
+    "$PREFIX/bin/vypr" --debug gpu-swap --enable || \
+        warn "could not print the steps - run 'vypr --debug gpu-swap --enable'"
+fi
 
 # ------------------------------------------------------------------------- done
 head2 "Next"

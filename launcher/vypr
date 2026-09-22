@@ -1268,9 +1268,27 @@ cmd_gpu_swap() {
         else
             # Readable without the helper installed, so you can see what would
             # move before agreeing to anything.
-            virsh dumpxml --inactive "$VM" 2>/dev/null |
-                grep -A3 "<hostdev" | grep -oE "bus='0x[0-9a-f]+' slot='0x[0-9a-f]+' function='0x[0-9a-f]+'" |
-                sed "s/bus='0x\(..\)' slot='0x\(..\)' function='0x\(.\)'/  0000:\1:\2.\3/"
+            #
+            # Parsed, not grepped: every <hostdev> carries two addresses - the
+            # host device in <source> and the slot it lands in inside the guest
+            # - and the rest of the XML is full of the same element. Matching
+            # address lines listed emulated guest slots as though they were
+            # cards on this machine.
+            virsh dumpxml --inactive "$VM" 2>/dev/null | python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.fromstring(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for hd in root.iter("hostdev"):
+    if hd.get("type") != "pci":
+        continue
+    a = hd.find("./source/address")
+    if a is None:
+        continue
+    f = lambda k, w: format(int(a.get(k, "0"), 16), "0%dx" % w)
+    print("  %s:%s:%s.%s" % (f("domain", 4), f("bus", 2), f("slot", 2), f("function", 1)))
+'
         fi
         ;;
     --enable)
@@ -1310,6 +1328,25 @@ EOF
   naming its ids, and rebuild the initramfs after changing it.
 
 EOF
+        # X11 opens every GPU on the machine, so the card is never free while a
+        # session is running and the swap refuses every time. Wayland does not
+        # do this and needs none of it.
+        if [ "${XDG_SESSION_TYPE:-}" = "x11" ]; then
+            local src_xorg; src_xorg="$(dirname "$BIN")/share/vypr/xorg/20-vypr-gpu-swap.conf"
+            [ -f "$src_xorg" ] || src_xorg="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/install/xorg/20-vypr-gpu-swap.conf"
+            cat <<EOF
+  You are on X11, which opens every GPU it can see - including the one you want
+  to hand over. It shows up as a 4 MiB client on the card and is enough to make
+  the swap refuse. One more file stops that:
+
+    sudo install -Dm644 $src_xorg /etc/X11/xorg.conf.d/20-vypr-gpu-swap.conf
+
+  It takes effect at your next login, not now. If Xorg then finds no usable
+  screen, it is because the firmware calls the passed-through card primary and
+  a Device section pinning BusID to the other one is also needed.
+
+EOF
+        fi
         ;;
     --disable)
         cat <<EOF

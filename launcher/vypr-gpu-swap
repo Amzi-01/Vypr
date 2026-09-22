@@ -61,11 +61,40 @@ driver_of() {
     [ -n "$p" ] && basename "$p"
 }
 
-# Is this card drawing something right now?
+# Is anything using this card?
 #
-# The one way this goes badly wrong is unbinding the GPU that is running your
-# session: the screens go black and the compositor dies with them. A card with
-# an enabled connector is one somebody is looking at, so that is the test.
+# This is the check that matters, and the obvious one does not work. The sysfs
+# "enabled" attribute on each connector reads "disabled" for outputs the
+# compositor is actively driving when the proprietary nvidia driver is loaded -
+# measured on this machine with two 4K panels lit. Trusting it would have
+# reported the card running the desktop as free to take.
+#
+# nvidia-smi is the thing that knows. It lists graphics (G) and compute (C)
+# clients per GPU, so Xorg, the compositor and a CUDA job all show up.
+# --query-compute-apps is not enough: it returns only C, and the processes that
+# make unbinding catastrophic are all G.
+nvidia_index_of() {
+    local d="$1"
+    command -v nvidia-smi >/dev/null || return 1
+    nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>/dev/null |
+        awk -F', *' -v w="$d" 'tolower($2) ~ tolower(w)"$" { print $1; exit }'
+}
+
+gpu_users() {
+    local d="$1" idx
+    idx=$(nvidia_index_of "$d") || return 0
+    [ -n "$idx" ] || return 0
+    nvidia-smi 2>/dev/null | sed -n '/Processes:/,$p' | awk -v g="$idx" '
+        /^\| +[0-9]+ / {
+            line = $0
+            gsub(/^\| */, "", line); gsub(/ *\|$/, "", line)
+            split(line, f, / +/)
+            if (f[1] == g) printf "      pid %s  %s  %s\n", f[4], f[5], f[6]
+        }'
+}
+
+# Kept as a second opinion only. When it does fire it is right; it just cannot
+# be relied on to fire, for the reason above.
 drives_a_display() {
     local d="$1" c st en
     for c in "$SYSPCI/devices/$d"/drm/card*/card*-*; do
@@ -75,16 +104,6 @@ drives_a_display() {
         [ "$st" = "connected" ] && [ "$en" = "enabled" ] && return 0
     done
     return 1
-}
-
-# Anything still using it through the nvidia stack - a CUDA job, a game, an
-# encoder - will make the unbind fail with EBUSY and a useless message, so look
-# first and say something better.
-nvidia_users() {
-    local d="$1"
-    command -v nvidia-smi >/dev/null || return 0
-    nvidia-smi --query-compute-apps=pid,used_memory,name \
-               --format=csv,noheader --id="$d" 2>/dev/null | grep -v '^\s*$'
 }
 
 bind_to() {
@@ -137,9 +156,10 @@ bind_to() {
 cmd_status() {
     local domain="$1" d
     for d in $(domain_devices "$domain"); do
-        printf '  %s  driver=%-10s display=%s\n' \
-            "$d" "$(driver_of "$d" || echo none)" \
-            "$(drives_a_display "$d" && echo yes || echo no)"
+        local users; users=$(gpu_users "$d")
+        printf '  %s  driver=%-14s %s\n' "$d" "$(driver_of "$d" || echo none)" \
+            "$([ -n "$users" ] && echo "IN USE" || echo free)"
+        [ -n "$users" ] && printf '%s\n' "$users"
     done
 }
 
@@ -154,10 +174,10 @@ cmd_to_vm() {
         if drives_a_display "$d"; then
             die "$d is driving a display. Moving it would take your desktop with it - plug the monitors into the other card first."
         fi
-        users=$(nvidia_users "$d")
+        users=$(gpu_users "$d")
         if [ -n "$users" ]; then
-            printf 'vypr-gpu-swap: %s is in use:\n%s\n' "$d" "$users" >&2
-            die "$d: close those first"
+            printf 'vypr-gpu-swap: %s is still in use:\n%s\n' "$d" "$users" >&2
+            die "$d: nothing may be holding the card. An X server opens every GPU it can see unless told not to - Option \"AutoAddGPU\" \"false\" in xorg.conf keeps it off this one."
         fi
     done
 
