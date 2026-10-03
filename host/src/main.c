@@ -1254,6 +1254,41 @@ int main(int argc, char **argv)
      * Whatever it names, the display in front of us is the one that counts, so
      * a failed start is retried without it before giving up.
      */
+    /*
+     * Tell the compositor which desktop entry this window belongs to.
+     *
+     * Wayland has no protocol for a client to hand over an icon - xdg_toplevel
+     * carries an app_id and nothing else, and the compositor looks that up as
+     * <app_id>.desktop to find a name and an Icon= line. Without one the window
+     * gets whatever the compositor shows for "no idea", which on Plasma is a
+     * generic placeholder, and SDL_SetWindowIcon cannot help: it is an X11-only
+     * facility and silently does nothing here.
+     *
+     * The desktop view maps to vypr-desktop.desktop, which is installed and
+     * already points at the Vypr icon. A streamed application maps to the entry
+     * written when it was registered, vypr-<app>.desktop, so each one carries
+     * its own icon in the task bar rather than all of them sharing Vypr's.
+     */
+    char app_id[128];
+    if (opt.window_id == VYPR_DESKTOP_WINDOW_ID) {
+        snprintf(app_id, sizeof(app_id), "vypr-desktop");
+    } else {
+        const char *k = opt.app_key && *opt.app_key ? opt.app_key : "";
+        size_t n = 0;
+        memcpy(app_id, "vypr-", 5); n = 5;
+        /* The registered name is the file name, so only what can appear in one
+         * survives: anything else would name an entry that cannot exist. */
+        for (const char *c = k; *c && n + 1 < sizeof(app_id); c++) {
+            if ((*c >= 'A' && *c <= 'Z')) app_id[n++] = (char)(*c - 'A' + 'a');
+            else if ((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9')) app_id[n++] = *c;
+        }
+        app_id[n] = '\0';
+        /* Nothing usable in the key - fall back to the one entry always there. */
+        if (n == 5) snprintf(app_id, sizeof(app_id), "vypr-desktop");
+    }
+    SDL_SetHint(SDL_HINT_APP_ID, app_id);
+    SDL_SetAppMetadata("Vypr", NULL, app_id);
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         const char *forced = getenv("SDL_VIDEODRIVER");
         bool recovered = false;
