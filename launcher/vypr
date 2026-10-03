@@ -12,6 +12,7 @@
 #   vypr guest-notifications  turn the guest's notifications back on
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr --debug resolution [WxH]  what size that screen is shown at
+#   vypr --debug clear-apps  take every registered app off this desktop
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -1233,6 +1234,86 @@ cmd_desktop() {
     die "the desktop did not appear - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
 }
 
+# Take every registered app off this desktop.
+#
+# The counterpart to a long session with `vypr detect`, and deliberately not
+# the same thing as running `vypr remove` over and over: this touches only the
+# Linux side. The guest keeps its scheduled tasks, so nothing has to be running
+# to do this and nothing in Windows is changed.
+#
+# That is the case it exists for. A rebuilt VM leaves a menu full of entries
+# whose tasks no longer exist, and every one of them fails at launch with an
+# error about the guest rather than anything a person can act on. `vypr remove`
+# refuses when the VM is down precisely so a task is never orphaned - correct
+# for one app, useless when the tasks are already gone with the old disk.
+cmd_clear_apps() {
+    local assume_yes=0
+    [ "${1:-}" = "--yes" ] && assume_yes=1
+
+    local dtop
+    dtop=$(xdg-user-dir DESKTOP 2>/dev/null) || dtop=""
+    [ -n "$dtop" ] || dtop="$HOME/Desktop"
+
+    local share="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local apps_dir="$share/applications"
+    local icon_dir="$share/icons/hicolor/256x256/apps"
+
+    # Gathered before anything is deleted, so the list that gets shown is the
+    # list that gets removed.
+    local names=() files=() f app label
+    for f in "$APPS"/*.conf; do
+        [ -e "$f" ] || continue
+        app=$(basename "$f" .conf)
+        names+=("$app")
+
+        # The desktop icon is named after the display name rather than the id,
+        # and a slash in it was turned into a dash on the way in.
+        label=$(sed -n 's/^NAME="\(.*\)"/\1/p' "$f")
+        [ -n "$label" ] || label="$app"
+
+        files+=("$f" \
+                "$apps_dir/vypr-$app.desktop" \
+                "$icon_dir/vypr-$app.png" \
+                "$dtop/${label//\//-}.desktop")
+    done
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo "vypr: no registered apps - nothing to clear"
+        return 0
+    fi
+
+    printf 'This removes %d app(s) from this desktop:\n\n' "${#names[@]}"
+    for app in "${names[@]}"; do printf '    %s\n' "$app"; done
+    printf '\nFiles that exist and would go:\n\n'
+    local present=0
+    for f in "${files[@]}"; do
+        [ -e "$f" ] && { printf '    %s\n' "$f"; present=$((present + 1)); }
+    done
+    [ "$present" -gt 0 ] || { printf '    (none - the entries are already gone)\n'; }
+    printf '\nThe guest keeps its scheduled tasks; nothing in Windows changes.\n'
+    printf 'Re-add any of them later with: vypr detect\n\n'
+
+    if [ "$assume_yes" != "1" ]; then
+        local reply
+        read -rp "  Remove them? [y/N] " reply
+        case "${reply:-n}" in
+            [Yy]*) ;;
+            *) echo "vypr: nothing removed"; return 0 ;;
+        esac
+    fi
+
+    local removed=0
+    for f in "${files[@]}"; do
+        [ -e "$f" ] || continue
+        rm -f "$f" && removed=$((removed + 1))
+    done
+
+    update-desktop-database "$apps_dir" 2>/dev/null || true
+    gtk-update-icon-cache -qtf "$share/icons/hicolor" 2>/dev/null || true
+
+    say "Removed ${#names[@]} app(s) and $removed file(s) from this desktop."
+}
+
 # ---------------------------------------------------- experimental: gpu swap
 #
 # Move the passed-through GPU between this machine and the VM, instead of
@@ -1703,7 +1784,8 @@ case "${1:-}" in
             desktop) cmd_desktop ;;
             resolution) shift; cmd_resolution "$@" ;;
             gpu-swap) shift; cmd_gpu_swap "$@" ;;
-            *) echo "vypr: --debug takes: desktop, resolution, gpu-swap" >&2; exit 2 ;;
+            clear-apps) shift; cmd_clear_apps "$@" ;;
+            *) echo "vypr: --debug takes: desktop, resolution, gpu-swap, clear-apps" >&2; exit 2 ;;
         esac
         ;;
     detect) cmd_detect ;;
