@@ -13,6 +13,7 @@
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr --debug resolution [WxH]  what size that screen is shown at
 #   vypr --debug clear-apps  take every registered app off this desktop
+#   vypr --debug anti-detect [--undo]  hide the hypervisor from the guest
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -1314,6 +1315,52 @@ cmd_clear_apps() {
     say "Removed ${#names[@]} app(s) and $removed file(s) from this desktop."
 }
 
+# Hide the hypervisor from the guest, or stop hiding it.
+#
+# The installer does this once at setup. This is here so it can be turned off
+# and on again afterwards without re-running the installer - which matters,
+# because whether it should be on is not a technical question. Software that
+# refuses to run under a hypervisor is the reason it exists; games that forbid
+# virtual machines outright are the reason someone might want it off.
+cmd_anti_detect() {
+    local script="$(dirname "$BIN")/share/vypr/anti-detect.py"
+    [ -f "$script" ] || script="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/install/anti-detect.py"
+    [ -f "$script" ] || die "anti-detect.py is missing - reinstall"
+
+    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+    virsh dumpxml --inactive "$VM" > "$tmp/in.xml" 2>/dev/null || die "cannot read $VM"
+
+    local out
+    if [ "${1:-}" = "--undo" ]; then
+        out=$(python3 "$script" "$tmp/in.xml" "$tmp/out.xml" --undo 2>&1) || die "$out"
+    else
+        local dmi; dmi() { cat "/sys/class/dmi/id/$1" 2>/dev/null; }
+        local oui; oui=$(cat /sys/class/net/*/address 2>/dev/null |
+                         grep -vE '^(52:54:00|02:|a2:|7a:|42:)' | head -1 | cut -d: -f1-3)
+        out=$(python3 "$script" "$tmp/in.xml" "$tmp/out.xml" \
+                 --dmi "bios_vendor=$(dmi bios_vendor)" \
+                 --dmi "bios_version=$(dmi bios_version)" \
+                 --dmi "system_manufacturer=$(dmi sys_vendor)" \
+                 --dmi "system_product=$(dmi product_name)" \
+                 --dmi "system_version=$(dmi product_version)" \
+                 --dmi "baseBoard_manufacturer=$(dmi board_vendor)" \
+                 --dmi "baseBoard_product=$(dmi board_name)" \
+                 --dmi "baseBoard_version=$(dmi board_version)" \
+                 ${oui:+--mac "$oui"} "$@" 2>&1) || die "$out"
+    fi
+
+    if [ -z "$out" ]; then
+        echo "  nothing to change"
+        return 0
+    fi
+    printf '%s\n' "$out"
+    if virsh define "$tmp/out.xml" >/dev/null 2>&1; then
+        say "Done. It takes effect at the VM's next boot."
+    else
+        die "could not redefine $VM; it is unchanged"
+    fi
+}
+
 # ---------------------------------------------------- experimental: gpu swap
 #
 # Move the passed-through GPU between this machine and the VM, instead of
@@ -1785,7 +1832,8 @@ case "${1:-}" in
             resolution) shift; cmd_resolution "$@" ;;
             gpu-swap) shift; cmd_gpu_swap "$@" ;;
             clear-apps) shift; cmd_clear_apps "$@" ;;
-            *) echo "vypr: --debug takes: desktop, resolution, gpu-swap, clear-apps" >&2; exit 2 ;;
+            anti-detect) shift; cmd_anti_detect "$@" ;;
+            *) echo "vypr: --debug takes: desktop, resolution, gpu-swap, clear-apps, anti-detect" >&2; exit 2 ;;
         esac
         ;;
     detect) cmd_detect ;;

@@ -198,6 +198,7 @@ install -Dm755 "$here/launcher/vypr-gpu-swap"  "$PREFIX/bin/vypr-gpu-swap" 2>/de
 install -Dm755 "$here/install/hooks/vypr-gpu"  "$PREFIX/share/vypr/hooks/vypr-gpu" 2>/dev/null || true
 install -Dm644 "$here/install/xorg/20-vypr-gpu-swap.conf" \
                "$PREFIX/share/vypr/xorg/20-vypr-gpu-swap.conf" 2>/dev/null || true
+install -Dm755 "$here/install/anti-detect.py" "$PREFIX/share/vypr/anti-detect.py" 2>/dev/null || true
 ok "installed to $PREFIX/bin"
 
 case ":$PATH:" in
@@ -413,6 +414,13 @@ if [ -r /sys/class/dmi/id/board_name ]; then
                 ok "domain updated; it takes effect at the VM's next boot"
                 warn "changing the NIC address means Windows sees a new adapter"
                 warn "and takes a new DHCP lease - Vypr asks libvirt, so it copes"
+                info ""
+                info "This is on so that software which refuses to run under a"
+                info "hypervisor will run. Some games forbid virtual machines in"
+                info "their terms and treat hiding one as a bannable offence,"
+                info "whatever it is being used for. Which games those are is"
+                info "yours to know; Vypr does not and cannot check."
+                info "Turn it off again with: vypr --debug anti-detect --undo"
             else
                 bad "could not redefine the domain; it is unchanged"
             fi

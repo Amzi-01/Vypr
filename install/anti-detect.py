@@ -48,6 +48,45 @@ def main():
     tree = ET.parse(src); root = tree.getroot()
     changed = []
 
+    if "--undo" in args:
+        # Put the domain back to a stock one. The MAC goes back to QEMU's
+        # prefix rather than to whatever it was before, because what it was
+        # before is not recorded anywhere - and 52:54:00 is what libvirt would
+        # have given it.
+        feats = root.find("features")
+        if feats is not None:
+            kvm = feats.find("kvm")
+            if kvm is not None:
+                feats.remove(kvm); changed.append("unhid the KVM CPUID leaf")
+            hv = feats.find("hyperv")
+            if hv is not None:
+                vid = hv.find("vendor_id")
+                if vid is not None:
+                    hv.remove(vid); changed.append("removed the Hyper-V vendor id")
+        si = root.find("sysinfo")
+        if si is not None:
+            root.remove(si); changed.append("removed the SMBIOS override")
+        os_el = root.find("os")
+        if os_el is not None:
+            sm = os_el.find("smbios")
+            if sm is not None:
+                os_el.remove(sm)
+        for mac in root.iter("mac"):
+            cur = mac.get("address") or ""
+            tail = cur.split(":")[3:]
+            if len(tail) == 3 and not cur.lower().startswith("52:54:00"):
+                mac.set("address", "52:54:00:" + ":".join(tail))
+                changed.append("put the NIC back on QEMU's prefix")
+        for cpu in root.iter("cpu"):
+            for f in list(cpu.findall("feature")):
+                if f.get("name") == "hypervisor" and f.get("policy") == "disable":
+                    cpu.remove(f); changed.append("restored the hypervisor-present bit")
+        ET.indent(tree, space="  ")
+        tree.write(dst, encoding="unicode")
+        for c in changed:
+            print("  " + c)
+        return
+
     # 1. The KVM paravirtualisation leaf. CPUID 0x40000000 returns "KVMKVMKVM"
     #    on an unhidden guest, which is the single most direct answer to "am I
     #    in a VM" and the first thing every detector asks.
