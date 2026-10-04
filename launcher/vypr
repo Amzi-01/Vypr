@@ -1327,7 +1327,10 @@ cmd_anti_detect() {
     [ -f "$script" ] || script="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/install/anti-detect.py"
     [ -f "$script" ] || die "anti-detect.py is missing - reinstall"
 
-    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+    # EXIT, not RETURN: several paths below end in die(), which exits rather
+    # than returning, and a RETURN trap never fires for those - leaving a
+    # directory in TMPDIR behind on every failure.
+    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
     virsh dumpxml --inactive "$VM" > "$tmp/in.xml" 2>/dev/null || die "cannot read $VM"
 
     local out

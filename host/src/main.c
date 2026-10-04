@@ -1277,10 +1277,17 @@ int main(int argc, char **argv)
         size_t n = 0;
         memcpy(app_id, "vypr-", 5); n = 5;
         /* The registered name is the file name, so only what can appear in one
-         * survives: anything else would name an entry that cannot exist. */
+         * survives: anything else would name an entry that cannot exist.
+         *
+         * Case is kept. Folding it to lower looked tidier and broke the match
+         * outright for any app whose id carries a capital - "battlefieldV" is
+         * written to vypr-battlefieldV.desktop, so an app_id of
+         * vypr-battlefieldv names nothing and the window falls back to the
+         * placeholder this whole function exists to avoid. */
         for (const char *c = k; *c && n + 1 < sizeof(app_id); c++) {
-            if ((*c >= 'A' && *c <= 'Z')) app_id[n++] = (char)(*c - 'A' + 'a');
-            else if ((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9')) app_id[n++] = *c;
+            if ((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+                (*c >= '0' && *c <= '9') || *c == '-' || *c == '_')
+                app_id[n++] = *c;
         }
         app_id[n] = '\0';
         /* Nothing usable in the key - fall back to the one entry always there. */
