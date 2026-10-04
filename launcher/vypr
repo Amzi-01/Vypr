@@ -1330,7 +1330,14 @@ cmd_anti_detect() {
     # EXIT, not RETURN: several paths below end in die(), which exits rather
     # than returning, and a RETURN trap never fires for those - leaving a
     # directory in TMPDIR behind on every failure.
-    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    #
+    # The variable cannot be local, though. An EXIT trap runs after the function
+    # has returned and its locals are gone, so under `set -u` the trap itself
+    # died with "tmp: unbound variable" - printed after every successful run.
+    # A global, and a default in the expansion, so the trap is safe whenever it
+    # fires.
+    VYPR_AD_TMP=$(mktemp -d); trap 'rm -rf "${VYPR_AD_TMP:-}"' EXIT
+    local tmp="$VYPR_AD_TMP"
     virsh dumpxml --inactive "$VM" > "$tmp/in.xml" 2>/dev/null || die "cannot read $VM"
 
     local out
