@@ -960,17 +960,6 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
-    /* The answer, to the window it came from and no other: a drag belongs to
-     * the window the user dragged out of. */
-    case VYPR_MSG_DRAG_FILES: {
-        if (bytes < sizeof(struct vypr_msg_drag_files)) break;
-        const struct vypr_msg_drag_files *m = (const void *)payload;
-        struct window *w = window_find(d, m->window_id);
-        if (w && w->client_fd >= 0)
-            client_send(d, w->client_fd, VYPR_MSG_CLIENT_DRAG_FILES, payload, bytes);
-        break;
-    }
-
     case VYPR_MSG_LOG:
         fprintf(stderr, "vyprd: agent: %.*s\n", (int)bytes, payload);
         break;
@@ -1025,16 +1014,6 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         fprintf(stderr, "vyprd: now also watching for '%s'\n", kept);
 
         if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_RESCAN, NULL, 0);
-        return;
-    }
-
-    /*
-     * The client's pointer left a window with a button held, so ask the guest
-     * whether a drag is on its way out. Straight through: only the guest can
-     * answer, and the daemon has nothing to add.
-     */
-    if (type == VYPR_MSG_DRAG_PROBE) {
-        if (d->agent_fd >= 0) msg_send(d->agent_fd, VYPR_MSG_DRAG_PROBE, payload, bytes);
         return;
     }
 

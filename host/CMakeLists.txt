@@ -7,26 +7,9 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 find_package(SDL3 REQUIRED CONFIG)
 
-add_executable(vypr-window src/main.c src/shm.c src/msg.c src/present.c src/present_gpu.c src/present_render.c src/dragsource.c)
+add_executable(vypr-window src/main.c src/shm.c src/msg.c src/present.c src/present_gpu.c src/present_render.c)
 target_include_directories(vypr-window PRIVATE src ../include)
 target_link_libraries(vypr-window PRIVATE SDL3::SDL3)
-
-# Offering a drag is per display server, and SDL has no call for it, so each
-# backend talks to the server itself. Wayland is optional: without its headers
-# the client still builds and simply refuses to drag files out.
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
-endif()
-if(WAYLAND_CLIENT_FOUND)
-    target_sources(vypr-window PRIVATE src/dragsource_wayland.c)
-    target_compile_definitions(vypr-window PRIVATE VYPR_HAVE_WAYLAND=1)
-    target_include_directories(vypr-window PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
-    target_link_libraries(vypr-window PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
-    message(STATUS "drag source: wayland (${WAYLAND_CLIENT_VERSION})")
-else()
-    message(STATUS "drag source: none - wayland-client not found")
-endif()
 
 # The session daemon: owns the region, the agent link, and which windows stream.
 add_executable(vyprd src/vyprd.c src/shm.c src/msg.c)

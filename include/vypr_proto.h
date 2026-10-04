@@ -88,18 +88,9 @@ enum vypr_msg_type {
     VYPR_MSG_CLIP_IMAGE_DATA  = 14,  /* vypr_msg_clip_image_data + raw bytes */
     VYPR_MSG_CLIP_IMAGE_END   = 15,  /* no payload */
 
-    /*
-     * What a drag leaving the guest is carrying.
-     *
-     * Sent in answer to VYPR_MSG_DRAG_PROBE, and only when a drag really was
-     * in flight. Paths rather than bytes: most of what anyone drags out of a
-     * streamed window is already visible to the host through the shared
-     * folder, and for those there is nothing to copy - the host makes a
-     * file:// URI out of the same file. A path that is not on the share
-     * cannot be offered yet; sending its contents is a separate exchange and
-     * is not implemented.
-     */
-    VYPR_MSG_DRAG_FILES       = 16,  /* vypr_msg_drag_files + NUL-separated utf8 */
+    /* 16 was VYPR_MSG_DRAG_FILES, removed with the drag-out work. Left
+     * reserved: an agent built before that release still sends it, and a
+     * number reused for something else would be read as that something. */
 
     /*
      * The same three, going the other way: an image copied here, on its way to
@@ -166,19 +157,8 @@ enum vypr_msg_type {
      */
     VYPR_MSG_RESCAN           = 80,  /* no payload */
 
-    /*
-     * Ask whether a drag is leaving the window.
-     *
-     * The host cannot see into the guest's drag loop, and the guest cannot see
-     * the host's pointer. What the host does know is that its pointer crossed
-     * the edge of the window with a button held, which is the only moment a
-     * drag can be on its way out - so it asks then, and only then.
-     *
-     * Answering means putting a window under the guest's cursor and letting
-     * OLE deliver the drag to it, which is intrusive enough that it must not
-     * happen on speculation.
-     */
-    VYPR_MSG_DRAG_PROBE       = 81,  /* vypr_msg_drag_probe */
+    /* 81 was VYPR_MSG_DRAG_PROBE, removed with the drag-out work.
+     * Left reserved for the same reason. */
 
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
@@ -213,14 +193,8 @@ enum vypr_msg_type {
      */
     VYPR_MSG_CLIENT_CLIPBOARD_IMAGE = 137, /* utf8 path to a BMP */
 
-    /*
-     * A drag leaving the guest, relayed to the client that owns the window.
-     *
-     * Same payload as VYPR_MSG_DRAG_FILES; a separate number because the
-     * daemon and its clients speak their own dialect over the unix socket,
-     * and mixing the two directions on one number makes the reader guess.
-     */
-    VYPR_MSG_CLIENT_DRAG_FILES      = 138  /* vypr_msg_drag_files + utf8 paths */
+    /* 138 was VYPR_MSG_CLIENT_DRAG_FILES, removed with the drag-out work.
+     * Left reserved: a client built before that release still knows it. */
 };
 
 /*
@@ -413,23 +387,7 @@ struct vypr_msg_drop_data {
     uint32_t _pad;
 };
 
-/* Where the pointer left the window, in captured-surface pixels. */
-struct vypr_msg_drag_probe {
-    uint64_t window_id;
-    int32_t  x, y;
-};
 
-/*
- * Followed by `bytes` of UTF-8 paths, each NUL-terminated, `count` of them.
- * Guest paths as the guest sees them: translating to something the host can
- * open is the host's job, because only the host knows where the share is
- * mounted on its side.
- */
-struct vypr_msg_drag_files {
-    uint64_t window_id;
-    uint32_t count;
-    uint32_t bytes;
-};
 
 struct vypr_msg_drop_end {
     uint64_t window_id;
