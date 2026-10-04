@@ -165,6 +165,90 @@ def main():
                 mac.set("address", "%s:%s" % (mac_oui, ":".join(tail)))
                 changed.append("changed the NIC prefix off QEMU's 52:54:00")
 
+    # ---------------------------------------------------------- aggressive
+    #
+    # Everything above closes a tell that costs nothing. What follows costs
+    # something - a QEMU argument that may not survive a version bump, an
+    # ejected ISO, a disk that no longer says what it is - so it is grouped and
+    # can be left out with --mild.
+    if "--mild" not in args:
+
+        # 5. ACPI table OEM identifiers. QEMU writes "BOCHS" as the OEM id and
+        #    "BXPC" as the OEM table id into every table it generates, and they
+        #    are readable from user space on Windows through the firmware
+        #    tables API. CPUID and SMBIOS being clean does not help once
+        #    something reads these.
+        #
+        #    The properties are x- prefixed, which in QEMU means unstable: they
+        #    may be renamed or removed in a later version, and the VM then
+        #    fails to start rather than quietly losing the setting. A second
+        #    -machine merges with the one libvirt generates rather than
+        #    replacing it.
+        qargs = root.find("{%s}commandline" % QEMU_NS)
+        if qargs is None:
+            qargs = ET.SubElement(root, "{%s}commandline" % QEMU_NS)
+        have = [a.get("value") for a in qargs.findall("{%s}arg" % QEMU_NS)]
+        oem_id = (dmi.get("system_manufacturer") or "ASUS")[:6]
+        oem_tbl = re.sub(r"[^A-Za-z0-9]", "", dmi.get("baseBoard_product") or "B550")[:8]
+        if not any("x-oem-id" in (v or "") for v in have):
+            for v in ("-machine", "x-oem-id=%s,x-oem-table-id=%s" % (oem_id, oem_tbl)):
+                a = ET.SubElement(qargs, "{%s}arg" % QEMU_NS); a.set("value", v)
+            changed.append("overrode the ACPI OEM ids (they read BOCHS/BXPC)")
+
+        # 6. Disk serials and product strings. The SCSI inquiry reports "QEMU
+        #    HARDDISK" and an empty serial, both of which Device Manager shows
+        #    verbatim and neither of which any real disk would say. The serial
+        #    is libvirt's to set; the product string is a device property, so
+        #    it goes through qemu:override against the alias libvirt derives
+        #    from the drive address.
+        over = root.find("{%s}override" % QEMU_NS)
+        if over is None:
+            over = ET.SubElement(root, "{%s}override" % QEMU_NS)
+        unit = 0
+        for disk in root.iter("disk"):
+            tgt = disk.find("target")
+            if tgt is None or tgt.get("bus") != "sata":
+                continue
+            alias = "sata0-0-%d" % unit
+            is_cd = disk.get("device") == "cdrom"
+            unit += 1
+            if not is_cd and disk.find("serial") is None:
+                ser = ET.SubElement(disk, "serial")
+                ser.text = "WD-%s" % ("".join("%02X" % ((unit * 37 + i * 91) % 256) for i in range(6)))
+                changed.append("gave %s a serial number" % tgt.get("dev"))
+            if not any(d.get("alias") == alias for d in over.findall("{%s}device" % QEMU_NS)):
+                dev = ET.SubElement(over, "{%s}device" % QEMU_NS); dev.set("alias", alias)
+                fe = ET.SubElement(dev, "{%s}frontend" % QEMU_NS)
+                pr = ET.SubElement(fe, "{%s}property" % QEMU_NS)
+                # "model", not "product": a SATA disk is an ide-hd device and
+                # that is what carries the identify string. product belongs to
+                # scsi-hd, and asking ide-hd for it stops the VM booting with
+                # "Property 'ide-hd.product' not found".
+                pr.set("name", "model"); pr.set("type", "string")
+                pr.set("value", "ASUS DRW-24B1ST" if is_cd else "WDC WDS500G2B0A")
+                changed.append("renamed %s off \"QEMU HARDDISK\"" % tgt.get("dev"))
+
+        # 7. The optical drive. A CD-ROM whose volume label is
+        #    "virtio-win-0.1.302" answers the question on its own, and an empty
+        #    one still identifies itself as "QEMU DVD-ROM" through a name
+        #    Windows caches in the registry - renaming the device does not
+        #    change what an already-enumerated drive reports. Since nothing
+        #    needs an optical drive once the drivers are installed, the whole
+        #    device goes.
+        #
+        #    --undo does not put it back: what was in it is not recorded. Add a
+        #    CD-ROM in virt-manager if the virtio drivers are ever needed again.
+        devs = root.find("devices")
+        if devs is not None:
+            for disk in list(devs.findall("disk")):
+                if disk.get("device") != "cdrom":
+                    continue
+                src = disk.find("source")
+                what = (src.get("file") if src is not None else "") or "an empty drive"
+                devs.remove(disk)
+                changed.append("removed the optical drive (%s)" %
+                               ("virtio-win" if "virtio-win" in what else what))
+
     # Note on what is deliberately NOT done here: the BIOS strings are left to
     # <sysinfo>, not to a -smbios argument on qemu:commandline. libvirt already
     # generates -smbios type=0 from the <bios> entries above, and a second one
