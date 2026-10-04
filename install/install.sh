@@ -371,6 +371,62 @@ EOF
     esac
 fi
 
+# ------------------------------------------------------- hiding the hypervisor
+head2 "Looking like a PC"
+
+# Plenty of Windows software refuses to run under a hypervisor, and a stock
+# libvirt domain tells it so immediately: CPUID returns KVMKVMKVM, SMBIOS reads
+# QEMU, the NIC carries QEMU's registered 52:54:00 prefix. None of that is
+# needed for the VM to work, so Vypr turns it off.
+#
+# The guest is given this machine's own board details, so it claims to be the
+# computer it is running on rather than a generic PC that does not exist.
+#
+# Note on where this stops. The Hyper-V enlightenments stay enabled and the
+# hypervisor-present CPU bit stays set, because every one of those
+# enlightenments depends on Windows being able to see a hypervisor, and they
+# are worth real performance in a guest that exists to run games. Hiding that
+# bit as well is `anti-detect.py --paranoid`, and it costs them.
+if [ -r /sys/class/dmi/id/board_name ]; then
+    tmp4=$(mktemp -d)
+    virsh dumpxml --inactive "$DOMAIN" > "$tmp4/domain.xml" 2>/dev/null
+
+    dmi() { cat "/sys/class/dmi/id/$1" 2>/dev/null; }
+    # The host's own NIC prefix is a real vendor's; QEMU's is not.
+    host_oui=$(cat /sys/class/net/*/address 2>/dev/null |
+               grep -vE '^(52:54:00|02:|a2:|7a:|42:)' | head -1 | cut -d: -f1-3)
+
+    if out=$(python3 "$here/install/anti-detect.py" "$tmp4/domain.xml" "$tmp4/hard.xml" \
+                --dmi "bios_vendor=$(dmi bios_vendor)" \
+                --dmi "bios_version=$(dmi bios_version)" \
+                --dmi "system_manufacturer=$(dmi sys_vendor)" \
+                --dmi "system_product=$(dmi product_name)" \
+                --dmi "system_version=$(dmi product_version)" \
+                --dmi "baseBoard_manufacturer=$(dmi board_vendor)" \
+                --dmi "baseBoard_product=$(dmi board_name)" \
+                --dmi "baseBoard_version=$(dmi board_version)" \
+                ${host_oui:+--mac "$host_oui"} 2>&1)
+    then
+        if grep -q . <<<"$out"; then
+            while IFS= read -r line; do [ -n "$line" ] && ok "${line# }"; done <<<"$out"
+            if virsh define "$tmp4/hard.xml" >/dev/null 2>&1; then
+                ok "domain updated; it takes effect at the VM's next boot"
+                warn "changing the NIC address means Windows sees a new adapter"
+                warn "and takes a new DHCP lease - Vypr asks libvirt, so it copes"
+            else
+                bad "could not redefine the domain; it is unchanged"
+            fi
+        else
+            info "already looks like a PC"
+        fi
+    else
+        warn "could not rewrite the domain: $out"
+    fi
+    rm -rf "$tmp4"
+else
+    info "no DMI on this host, so there is nothing believable to copy"
+fi
+
 # ------------------------------------------------- microphone and speakers
 head2 "Audio devices in the VM"
 
