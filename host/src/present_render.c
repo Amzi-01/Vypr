@@ -23,6 +23,11 @@ struct render_state {
     int           at;
     uint32_t      tex_w, tex_h;
     bool          have_frame;
+    /* Latched on the first damage frame. The pool ping-pongs whole frames; a
+     * damage frame has to be painted onto the one texture that already holds
+     * the window, so accumulation drops to tex[0] alone and updates only the
+     * changed rectangles into it. */
+    bool          accumulate;
     uint64_t      ns_upload, ns_present;
 };
 
@@ -86,8 +91,35 @@ static bool render_upload(void *impl, const struct vypr_frame_view *f)
         p->at = 0;
     }
 
-    SDL_Texture *target = p->tex[p->at];
-    p->at = (p->at + 1) % TEX_POOL;
+    const bool partial = (f->flags & VYPR_PUB_DAMAGE_RECTS) && f->damage_count > 0;
+    if (partial && !p->have_frame) return true;   /* nothing to paint onto yet */
+
+    if (partial) {
+        /* Paint the changed rectangles into the single accumulation texture.
+         * SDL_LockTexture on a sub-rect leaves the rest of the texture as it
+         * was, which is exactly the frame we want to keep. */
+        p->accumulate = true;
+        SDL_Texture *target = p->tex[0];
+        for (uint32_t r = 0; r < f->damage_count; r++) {
+            const struct vypr_rect d = f->damage[r];
+            const SDL_Rect rect = { (int)d.x, (int)d.y, (int)d.w, (int)d.h };
+            void *dst = NULL;
+            int   pitch = 0;
+            if (!SDL_LockTexture(target, &rect, &dst, &pitch)) continue;
+            for (uint32_t row = 0; row < d.h; row++)
+                memcpy((uint8_t *)dst + (size_t)row * pitch,
+                       f->pixels + (size_t)(d.y + row) * f->stride + (size_t)d.x * 4,
+                       (size_t)d.w * 4);
+            SDL_UnlockTexture(target);
+        }
+        p->ns_upload += SDL_GetTicksNS() - t0;
+        return true;
+    }
+
+    /* Whole frame. Into tex[0] alone once accumulating, so present always finds
+     * the current picture there; otherwise round-robin the pool as before. */
+    SDL_Texture *target = p->accumulate ? p->tex[0] : p->tex[p->at];
+    if (!p->accumulate) p->at = (p->at + 1) % TEX_POOL;
 
     void *dst = NULL;
     int   pitch = 0;
@@ -115,7 +147,9 @@ static void render_present(void *impl)
 
     SDL_RenderClear(p->ren);
     if (p->have_frame) {
-        SDL_Texture *show = p->tex[(p->at + TEX_POOL - 1) % TEX_POOL];
+        SDL_Texture *show = p->accumulate
+            ? p->tex[0]
+            : p->tex[(p->at + TEX_POOL - 1) % TEX_POOL];
         if (show) {
             int ww = 0, wh = 0;
             SDL_GetCurrentRenderOutputSize(p->ren, &ww, &wh);

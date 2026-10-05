@@ -418,6 +418,13 @@ int vypr_shm_acquire(struct vypr_shm *s, uint32_t slot_index, uint32_t since,
         if (off + slot->frame_bytes > s->bytes) return -1;
 
         out->pixels           = (const uint8_t *)s->base + off;
+        /* The slot record sits in guest-writable memory too, so the ring is only
+         * offered when it really lies inside the mapping. */
+        const uint64_t ring_bytes = slot->frame_bytes * VYPR_RING_FRAMES;
+        const int ring_ok = slot->ring_offset <= s->bytes &&
+                            ring_bytes <= s->bytes - slot->ring_offset;
+        out->ring             = ring_ok ? (const uint8_t *)s->base + slot->ring_offset : NULL;
+        out->ring_bytes       = ring_ok ? ring_bytes : 0;
         out->width            = p.width;
         out->height           = p.height;
         out->stride           = p.stride;
@@ -425,6 +432,30 @@ int vypr_shm_acquire(struct vypr_shm *s, uint32_t slot_index, uint32_t since,
         out->capture_qpc      = p.capture_qpc;
         out->capture_qpc_freq = p.capture_qpc_freq;
         out->flags            = p.flags;
+
+        /*
+         * Damage rectangles, each clamped to the frame.
+         *
+         * Everything here is guest-supplied, so a rectangle that ran off the
+         * edge of the frame would walk a presenter past the end of the ring
+         * buffer. A rect that does not fit is dropped rather than clamped: a
+         * wrong rectangle paints the wrong pixels, which is worse than a frame
+         * that is a touch less up to date. If that leaves the flag set with no
+         * usable rects, the frame carries nothing and the presenter keeps what
+         * it had - correct, just not advanced.
+         */
+        out->damage_count = 0;
+        if (p.flags & VYPR_PUB_DAMAGE_RECTS) {
+            uint32_t n = p.damage_count;
+            if (n > VYPR_MAX_DAMAGE_RECTS) n = VYPR_MAX_DAMAGE_RECTS;
+            for (uint32_t r = 0; r < n; r++) {
+                struct vypr_rect d = p.damage[r];
+                if (d.w == 0 || d.h == 0) continue;
+                if (d.x >= p.width || d.y >= p.height) continue;
+                if (d.w > p.width - d.x || d.h > p.height - d.y) continue;
+                out->damage[out->damage_count++] = d;
+            }
+        }
         return 0;
     }
     return -2;

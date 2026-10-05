@@ -146,6 +146,15 @@ else
     FAIL=1
 fi
 
+# Not a hard requirement - without the headers the window still builds, and
+# presents through SDL_GPU - but the zero-copy presenter needs them, and it is
+# several times faster at 4K.
+if [ -f /usr/include/vulkan/vulkan.h ]; then
+    ok "Vulkan headers present (zero-copy presenter)"
+else
+    warn "Vulkan headers missing (package: vulkan-headers / libvulkan-dev) - building without the zero-copy presenter, which is the fast path"
+fi
+
 if [ "$FAIL" -ne 0 ]; then
     printf '\n%sCannot continue.%s The items marked ✗ are prerequisites rather than\nthings an installer can arrange. Fix those and run this again.\n\n' "$red" "$rst"
     exit 1

@@ -44,6 +44,7 @@ struct Stream {
     vypr::Publisher     pub;
     vypr::WindowCapture capture;
     std::uint32_t       slot = 0;
+    bool                want_damage = false;   /* carried into a restart */
 
     /* For noticing that WGC has stopped calling back. */
     std::uint64_t last_arrived = 0;
@@ -308,7 +309,9 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
         return;
     }
 
-    if (!stream->capture.start(hwnd, &stream->pub)) {
+    const bool want_damage = (msg.flags & VYPR_ATTACH_DAMAGE) != 0;
+    stream->want_damage = want_damage;
+    if (!stream->capture.start(hwnd, &stream->pub, want_damage)) {
         result.status = -3;
         control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
@@ -568,7 +571,7 @@ void Agent::watch_windows() {
                                 "restarting capture (attempt %u)\n",
                                 (unsigned long long)id, s->restarts);
                             s->capture.stop();
-                            if (!s->capture.start(hwnd, &s->pub))
+                            if (!s->capture.start(hwnd, &s->pub, s->want_damage))
                                 std::fprintf(stderr,
                                     "vypr: hwnd %llx would not restart\n",
                                     (unsigned long long)id);
@@ -764,6 +767,29 @@ bool Agent::run(const char* host, std::uint16_t port) {
     return true;
 }
 
+/*
+ * Out from under the scheduler's default.
+ *
+ * The agent is started by a scheduled task, and a task registered without an
+ * explicit priority runs at Task Scheduler's default of 7 - below normal CPU
+ * priority, with low memory priority to match - and the agent inherits it
+ * through run-agent.cmd. That puts both halves of the stream behind every
+ * ordinary thread in the guest: frames are captured, and keystrokes and clicks
+ * injected, only once a game running at normal priority leaves a core free.
+ *
+ * High rather than realtime. The agent mostly waits, so ranking above the game
+ * costs the game almost nothing, while realtime could starve the very system
+ * threads - DWM among them - that produce the frames.
+ */
+void raise_priority() {
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+        std::fprintf(stderr, "vypr: could not raise priority (%lu)\n", GetLastError());
+
+    MEMORY_PRIORITY_INFORMATION mem{};
+    mem.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+    SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &mem, sizeof(mem));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -792,6 +818,8 @@ int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    raise_priority();
 
     // Every WinRT type used here needs an initialised apartment first.
     // Multi-threaded because the frame pool is free-threaded: frames arrive on

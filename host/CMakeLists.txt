@@ -7,9 +7,20 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 find_package(SDL3 REQUIRED CONFIG)
 
-add_executable(vypr-window src/main.c src/shm.c src/msg.c src/present.c src/present_gpu.c src/present_render.c)
+add_executable(vypr-window src/main.c src/shm.c src/msg.c src/present.c src/present_gpu.c
+                           src/present_render.c src/present_vk.c)
 target_include_directories(vypr-window PRIVATE src ../include)
 target_link_libraries(vypr-window PRIVATE SDL3::SDL3)
+
+# The zero-copy presenter. Optional so a machine without the Vulkan headers
+# still builds; it then presents through SDL_GPU, one memcpy slower.
+find_package(Vulkan)
+if(Vulkan_FOUND)
+    target_compile_definitions(vypr-window PRIVATE VYPR_HAVE_VULKAN)
+    target_link_libraries(vypr-window PRIVATE Vulkan::Vulkan)
+else()
+    message(WARNING "Vulkan headers not found: building without the zero-copy presenter")
+endif()
 
 # The session daemon: owns the region, the agent link, and which windows stream.
 add_executable(vyprd src/vyprd.c src/shm.c src/msg.c)

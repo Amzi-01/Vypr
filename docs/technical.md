@@ -89,11 +89,95 @@ staging, which copies through a CPU buffer — not the transport. `present_gpu.c
 avoids it by writing into a mapped `SDL_GPUTransferBuffer` instead, and is the
 default for that reason.
 
-**These figures predate that becoming the default and want re-measuring.** They
+**Zero-copy, 2026-10-05.** `present_vk.c` removes the CPU copy altogether. The
+ring is ordinary host RAM, so it is imported into Vulkan once with
+`VK_EXT_external_memory_host` and every frame is a single DMA out of it, on the
+GPU's dedicated copy engine rather than the graphics queue. Measured headless
+under gamescope on the RTX 5050, 3840x2160 @ 60 from `vypr-testsrc`, with a
+game running on the same GPU:
+
+| Backend | Upload (CPU) | Shown, avg | Shown, worst | GPU copy |
+|---|---|---|---|---|
+| `gpu` (SDL_GPU) | 10.7 ms | 12.2 ms | ~22 ms | ~8.5 ms, graphics queue |
+| `vulkan` (zero-copy) | 0.1 ms | 1.2 ms | ~2.5 ms | ~3.5 ms, copy engine |
+
+"Shown" stops when the present is submitted, so the GPU copy - which runs after
+it, asynchronously - is in neither column; the last column is that copy measured
+on its own. End to end the host side went from roughly 19 ms to roughly 4 ms. It
+is now the default, falling back to `gpu` and then `render`.
+
+**The table further up predates both and wants re-measuring.** They
 are left as recorded rather than adjusted by hand; run `vypr-window --stats`
 against `vypr-testsrc` to replace them. In live use a 4K guest window publishes
 a steady 60 fps, but that is the guest's publish rate, which is a different
 measurement from the host's present cost.
+
+### The guest side of a frame (2026-10-05)
+
+Three faults in the agent were costing more than the transport:
+
+- **Each frame waited for the next.** The readback used two staging textures
+  and always read the one written a frame earlier, so a frame was published only
+  when the following one arrived - a full frame interval late, and on a still
+  screen, where WGC only calls back on change, indefinitely. A frame is now
+  published the moment its own GPU copy lands: the capture callback starts the
+  copy, and a reader thread waits for it on a D3D11 fence.
+- **The agent ran below normal priority.** A task registered by `schtasks`
+  without a priority runs at Task Scheduler's default of 7, so capture and input
+  injection both queued behind any guest game. The agent raises itself to high
+  priority at start, and the capture threads join MMCSS's "Capture" class.
+- **Publishing lacked write barriers.** The region is mapped write-combined,
+  which x86's ordinary store ordering does not cover, so the record could become
+  visible before the pixels it describes. An `sfence` now precedes and follows
+  the publish.
+
+Live on the 4K guest desktop, frame age while things are moving went from 10-37
+ms average (60-180 ms worst) to 2-4 ms average (5-30 ms worst).
+
+### Damage: sending only what changed (opt-in, 2026-10-05)
+
+Everything above moves a whole frame per update. For a game that is the right
+thing to do - most of the screen changes every frame. For a desktop app it is
+mostly waste: a typed character changes a few hundred pixels and Vypr was
+copying 33 MB to show it.
+
+With damage on, the guest diffs each frame against the last in 64-pixel tiles,
+writes only the changed rectangles into the ring, and names them in the publish
+record (`VYPR_PUB_DAMAGE_RECTS`, up to `VYPR_MAX_DAMAGE_RECTS` of them). The host
+keeps a persistent copy of the window and paints just those rectangles over it -
+`present_vk.c` into a single accumulator texture, and the two fallback backends
+likewise. A frame that changed nothing is not sent at all. The first frame, a
+resize, or damage too scattered to fit the rectangle budget falls back to a
+whole frame, so the picture is never wrong, only sent more cheaply.
+
+It is **off by default** and turned on per session with `VYPR_DAMAGE=1` (which
+passes `--damage` to `vyprd`, which sets `VYPR_ATTACH_DAMAGE` on each attach).
+The reason it is opt-in rather than automatic: the guest pays a per-frame CPU
+diff of the frame, which is cheap against the transfer it saves for a still
+screen and pure overhead for full-screen motion. The workload decides, so the
+user does.
+
+Measured with `vypr-testsrc --damage` (a static background, one moving block)
+at 1280x720, the host upload fell from the whole-frame figure to **0.0 ms** -
+only the block's rectangle crosses - and all three backends reconstruct the
+frame pixel-for-pixel. On the guest the ring write shrinks to the changed tiles
+too; the readback from the guest GPU does not, as below.
+
+Live on the 4K guest desktop, read straight out of the publish records over
+ten seconds of an idle desktop: 20 partial frames and no full ones, each a single
+64x64 rectangle - 16 KB per update where a whole frame is 33 MB.
+
+What it does not fix is idle latency. A change on a still desktop still arrives
+~45 ms after it was composed, with or without damage, because the guest reads
+the whole frame back from its GPU before it can diff it. Damage removes the
+transfer cost, not that readback. Reading back only the changed rectangles needs
+the dirty regions before the copy, which Windows' capture API can report on
+recent builds; that is the next step.
+
+The wire format changed to carry the rectangles, so the region and protocol
+versions both went to 2; a host and guest built from different trees refuse each
+other rather than misread the longer records. Deploying it therefore means
+replacing the agent and the host together.
 
 ## It works
 
@@ -545,7 +629,9 @@ past 2560x1440 mapped out of range.
 | `include/vypr_proto.h` — control protocol | spoken by both ends |
 | `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
 | `host/src/main.c` — present a slot as a native window | working |
-| `host/src/present_gpu.c` — SDL_GPU upload path | working, 4x faster at 4K |
+| `host/src/present_vk.c` — zero-copy Vulkan path | working, default; ~5x faster at 4K than `gpu` |
+| `host/src/present_gpu.c` — SDL_GPU upload path | fallback |
+| Damage (changed-region) streaming | working, opt-in (`VYPR_DAMAGE=1`); verified live on the 4K guest |
 | `host/src/present_render.c` — SDL_Renderer path | kept for comparison |
 | `tools/vypr-testsrc.c` — reference producer | working |
 | Guest agent — publish path (`guest/src/publisher.cpp`) | verified on Linux, 1080p60, 0 drops |

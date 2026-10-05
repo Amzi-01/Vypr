@@ -38,7 +38,7 @@ struct options {
      * the moment you save, or the moment it stops responding. */
     const char *app_key;
     const char *sock_path;   /* unix socket back to vyprd; NULL = no input path */
-    const char *backend;     /* "gpu" or "render" */
+    const char *backend;     /* "vulkan", "gpu" or "render" */
     int         capture;     /* start with the pointer captured */
     int         never_capture; /* refuse to capture at all, whatever the guest says */
     /*
@@ -64,7 +64,7 @@ struct options {
 static void usage(void)
 {
     fputs("usage: vypr-window --shm PATH --slot N [--title NAME] [--stats]\n"
-          "                 [--sock PATH --window-id ID] [--present gpu|render]\n"
+          "                 [--sock PATH --window-id ID] [--present vulkan|gpu|render]\n"
           "\nRun standalone it presents a slot. vyprd additionally passes --sock\n"
           "and --window-id, which is what turns input back on.\n", stderr);
 }
@@ -906,6 +906,12 @@ struct view {
     uint32_t          src_w, src_h;
     uint32_t          last_serial;
     bool              is_popup;
+    /* Something new to put on screen: a frame, or the window being shown,
+     * exposed or resized. Presenting is skipped otherwise - see the loop. */
+    bool              dirty;
+    /* Host-clock capture time of the frame waiting to be presented, for the
+     * "shown" age in --stats. Zero when unknown. */
+    int64_t           capture_host_ns;
 };
 
 /* Relative capture is a request to the compositor, not a guarantee - it can be
@@ -1074,6 +1080,19 @@ static void to_guest_coords(int win_w, int win_h, uint32_t src_w, uint32_t src_h
 /* A popup the daemon handed us: a real popup surface anchored to the owner's
  * window, so the compositor treats it as a menu rather than a floating
  * top-level - it stacks correctly and does not take focus. */
+/* The Vulkan presenter can only make a surface for a window created for
+ * Vulkan, so ask for that whenever it is the one that will be tried first. The
+ * other backends present into such a window just as well. */
+static SDL_WindowFlags vk_window_flag(const char *backend)
+{
+#ifdef VYPR_HAVE_VULKAN
+    if (!backend || !strcmp(backend, "vulkan") || !strcmp(backend, "vk"))
+        return SDL_WINDOW_VULKAN;
+#endif
+    (void)backend;
+    return 0;
+}
+
 static bool view_open_popup(struct view *views, int *count, struct vypr_shm *shm,
                             const struct vypr_msg_client_popup *msg,
                             const char *backend)
@@ -1095,13 +1114,14 @@ static bool view_open_popup(struct view *views, int *count, struct vypr_shm *shm
 
     v->win = SDL_CreatePopupWindow(owner->win, msg->dx, msg->dy,
                                    (int)msg->width, (int)msg->height,
-                                   SDL_WINDOW_POPUP_MENU);
+                                   SDL_WINDOW_POPUP_MENU | vk_window_flag(backend));
     if (!v->win) {
         fprintf(stderr, "vypr: SDL_CreatePopupWindow: %s\n", SDL_GetError());
         return false;
     }
 
     v->pres = presenter_create(v->win, backend, owner->pres);
+    v->dirty = true;
     if (!v->pres) {
         SDL_DestroyWindow(v->win);
         v->win = NULL;
@@ -1292,8 +1312,9 @@ int main(int argc, char **argv)
      */
     const bool decorated = opt.window_id == VYPR_DESKTOP_WINDOW_ID;
 
+    views[0].dirty = true;
     views[0].win = SDL_CreateWindow(opt.title, win_w, win_h,
-                                    SDL_WINDOW_RESIZABLE |
+                                    SDL_WINDOW_RESIZABLE | vk_window_flag(opt.backend) |
                                     (decorated ? 0 : SDL_WINDOW_BORDERLESS));
     if (!views[0].win) {
         fprintf(stderr, "vypr: SDL_CreateWindow: %s\n", SDL_GetError());
@@ -1451,15 +1472,29 @@ int main(int argc, char **argv)
     /* Frame age: guest capture to host acquire, in host time. Needs the clock
      * offset the daemon negotiates, so it stays zero until that lands. */
     uint64_t age_total_ns = 0, age_samples = 0, age_worst_ns = 0;
+    /* The same, measured once the frame has been handed to the presenter
+     * rather than when it was taken from the ring - so it includes the upload
+     * and any wait for the swapchain, which "age" never did. */
+    uint64_t shown_total_ns = 0, shown_samples = 0, shown_worst_ns = 0;
     uint64_t stats_at = SDL_GetTicks();
 
     int running = 1;
     while (running) {
         SDL_Event ev;
+        bool did_present = false;
         while (SDL_PollEvent(&ev)) {
             /* Input is reported against the guest window the event landed on,
              * so a click on a menu reaches the menu rather than its owner. */
             struct view *v = view_for_sdl_id(views, view_count, ev.window.windowID);
+            /* With presenting done only on demand, anything that leaves the
+             * window without a picture has to ask for one. A resize recreates
+             * the swapchain, and an exposed window may have lost its contents. */
+            if (v && (ev.type == SDL_EVENT_WINDOW_EXPOSED ||
+                      ev.type == SDL_EVENT_WINDOW_RESIZED ||
+                      ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+                      ev.type == SDL_EVENT_WINDOW_RESTORED ||
+                      ev.type == SDL_EVENT_WINDOW_SHOWN))
+                v->dirty = true;
             if (!v) v = &views[0];
 
             switch (ev.type) {
@@ -1984,6 +2019,7 @@ drop_pump(&drop);
                     clock_gettime(CLOCK_MONOTONIC, &ts);
                     const int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
                     const int64_t age = now - captured_host_ns;
+                    v->capture_host_ns = captured_host_ns;
                     if (age >= 0 && age < 1000000000) {
                         age_total_ns += (uint64_t)age;
                         if ((uint64_t)age > age_worst_ns) age_worst_ns = (uint64_t)age;
@@ -1991,7 +2027,7 @@ drop_pump(&drop);
                     }
                 }
 
-                presenter_upload(v->pres, &f);
+                if (presenter_upload(v->pres, &f)) v->dirty = true;
                 if (i == 0) {
                     presented++;
                     last_frame_ms = SDL_GetTicks();
@@ -2006,7 +2042,34 @@ drop_pump(&drop);
                     running = 0;
             }
 
-            presenter_present(v->pres);
+            /*
+             * Only when there is something new to show.
+             *
+             * This used to run every iteration, and with a vsync swapchain it
+             * blocked each time until the display was ready - so the loop went
+             * round once per refresh, and a frame published just after the
+             * check sat for up to a whole interval before it was even picked
+             * up. It also meant pointer motion was only flushed to the guest
+             * once per refresh. Presenting on demand lets the loop come round
+             * as soon as anything happens, which is what the wait below is for.
+             */
+            if (v->dirty) {
+                presenter_present(v->pres);
+                v->dirty = false;
+                did_present = true;
+                if (i == 0 && v->capture_host_ns) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    const int64_t shown = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec
+                                          - v->capture_host_ns;
+                    if (shown >= 0 && shown < 1000000000) {
+                        shown_total_ns += (uint64_t)shown;
+                        if ((uint64_t)shown > shown_worst_ns) shown_worst_ns = (uint64_t)shown;
+                        shown_samples++;
+                    }
+                    v->capture_host_ns = 0;
+                }
+            }
         }
 
         /* The one-shot --size request. A frame has arrived, so the agent is
@@ -2039,6 +2102,19 @@ drop_pump(&drop);
             fflush(stdout);
         }
 
+        /*
+         * Nothing presented this time round: wait for an event, but only
+         * briefly.
+         *
+         * Presenting used to block on vsync and that paced the loop. Without
+         * it the loop would spin, and there is no event to wait for when a
+         * frame lands - the guest publishes into shared memory and signals
+         * nothing. A millisecond is the compromise: a new frame is picked up
+         * within about that, where it used to wait up to a whole refresh
+         * interval, and input still wakes the loop at once.
+         */
+        if (!did_present) SDL_WaitEventTimeout(NULL, 1);
+
         if (opt.stats) {
             uint64_t now = SDL_GetTicks();
             if (now - stats_at >= 1000) {
@@ -2049,14 +2125,21 @@ drop_pump(&drop);
                 const double err_ms = shm.hdr->offset_rtt_us / 2000.0;
                 printf("%" PRIu64 " fps presented, %" PRIu64 " dropped | "
                        "upload %.1f ms, present %.1f ms | age avg %.1f ms "
-                       "worst %.1f ms (+/- %.2f)\n",
+                       "worst %.1f ms | shown avg %.1f ms worst %.1f ms (+/- %.2f)\n",
                        presented, dropped,
                        presented ? ns_upload  / 1e6 / presented : 0.0,
                        presented ? ns_present / 1e6 / presented : 0.0,
                        age_samples ? age_total_ns / 1e6 / age_samples : 0.0,
-                       age_worst_ns / 1e6, err_ms);
+                       age_worst_ns / 1e6,
+                       shown_samples ? shown_total_ns / 1e6 / shown_samples : 0.0,
+                       shown_worst_ns / 1e6, err_ms);
+                /* stdout is a log file when vyprd starts us, so it is block
+                 * buffered and a second's line would otherwise sit unseen for
+                 * the better part of half a minute. */
+                fflush(stdout);
                 presented = dropped = 0;
                 age_total_ns = age_samples = age_worst_ns = 0;
+                shown_total_ns = shown_samples = shown_worst_ns = 0;
                 stats_at = now;
             }
         }

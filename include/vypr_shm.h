@@ -25,7 +25,16 @@
 #include <stdint.h>
 
 #define VYPR_SHM_MAGIC      0x52505956u  /* 'VYPR' little-endian */
-#define VYPR_SHM_VERSION    1u
+
+/*
+ * Bumped to 2 when the publish record grew its damage rectangles. The whole
+ * record is a plain struct at a fixed offset read on both sides, so a size
+ * change is a wire break: a host and guest that disagree must not talk, and the
+ * version check in vypr_shm_open / Publisher::bind is what stops them. An old
+ * guest paired with a new host, or the reverse, fails that check and refuses,
+ * rather than reading the damage array at the wrong offset.
+ */
+#define VYPR_SHM_VERSION    2u
 
 /* Slots are windows. Sixteen is far past what a person keeps open from one VM,
  * and keeping it fixed lets the header be a plain struct at a known offset. */
@@ -75,6 +84,24 @@ enum vypr_slot_state {
  * record and drops that read. It costs two stores per frame and removes the
  * need for any lock across the VM boundary.
  */
+/*
+ * How many separate changed rectangles a partial frame can name.
+ *
+ * Eight is a deliberate ceiling, not a guess at how many regions change: it
+ * keeps the publish record a small fixed struct, and the guest coalesces its
+ * real damage down to at most this many before publishing. When the true
+ * damage is more scattered than eight rectangles, the guest sends their
+ * bounding box as a single rectangle instead - still far less than the whole
+ * frame for the cases this exists for (a blinking caret, a moving cursor, one
+ * updating panel), and never wrong, only less selective.
+ */
+#define VYPR_MAX_DAMAGE_RECTS 8u
+
+/* A changed region, in pixels from the top-left of the frame. */
+struct vypr_rect {
+    uint32_t x, y, w, h;
+};
+
 struct vypr_publish {
     volatile uint32_t seq;       /* even = stable, odd = being written */
     uint32_t index;              /* which ring buffer holds the frame */
@@ -85,11 +112,31 @@ struct vypr_publish {
     uint64_t capture_qpc;        /* guest QueryPerformanceCounter at capture */
     uint64_t capture_qpc_freq;   /* so the host can convert without asking */
     uint32_t flags;
-    uint32_t _pad;
+
+    /*
+     * Partial frames.
+     *
+     * With VYPR_PUB_DAMAGE_RECTS set, only the pixels inside damage[0 ..
+     * damage_count) were written into this ring buffer, at their own
+     * coordinates; everything else in the buffer is stale and must not be
+     * read. The host keeps its own full copy of the window and paints just
+     * these rectangles over it. This is the whole point of damage: a typed
+     * character crosses the VM boundary as a few kilobytes instead of a whole
+     * frame.
+     *
+     * With VYPR_PUB_DAMAGE_FULL set (the default, and always the first frame of
+     * a session or after a resize), the entire buffer is valid and damage_count
+     * is zero. A host that does not understand damage simply never sees the
+     * rects flag, because the guest only sets it once the host has asked for it
+     * over the control channel.
+     */
+    uint32_t damage_count;
+    struct vypr_rect damage[VYPR_MAX_DAMAGE_RECTS];
 };
 
 #define VYPR_PUB_CURSOR_VISIBLE  (1u << 0)
 #define VYPR_PUB_DAMAGE_FULL     (1u << 1)
+#define VYPR_PUB_DAMAGE_RECTS    (1u << 2)
 
 struct vypr_slot {
     volatile uint32_t state;     /* enum vypr_slot_state */

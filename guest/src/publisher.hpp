@@ -36,9 +36,17 @@ public:
     // Publish what begin_frame handed out. `width`/`height` may change between
     // frames when the window is resized, as long as they stay within the slot's
     // maximum - past that the host has to re-attach with a bigger ring.
+    //
+    // With `damage`/`damage_count`, only those rectangles of the ring buffer
+    // were written and the host paints just them over the frame it holds - see
+    // VYPR_PUB_DAMAGE_RECTS. The caller sets the matching flag; passing no
+    // rectangles (the default) publishes a whole frame, as before. More than
+    // VYPR_MAX_DAMAGE_RECTS are ignored past the limit, so the caller coalesces
+    // first.
     bool publish(std::uint32_t width, std::uint32_t height, std::uint32_t stride,
                  std::uint64_t capture_ts, std::uint64_t ts_freq,
-                 std::uint32_t flags);
+                 std::uint32_t flags,
+                 const vypr_rect* damage = nullptr, std::uint32_t damage_count = 0);
 
     // Guest window went away. The host reclaims the slot.
     void close();

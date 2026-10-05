@@ -60,10 +60,28 @@ struct vypr_shm {
  * slot - the guest may reuse the buffer once we stop looking at it. */
 struct vypr_frame_view {
     const uint8_t *pixels;
+    /* The whole ring `pixels` lies in. It stays put for as long as the slot is
+     * attached, which is what lets a presenter hand it to the GPU once and
+     * have the GPU read every later frame straight out of it. */
+    const uint8_t *ring;
+    uint64_t ring_bytes;
     uint32_t width, height, stride;
     uint32_t serial;
     uint64_t capture_qpc, capture_qpc_freq;
     uint32_t flags;
+
+    /*
+     * Changed rectangles, when `flags` has VYPR_PUB_DAMAGE_RECTS.
+     *
+     * Then only the pixels inside these rectangles are valid in `pixels`, and a
+     * presenter must paint them over the frame it already holds rather than
+     * treating `pixels` as a whole frame. Already validated against the frame's
+     * own width, height and stride, so a presenter can use them without
+     * re-checking. Zero `damage_count` with the flag clear means the whole
+     * frame is valid, as before.
+     */
+    uint32_t damage_count;
+    struct vypr_rect damage[VYPR_MAX_DAMAGE_RECTS];
 };
 
 /* `format` on open: 1 to write a fresh header (the host is starting a session),

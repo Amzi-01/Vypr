@@ -2,6 +2,10 @@
 
 #include <cstring>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace vypr {
 
 namespace {
@@ -19,6 +23,23 @@ inline std::uint32_t load_acquire(const volatile std::uint32_t& v) {
 inline void store_relaxed(volatile std::uint32_t& v, std::uint32_t x) {
     std::atomic_ref<std::uint32_t> r(const_cast<std::uint32_t&>(v));
     r.store(x, std::memory_order_relaxed);
+}
+
+/*
+ * Drain the write-combining buffers.
+ *
+ * The region is mapped write-combined (see ivshmem.cpp), and x86's ordinary
+ * store ordering does not cover WC memory: stores to it may become visible out
+ * of order and may sit in a fill buffer indefinitely. The C++ fences below
+ * compile to nothing on x86, so on their own they order the compiler and not
+ * the hardware - the host could see the even sequence number before the last
+ * rows of pixels, or not see it at all until the buffer happens to evict.
+ * SFENCE is the instruction that makes WC stores globally visible, in order.
+ */
+inline void wc_fence() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_sfence();
+#endif
 }
 }  // namespace
 
@@ -60,7 +81,8 @@ std::uint8_t* Publisher::begin_frame(std::uint32_t* out_stride) const {
 
 bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t stride,
                         std::uint64_t capture_ts, std::uint64_t ts_freq,
-                        std::uint32_t flags) {
+                        std::uint32_t flags,
+                        const vypr_rect* damage, std::uint32_t damage_count) {
     if (!slot_) return false;
 
     // The host handed this slot index to somebody else. Writing now would put
@@ -74,14 +96,25 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
     if (width > slot_->max_width || height > slot_->max_height) return false;
     if (static_cast<std::uint64_t>(stride) * height > slot_->frame_bytes) return false;
 
+    // A damage frame with no rectangles would tell the host the buffer holds
+    // nothing valid, which is never what is meant: fall back to a whole frame.
+    if ((flags & VYPR_PUB_DAMAGE_RECTS) && (!damage || damage_count == 0)) {
+        flags = (flags & ~VYPR_PUB_DAMAGE_RECTS) | VYPR_PUB_DAMAGE_FULL;
+    }
+    if (damage_count > VYPR_MAX_DAMAGE_RECTS) damage_count = VYPR_MAX_DAMAGE_RECTS;
+
     vypr_publish& pub = slot_->pub;
 
     // Seqlock write. Odd marks the record unstable; the release fences keep the
     // pixel writes and the field writes from being seen after the even store
     // that publishes them.
+    // Every row of the frame lands before the record says it is there.
+    wc_fence();
+
     const std::uint32_t seq = pub.seq;
     store_relaxed(pub.seq, seq + 1);
     std::atomic_thread_fence(std::memory_order_release);
+    wc_fence();
 
     pub.index            = index_;
     pub.serial           = ++serial_;
@@ -92,13 +125,22 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
     pub.capture_qpc_freq = ts_freq;
     pub.flags            = flags;
 
+    pub.damage_count = (flags & VYPR_PUB_DAMAGE_RECTS) ? damage_count : 0;
+    for (std::uint32_t r = 0; r < pub.damage_count; r++) pub.damage[r] = damage[r];
+
     std::atomic_thread_fence(std::memory_order_release);
+    wc_fence();
     store_release(pub.seq, seq + 2);
+    // And push the publish itself out now, rather than whenever the fill
+    // buffer is next evicted: until it lands the host cannot see the frame.
+    wc_fence();
 
     // First publish takes the slot live, so the host starts reading only once
     // there is a whole frame to read.
-    if (load_acquire(slot_->state) == VYPR_SLOT_ARMED)
+    if (load_acquire(slot_->state) == VYPR_SLOT_ARMED) {
         store_release(slot_->state, VYPR_SLOT_LIVE);
+        wc_fence();
+    }
 
     index_ = (index_ + 1) % VYPR_RING_FRAMES;
     return true;

@@ -1,4 +1,4 @@
-/* Backend contract. Two implementations link side by side so they can be
+/* Backend contract. The implementations link side by side so they can be
  * compared on the same frames rather than across separate builds. */
 #ifndef VYPR_HOST_PRESENT_INTERNAL_H
 #define VYPR_HOST_PRESENT_INTERNAL_H
@@ -16,6 +16,9 @@ struct present_ops {
 };
 
 extern const struct present_ops present_gpu_ops;
+#ifdef VYPR_HAVE_VULKAN
+extern const struct present_ops present_vk_ops;
+#endif
 extern const struct present_ops present_render_ops;
 
 #endif

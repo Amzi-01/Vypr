@@ -149,6 +149,11 @@ struct daemon {
      * passes straight through. */
     const char *share;
 
+    /* Ask the guest to send only changed rectangles of each frame. Off unless
+     * the user turned it on - see VYPR_ATTACH_DAMAGE. Set once here and carried
+     * into every ATTACH, so a window opened later in the session gets it too. */
+    int damage;
+
     /*
      * Windows the user closed.
      *
@@ -391,6 +396,12 @@ static int spawn_client(struct daemon *d, struct window *w)
         argv[n++] = (char *)cap_flag;
         if (size_flag) { argv[n++] = "--size";  argv[n++] = (char *)size_flag; }
         if (d->share)  { argv[n++] = "--share"; argv[n++] = (char *)d->share; }
+        /* Per-second frame timings from every window, into this daemon's log.
+         * Off by default; VYPR_STATS=1 in the environment that starts the
+         * session turns it on without anyone having to edit a command line
+         * the launcher builds. */
+        const char *stats = getenv("VYPR_STATS");
+        if (stats && *stats == '1') argv[n++] = "--stats";
         argv[n] = NULL;
 
         execv(exe, argv);
@@ -472,6 +483,8 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
 
     w->slot = at.slot;
     w->has_slot = 1;
+
+    if (d->damage) at.flags |= VYPR_ATTACH_DAMAGE;
 
     if (msg_send(d->agent_fd, VYPR_MSG_ATTACH, &at, sizeof(at)) < 0) {
         fprintf(stderr, "vyprd: failed to send ATTACH for '%s'\n", title);
@@ -1136,7 +1149,8 @@ static void usage(void)
           "  --all    stream every guest window; useful for seeing what is there\n"
           "  --bind   interface to accept the agent on; defaults to the virtual\n"
           "           bridge (192.168.122.1). 'any' listens everywhere.\n"
-          "  --launch ask the agent to start this command once it connects\n", stderr);
+          "  --launch ask the agent to start this command once it connects\n"
+          "  --damage ask the guest to send only changed screen regions (opt-in)\n", stderr);
 }
 
 /*
@@ -1206,6 +1220,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--window-size") && i + 1 < argc) d.window_size = argv[++i];
         else if (!strcmp(argv[i], "--share") && i + 1 < argc) d.share = argv[++i];
         else if (!strcmp(argv[i], "--launch") && i + 1 < argc) d.launch = argv[++i];
+        else if (!strcmp(argv[i], "--damage")) d.damage = 1;
         else { usage(); return 2; }
     }
 

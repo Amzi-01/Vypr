@@ -350,6 +350,11 @@ start_daemon() {
         sroot=$(share_root 2>/dev/null || true)
         # Normalised to "Z:" - share_drive answers with the letter alone.
         [ -n "$sdrive" ] && [ -n "$sroot" ] && args+=(--share "${sdrive%:}:=$sroot")
+        # Changed-region streaming. Off unless VYPR_DAMAGE=1 is set, because it
+        # trades a per-frame CPU diff in the guest for far less to send: a clear
+        # win for a mostly-still desktop app, a cost for full-screen motion like
+        # a game. The user opts in per their workload, so it is never forced on.
+        [ "${VYPR_DAMAGE:-0}" = "1" ] && args+=(--damage)
         nohup "$BIN/vyprd" --shm "$SHM" "${args[@]}" \
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2

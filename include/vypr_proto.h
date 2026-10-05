@@ -19,7 +19,13 @@
 
 #include <stdint.h>
 
-#define VYPR_PROTO_VERSION   1u
+/*
+ * Bumped to 2 alongside the shared-memory layout, when ATTACH grew its `flags`
+ * field for damage. Host and guest are built from one tree and so always agree,
+ * but a stale binary paired with a fresh one would misread the longer ATTACH;
+ * the mismatch is caught by this number and by the region's own version.
+ */
+#define VYPR_PROTO_VERSION   2u
 #define VYPR_CONTROL_PORT    47820u
 #define VYPR_MAX_MSG_BYTES   (64u * 1024u)
 
@@ -336,7 +342,21 @@ struct vypr_msg_attach {
     uint32_t max_height;
     uint32_t frame_stride;
     uint32_t generation;
+    uint32_t flags;              /* VYPR_ATTACH_* */
 };
+
+/*
+ * Send only the changed rectangles of each frame, not the whole thing.
+ *
+ * Off unless the host sets it, and the host only sets it when the user asked
+ * (it is opt-in, and off by default). An old guest that does not read the field
+ * never turns it on, so the host keeps receiving whole frames from it and
+ * nothing breaks. A guest that honours it still sends whole frames when it has
+ * nothing better - the first frame of a session, a resize, or a frame it could
+ * not reduce to a few rectangles - so damage never changes what is shown, only
+ * how much crosses the boundary to show it. See VYPR_PUB_DAMAGE_RECTS.
+ */
+#define VYPR_ATTACH_DAMAGE       (1u << 0)
 
 struct vypr_msg_attach_result {
     uint64_t window_id;

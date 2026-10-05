@@ -67,7 +67,7 @@ static inline void vypr_fit_rect(int win_w, int win_h,
     *y = (win_h - *h) / 2;
 }
 
-/* `backend` is "gpu", "render", or NULL for the default.
+/* `backend` is "vulkan", "gpu", "render", or NULL for the default (vulkan).
  *
  * `share` may name an existing presenter to borrow GPU state from. Creating a
  * GPU device costs milliseconds, which is fine once per window and far too slow

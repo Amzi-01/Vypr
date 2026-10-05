@@ -54,6 +54,26 @@ static void draw(std::uint8_t* dst, std::uint32_t w, std::uint32_t h,
     }
 }
 
+// A static background with a white block, painted into one rectangle, matching
+// draw() at f==0 everywhere outside the block. Lets the damage path be exercised
+// end to end: if the host accumulates partial frames correctly, the block moves
+// over an unchanging background with no trail.
+static void draw_block_rect(std::uint8_t* dst, std::uint32_t stride,
+                            std::uint32_t rx, std::uint32_t ry, std::uint32_t rw,
+                            std::uint32_t rh, std::uint32_t bx, std::uint32_t by,
+                            std::uint32_t bs) {
+    for (std::uint32_t y = ry; y < ry + rh; y++) {
+        std::uint8_t* row = dst + (std::size_t)y * stride;
+        for (std::uint32_t x = rx; x < rx + rw; x++) {
+            const bool in = (x >= bx && x < bx + bs && y >= by && y < by + bs);
+            row[x * 4 + 0] = in ? 0xff : (std::uint8_t)((x * 2) & 0xff);
+            row[x * 4 + 1] = in ? 0xff : (std::uint8_t)(y & 0xff);
+            row[x * 4 + 2] = in ? 0xff : (std::uint8_t)((x ^ y) & 0xff);
+            row[x * 4 + 3] = 0xff;
+        }
+    }
+}
+
 // Control mode: behave like the Windows agent. Announce a window, wait to be
 // attached, publish into whatever slot the daemon assigns, and report the input
 // that comes back. This exercises vyprd, slot allocation, client spawning and
@@ -110,6 +130,9 @@ static int run_connected(const std::string& host, std::uint16_t port,
 
     vypr::Publisher pub;
     bool streaming = false;
+    bool damage_on = false;   /* the daemon asked for damage on this attach */
+    const std::uint32_t bs = w > 128 ? 64 : 16;
+    std::uint32_t prev_bx = 0, prev_by = 0;
 
     struct msg_reader rx{};
     const std::uint64_t period = 1000000000ull / (fps ? fps : 60);
@@ -141,10 +164,13 @@ static int run_connected(const std::string& host, std::uint16_t port,
                     if (pub.bind(shm.base, shm.bytes, at->slot)) {
                         res.status = 0;
                         streaming = true;
+                        damage_on = (at->flags & VYPR_ATTACH_DAMAGE) != 0;
+                        prev_bx = prev_by = 0;
                         next = now_ns();
                         std::fprintf(stderr,
-                            "vypr-testagent: attached to slot %u (%ux%u max)\n",
-                            at->slot, pub.max_width(), pub.max_height());
+                            "vypr-testagent: attached to slot %u (%ux%u max)%s\n",
+                            at->slot, pub.max_width(), pub.max_height(),
+                            damage_on ? ", damage on" : "");
                     } else {
                         res.status = -2;
                         std::fprintf(stderr, "vypr-testagent: bind failed\n");
@@ -196,8 +222,27 @@ static int run_connected(const std::string& host, std::uint16_t port,
         if (streaming && now_ns() >= next) {
             std::uint32_t stride = 0;
             if (std::uint8_t* dst = pub.begin_frame(&stride)) {
-                draw(dst, w, h, stride, pub.serial());
-                pub.publish(w, h, stride, now_ns(), 1000000000ull, VYPR_PUB_DAMAGE_FULL);
+                const bool partial = damage_on && (pub.serial() % 120 != 0);
+                if (partial) {
+                    const std::uint32_t span = w > bs ? w - bs : 1;
+                    const std::uint32_t bx = (pub.serial() * 7) % span;
+                    const std::uint32_t by = (h > bs) ? (pub.serial() * 3) % (h - bs) : 0;
+                    vypr_rect d;
+                    d.x = bx < prev_bx ? bx : prev_bx;
+                    d.y = by < prev_by ? by : prev_by;
+                    d.w = (bx > prev_bx ? bx - prev_bx : prev_bx - bx) + bs;
+                    d.h = (by > prev_by ? by - prev_by : prev_by - by) + bs;
+                    if (d.x + d.w > w) d.w = w - d.x;
+                    if (d.y + d.h > h) d.h = h - d.y;
+                    draw_block_rect(dst, stride, d.x, d.y, d.w, d.h, bx, by, bs);
+                    pub.publish(w, h, stride, now_ns(), 1000000000ull,
+                                VYPR_PUB_DAMAGE_RECTS, &d, 1);
+                    prev_bx = bx; prev_by = by;
+                } else {
+                    draw(dst, w, h, stride, damage_on ? 0 : pub.serial());
+                    pub.publish(w, h, stride, now_ns(), 1000000000ull, VYPR_PUB_DAMAGE_FULL);
+                    if (damage_on) prev_bx = prev_by = 0;
+                }
             }
             next += period;
             if (next < now_ns()) next = now_ns();

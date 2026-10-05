@@ -34,6 +34,19 @@ struct gpu_state {
     uint32_t src_w, src_h, src_stride;
     bool     have_frame;
 
+    /*
+     * Set the first time a damage frame arrives, and then latched.
+     *
+     * The texture is persistent either way, but a whole-frame upload cycles it
+     * - takes a fresh backing and rewrites every pixel - which is faster and
+     * cannot stall. A damage frame paints only its rectangles, so the texture
+     * must keep what it already holds, which means not cycling it and wearing
+     * the occasional stall against the present reading it. Switching the whole
+     * window to the no-cycle path on the first damage frame keeps the fast
+     * path exactly as it was whenever damage is off.
+     */
+    bool     accumulate;
+
     uint64_t ns_upload, ns_present;
 };
 
@@ -73,10 +86,28 @@ static void *gpu_create(SDL_Window *win, void *share_impl)
         return NULL;
     }
 
-    /* VSYNC rather than MAILBOX: the guest is the clock here, and tearing a
-     * frame that cost a PCIe crossing to deliver is a poor trade. */
-    SDL_SetGPUSwapchainParameters(p->dev, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                                  SDL_GPU_PRESENTMODE_VSYNC);
+    /*
+     * MAILBOX where the driver offers it, VSYNC where it does not.
+     *
+     * This used to be VSYNC to avoid tearing, which is the right goal and the
+     * wrong mode to rule out: MAILBOX does not tear. It still waits for the
+     * vertical blank; it differs only in that a newer image replaces one still
+     * waiting, rather than queueing behind it. IMMEDIATE is the mode that
+     * tears. With VSYNC every frame queued behind whatever was already
+     * pending, so a frame arriving mid-refresh was shown one or two
+     * refreshes later than it needed to be. The guest is the clock here, as
+     * the old comment said - which is exactly why the newest frame should win.
+     *
+     * One frame in flight rather than SDL's default of two, for the same
+     * reason: a second slot is a second frame of queue.
+     */
+    SDL_GPUPresentMode mode = SDL_GPU_PRESENTMODE_VSYNC;
+    if (SDL_WindowSupportsGPUPresentMode(p->dev, win, SDL_GPU_PRESENTMODE_MAILBOX))
+        mode = SDL_GPU_PRESENTMODE_MAILBOX;
+    SDL_SetGPUSwapchainParameters(p->dev, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode);
+    SDL_SetGPUAllowedFramesInFlight(p->dev, 1);
+    fprintf(stderr, "vypr: presenting with %s, 1 frame in flight\n",
+            mode == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "vsync");
     return p;
 }
 
@@ -146,30 +177,69 @@ static bool gpu_upload(void *impl, const struct vypr_frame_view *f)
     if (f->stride % 4 != 0) return false;   /* pixels_per_row is in pixels */
     if (!ensure_resources(p, f)) return false;
 
+    /* A damage frame can only be painted over a frame already held. If one has
+     * not arrived yet - the very first frame should never be damage, but a
+     * guest bug must not scribble - skip it. */
+    const bool partial = (f->flags & VYPR_PUB_DAMAGE_RECTS) && f->damage_count > 0;
+    if (partial && !p->have_frame) return true;
+    if (partial) p->accumulate = true;
+
     void *dst = SDL_MapGPUTransferBuffer(p->dev, p->xfer, true);
     if (!dst) {
         fprintf(stderr, "vypr: MapGPUTransferBuffer: %s\n", SDL_GetError());
         return false;
     }
-    /* One contiguous copy, padding included - cheaper than skipping it. */
-    memcpy(dst, f->pixels, (size_t)f->stride * f->height);
+    if (partial) {
+        /* Only the changed rows, each at the same byte offset it has in the
+         * ring, so one pitch describes both sides below. */
+        for (uint32_t r = 0; r < f->damage_count; r++) {
+            const struct vypr_rect d = f->damage[r];
+            for (uint32_t y = d.y; y < d.y + d.h; y++) {
+                const size_t o = (size_t)y * f->stride + (size_t)d.x * 4;
+                memcpy((uint8_t *)dst + o, f->pixels + o, (size_t)d.w * 4);
+            }
+        }
+    } else {
+        /* One contiguous copy, padding included - cheaper than skipping it. */
+        memcpy(dst, f->pixels, (size_t)f->stride * f->height);
+    }
     SDL_UnmapGPUTransferBuffer(p->dev, p->xfer);
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(p->dev);
     if (!cmd) return false;
 
+    /* Once a window is accumulating, never cycle: cycling hands back a fresh
+     * texture and the previous frame with it. */
+    const bool cycle = !p->accumulate;
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
-    SDL_GPUTextureTransferInfo src = {
-        .transfer_buffer = p->xfer,
-        .offset          = 0,
-        .pixels_per_row  = f->stride / 4,
-        .rows_per_layer  = f->height,
-    };
-    SDL_GPUTextureRegion dstr = {
-        .texture = p->tex,
-        .w = f->width, .h = f->height, .d = 1,
-    };
-    SDL_UploadToGPUTexture(copy, &src, &dstr, true);
+    if (partial) {
+        for (uint32_t r = 0; r < f->damage_count; r++) {
+            const struct vypr_rect d = f->damage[r];
+            SDL_GPUTextureTransferInfo src = {
+                .transfer_buffer = p->xfer,
+                .offset          = (Uint32)((size_t)d.y * f->stride + (size_t)d.x * 4),
+                .pixels_per_row  = f->stride / 4,
+                .rows_per_layer  = d.h,
+            };
+            SDL_GPUTextureRegion dstr = {
+                .texture = p->tex,
+                .x = d.x, .y = d.y, .w = d.w, .h = d.h, .d = 1,
+            };
+            SDL_UploadToGPUTexture(copy, &src, &dstr, false);
+        }
+    } else {
+        SDL_GPUTextureTransferInfo src = {
+            .transfer_buffer = p->xfer,
+            .offset          = 0,
+            .pixels_per_row  = f->stride / 4,
+            .rows_per_layer  = f->height,
+        };
+        SDL_GPUTextureRegion dstr = {
+            .texture = p->tex,
+            .w = f->width, .h = f->height, .d = 1,
+        };
+        SDL_UploadToGPUTexture(copy, &src, &dstr, cycle);
+    }
     SDL_EndGPUCopyPass(copy);
     SDL_SubmitGPUCommandBuffer(cmd);
 

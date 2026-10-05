@@ -11,28 +11,34 @@ struct presenter {
 struct presenter *presenter_create(SDL_Window *win, const char *backend,
                                    struct presenter *share)
 {
-    const struct present_ops *ops = &present_gpu_ops;
-    if (backend && !strcmp(backend, "render")) ops = &present_render_ops;
-
-    /* Sharing only makes sense between the same backend. */
-    if (share && share->ops != ops) share = NULL;
+    /*
+     * Fastest first, each falling back to the next: Vulkan needs the host
+     * pointer import and a window created for Vulkan; SDL_GPU needs a working
+     * Vulkan or D3D12; the renderer always works. Falling back beats refusing
+     * to show the window at all. A named backend starts the chain there.
+     */
+    const struct present_ops *chain[3];
+    int n = 0;
+#ifdef VYPR_HAVE_VULKAN
+    if (!backend || !strcmp(backend, "vulkan") || !strcmp(backend, "vk"))
+        chain[n++] = &present_vk_ops;
+#endif
+    if (!backend || strcmp(backend, "render"))
+        chain[n++] = &present_gpu_ops;
+    chain[n++] = &present_render_ops;
 
     struct presenter *p = SDL_calloc(1, sizeof(*p));
     if (!p) return NULL;
 
-    p->impl = ops->create(win, share ? share->impl : NULL);
-    if (!p->impl) {
-        /* The GPU backend needs a working Vulkan or D3D12; falling back beats
-         * refusing to show the window at all. */
-        if (ops != &present_render_ops) {
-            fprintf(stderr, "vypr: '%s' backend unavailable, falling back to 'render'\n",
-                    ops->name);
-            ops = &present_render_ops;
-            p->impl = ops->create(win, NULL);
-        }
-        if (!p->impl) { SDL_free(p); return NULL; }
+    for (int i = 0; i < n && !p->impl; i++) {
+        if (i > 0)
+            fprintf(stderr, "vypr: '%s' backend unavailable, falling back to '%s'\n",
+                    chain[i - 1]->name, chain[i]->name);
+        /* Sharing only makes sense between the same backend. */
+        p->impl = chain[i]->create(win, share && share->ops == chain[i] ? share->impl : NULL);
+        p->ops  = chain[i];
     }
-    p->ops = ops;
+    if (!p->impl) { SDL_free(p); return NULL; }
     return p;
 }
 

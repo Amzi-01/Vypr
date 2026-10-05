@@ -26,7 +26,12 @@ public:
     // Begins capturing `hwnd`, publishing every frame into `pub`. The publisher
     // must outlive the capture. Returns false if WGC is unavailable or the
     // window cannot be captured.
-    bool start(void* hwnd, Publisher* pub);
+    //
+    // With `damage`, the capture compares each frame against the last and
+    // publishes only the rectangles that changed, which is far less to move
+    // across the VM boundary for a mostly-still window. Off by default; the
+    // host turns it on per attach only when the user asked for it.
+    bool start(void* hwnd, Publisher* pub, bool damage = false);
     void stop();
 
     // Set when the window's content grows past the slot the host gave us. The
