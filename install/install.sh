@@ -8,7 +8,7 @@
 # that already exists. Those are prerequisites, not install steps.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.5.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 SHM_NAME="vypr"   # the shared-memory device older versions added
 PORT=47820
