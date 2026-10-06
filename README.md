@@ -37,6 +37,14 @@ from Windows capturing a 1440p frame to Vypr having it on this side, measured �
 and nothing has to be installed in Windows to get it out: no driver, Looking
 Glass's or anyone else's.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/how-it-works-dark.svg">
+    <img src="docs/readme/how-it-works-light.svg" width="760"
+         alt="How a frame travels: in Windows the app's window is captured, read back from the GPU in eight bands and written into locked pages of the VM's own RAM; the host reads those pages in place, with no copy, codec or driver; vyprd checks every page, the GPU imports the ring without a copy, and the frame appears as a native window. Keys and mouse go back over a socket.">
+  </picture>
+</p>
+
 ## Where it came from
 
 This started as a passion project with one goal: **play FiveM on Linux.**
@@ -116,6 +124,32 @@ case they cannot reach — when the thing you are running has to be fast, and yo
 have a second GPU to give it.
 
 *Compared against WinApps and WinBoat documentation as of August 2026.*
+
+### How fast
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/latency-dark.svg">
+    <img src="docs/readme/latency-light.svg" width="760"
+         alt="Milliseconds from capture in Windows to the frame being ready on Linux, 0.4.13 against 0.5.0: 1920x1080 window 5.98 to 5.02 (16% less), 2560x1440 window 7.42 to 6.29 (15% less), 3200x1800 window 10.80 to 8.72 (19% less), whole 4K desktop 13.82 to 11.74 (15% less).">
+  </picture>
+</p>
+
+<details>
+<summary>The numbers behind it</summary>
+
+| Milliseconds, capture to publish | 0.4.13 | 0.5.0 | Change |
+|---|---:|---:|---:|
+| 1920 × 1080 window | 5.98 | 5.02 | −16% |
+| 2560 × 1440 window | 7.42 | 6.29 | −15% |
+| 3200 × 1800 window | 10.80 | 8.72 | −19% |
+| Whole 4K desktop | 13.82 | 11.74 | −15% |
+
+Measured on one VM, both versions in the same session, at a steady 58–60 fps
+with nothing dropped. How it was measured, and why, is in
+[docs/technical.md](docs/technical.md).
+
+</details>
 
 ## What you need
 
@@ -217,7 +251,7 @@ any defaults.
 | `vypr detect` | find apps on the guest desktop and pick which to add |
 | `vypr open <file>` | open a Linux file in the Windows app that handles it |
 | `vypr associate` | make double-clicking `.psd`, `.exe` and friends do that |
-| `vypr open-elevation` | let the guest elevate without a prompt Vypr cannot answer |
+| `vypr open-elevation` | let the guest elevate without a prompt Vypr cannot answer — on by default; `--remove` turns it off |
 | `vypr guest-notifications` | turn the guest's notifications back on |
 | `vypr --debug desktop` | stream the guest's whole screen, for when something is wrong |
 | `vypr --debug resolution [WxH]` | what size that screen is shown at |
@@ -236,6 +270,7 @@ A few settings live in `~/.config/vypr/config`:
 | `VYPR_DAMAGE=1` | send only the changed parts of each frame — good for desktop apps, not games |
 | `USE_PARSEC=0` | do not start Parsec; only games that read raw mouse input need it |
 | `SHUTDOWN_VM_ON_EXIT=0` | leave the VM running when the last window closes |
+| `OPEN_ELEVATION=0` | keep Windows' administrator prompt (you answer it on the VM's own screen) |
 
 And one for the environment: `VYPR_STATS=1 vypr run <app>` writes a line a
 second to `$XDG_RUNTIME_DIR/vyprd.log` — frames shown, upload time, and how old
@@ -299,13 +334,13 @@ each frame was by the time it reached your screen.
   the Windows application; dragging back out is not implemented, and neither is
   dragging a folder.
 - **Administrator prompts cannot be answered through Vypr.** Windows draws the
-  User Account Control prompt on the secure desktop, which nothing here can see
-  — so an installer that asks for approval waits forever on a question you were
-  never shown. Vypr now streams the prompt if the guest has been told to draw it
-  on the ordinary desktop, but Windows still refuses injected input to it, so
-  seeing it is as far as that goes. `vypr open-elevation` turns the prompt off
-  inside the VM, which is what makes installers work; `vypr doctor` says which
-  of the two states you are in.
+  User Account Control prompt on the secure desktop and refuses injected input
+  to it, so an installer that asked for approval would wait forever on a
+  question you were never shown. So by default Vypr turns the prompt off inside
+  the VM, and programs there get administrator rights without asking. That is a
+  real reduction in the VM's security, which is why both installers say so and
+  why it can be undone: `vypr open-elevation --remove`, or `OPEN_ELEVATION=0` in
+  the config. `vypr doctor` says which state you are in.
 - **The guest has to have notifications turned on.** They can be switched off
   for the whole Windows user, and then nothing reaches the Action Center for
   Vypr to read — which looks exactly like forwarding being broken.
