@@ -14,9 +14,12 @@
 #include <windows.h>
 #include <ntsecapi.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <urlmon.h>
+#include <wrl.h>
+#include "WebView2.h"
 #include <string>
 #include <vector>
 
@@ -24,9 +27,14 @@
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+// The static loader, so the installer stays one file with no DLL beside it.
+#pragma comment(lib, "WebView2LoaderStatic.lib")
+#pragma comment(lib, "version.lib")
 
 #define IDR_AGENT        101
 #define IDI_VYPR         102
+#define IDR_UI           103
 #define ID_LOG           1001
 #define ID_INSTALL       1002
 #define ID_KEY           1003
@@ -39,6 +47,10 @@
 #define ID_CHK_HOMEDIR   1016
 #define ID_CHK_ELEVATION 1017
 #define WM_STEP_DONE     (WM_APP + 1)
+#define WM_APP_LOG       (WM_APP + 2)   /* a log line for the web interface */
+#define WM_APP_FALLBACK  (WM_APP + 3)   /* WebView2 failed: show the classic window */
+
+static const wchar_t *VYPR_VERSION = L"0.5.0";
 
 static const wchar_t *PARSEC_APP_URL =
     L"https://builds.parsec.app/package/parsec-windows.exe";
@@ -61,6 +73,29 @@ static HWND g_chk_elevation;
 static HWND g_password, g_pw_label, g_pw_note, g_link;
 static HFONT g_font, g_font_bold;
 static bool  g_failed = false;
+static HINSTANCE g_inst;
+
+/*
+ * What to install, gathered from whichever interface is showing before the
+ * work starts. The worker never reads a control: with two interfaces, the one
+ * place that knows what was asked for is this.
+ */
+struct Options {
+    bool parsec = true, ssh = true, autologin = false, homedir = false, elevation = true;
+    std::wstring pubkey, password;
+};
+static Options g_opt;
+
+/*
+ * The installer has two faces. The usual one is ui.html in WebView2, which
+ * every Windows 11 has and Windows 10 gets with Edge; when that cannot start,
+ * the classic window below is what appears instead, so a machine without it is
+ * never left without an installer.
+ */
+static bool g_web = false;
+static bool g_installing = false;
+static Microsoft::WRL::ComPtr<ICoreWebView2Controller> g_wvc;
+static Microsoft::WRL::ComPtr<ICoreWebView2> g_wv;
 
 // ---------------------------------------------------------------- logging
 
@@ -72,6 +107,12 @@ static void logf(const wchar_t *fmt, ...)
     _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
     va_end(ap);
 
+    if (g_web) {
+        // Only the window's own thread may talk to WebView2, and this runs on
+        // the worker: hand the line over and let the window send it on.
+        PostMessageW(g_main, WM_APP_LOG, 0, (LPARAM)new std::wstring(buf));
+        return;
+    }
     int i = (int)SendMessageW(g_log, LB_ADDSTRING, 0, (LPARAM)buf);
     SendMessageW(g_log, LB_SETTOPINDEX, i, 0);
 }
@@ -747,39 +788,21 @@ static void setup_autologin(std::wstring &password)
 
 static DWORD WINAPI worker(LPVOID)
 {
-    bool want_parsec    = SendMessageW(g_chk_parsec, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    bool want_ssh       = SendMessageW(g_chk_ssh, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    bool want_autologin = SendMessageW(g_chk_autologin, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    bool want_homedir   = SendMessageW(g_chk_homedir, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    bool want_elevation = SendMessageW(g_chk_elevation, BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-    int len = GetWindowTextLengthW(g_key);
-    std::wstring pubkey(len + 1, L'\0');
-    GetWindowTextW(g_key, pubkey.data(), len + 1);
-    pubkey.resize(len);
-    while (!pubkey.empty() && (pubkey.back() == L'\r' || pubkey.back() == L'\n'))
-        pubkey.pop_back();
-
-    std::wstring password;
-    if (want_autologin) {
-        int plen = GetWindowTextLengthW(g_password);
-        password.assign(plen + 1, L'\0');
-        GetWindowTextW(g_password, password.data(), plen + 1);
-        password.resize(plen);
-        /* Cleared from the control too, so it is not sitting in a window that
-         * stays open after the work is done. */
-        SetWindowTextW(g_password, L"");
-    }
+    Options o = std::move(g_opt);
+    g_opt.password.clear();
+    while (!o.pubkey.empty() && (o.pubkey.back() == L'\r' || o.pubkey.back() == L'\n' ||
+                                 o.pubkey.back() == L' '))
+        o.pubkey.pop_back();
 
     install_agent();
     grant_lock_pages();
-    if (want_elevation) open_elevation();
-    if (want_parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
-    if (want_ssh)       setup_ssh(pubkey);
+    if (o.elevation) open_elevation();
+    if (o.parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
+    if (o.ssh)       setup_ssh(o.pubkey);
     name_audio_endpoints();
-    name_audio_endpoints();
-    if (want_homedir)   install_home_share();
-    if (want_autologin) setup_autologin(password);
+    if (o.homedir)   install_home_share();
+    if (o.autologin) setup_autologin(o.password);
+    SecureZeroMemory(o.password.data(), o.password.size() * sizeof(wchar_t));
 
     PostMessageW(g_main, WM_STEP_DONE, 0, 0);
     return 0;
@@ -898,6 +921,26 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
             EnableWindow(g_install, FALSE);
             SendMessageW(g_log, LB_RESETCONTENT, 0, 0);
             g_failed = false;
+
+            const auto checked = [](HWND c) { return SendMessageW(c, BM_GETCHECK, 0, 0) == BST_CHECKED; };
+            g_opt = Options{};
+            g_opt.parsec    = checked(g_chk_parsec);
+            g_opt.ssh       = checked(g_chk_ssh);
+            g_opt.autologin = checked(g_chk_autologin);
+            g_opt.homedir   = checked(g_chk_homedir);
+            g_opt.elevation = checked(g_chk_elevation);
+            const auto text = [](HWND c) {
+                std::wstring t(GetWindowTextLengthW(c) + 1, L'\0');
+                t.resize(GetWindowTextW(c, t.data(), (int)t.size()));
+                return t;
+            };
+            g_opt.pubkey = text(g_key);
+            if (g_opt.autologin) g_opt.password = text(g_password);
+            /* Cleared from the control too, so it is not sitting in a window
+             * that stays open after the work is done. */
+            SetWindowTextW(g_password, L"");
+
+            g_installing = true;
             CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
         }
         return 0;
@@ -913,6 +956,7 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetWindowTextW(g_install, L"Close");
         EnableWindow(g_install, TRUE);
         SetWindowLongPtrW(g_install, GWLP_USERDATA, 1);
+        g_installing = false;
         return 0;
 
     case WM_CTLCOLORSTATIC:
@@ -927,8 +971,328 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
+// -------------------------------------------------------- the web interface
+
+using Microsoft::WRL::Callback;
+
+static std::wstring json_str(const std::wstring &in)
 {
+    std::wstring out = L"\"";
+    for (wchar_t c : in) {
+        switch (c) {
+        case L'"':  out += L"\\\""; break;
+        case L'\\': out += L"\\\\"; break;
+        case L'\n': out += L"\\n"; break;
+        case L'\r': out += L"\\r"; break;
+        case L'\t': out += L"\\t"; break;
+        default:
+            if (c < 0x20) { wchar_t b[8]; _snwprintf_s(b, _TRUNCATE, L"\\u%04x", c); out += b; }
+            else out += c;
+        }
+    }
+    return out + L"\"";
+}
+
+static void web_send(const std::wstring &json)
+{
+    if (g_wv) g_wv->PostWebMessageAsJson(json.c_str());
+}
+
+/* "%xx"-encoded UTF-8, as encodeURIComponent writes it, back to UTF-16. */
+static std::wstring url_decode(const std::wstring &in)
+{
+    std::string bytes;
+    for (size_t i = 0; i < in.size(); i++) {
+        if (in[i] == L'%' && i + 2 < in.size() && iswxdigit(in[i + 1]) && iswxdigit(in[i + 2])) {
+            bytes += (char)wcstol(in.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else {
+            bytes += (char)in[i];
+        }
+    }
+    std::wstring out(bytes.size(), L'\0');
+    out.resize(MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), out.data(), (int)out.size()));
+    return out;
+}
+
+static bool file_exists(const std::wstring &p)
+{
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void set_clipboard(const std::wstring &t)
+{
+    if (!OpenClipboard(g_main)) return;
+    EmptyClipboard();
+    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (t.size() + 1) * sizeof(wchar_t))) {
+        memcpy(GlobalLock(g), t.c_str(), (t.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(g);
+        if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+    }
+    CloseClipboard();
+}
+
+/*
+ * A message from the page: a command on the first line, then key=value lines
+ * with the values URI-encoded. Deliberately not JSON - there is no parser here
+ * to get wrong, and nothing the page sends needs more structure than this.
+ */
+static void on_web_message(const std::wstring &msg)
+{
+    std::vector<std::wstring> lines;
+    for (size_t at = 0;;) {
+        size_t nl = msg.find(L'\n', at);
+        lines.push_back(msg.substr(at, nl == std::wstring::npos ? std::wstring::npos : nl - at));
+        if (nl == std::wstring::npos) break;
+        at = nl + 1;
+    }
+    const std::wstring cmd = lines.empty() ? L"" : lines[0];
+    auto field = [&](const wchar_t *name) -> std::wstring {
+        const std::wstring key = std::wstring(name) + L"=";
+        for (size_t i = 1; i < lines.size(); i++)
+            if (lines[i].compare(0, key.size(), key) == 0) return url_decode(lines[i].substr(key.size()));
+        return L"";
+    };
+
+    if (cmd == L"ready") {
+        const bool installed = file_exists(program_dir() + L"\\vypr-agent.exe");
+        const bool parsec    = file_exists(L"C:\\Program Files\\Parsec\\parsecd.exe");
+        web_send(std::wstring(L"{\"type\":\"init\",\"version\":") + json_str(VYPR_VERSION) +
+                 L",\"installed\":" + (installed ? L"true" : L"false") +
+                 L",\"parsec\":" + (parsec ? L"true" : L"false") + L"}");
+    } else if (cmd == L"install" && !g_installing) {
+        g_opt = Options{};
+        g_opt.parsec    = field(L"parsec") == L"1";
+        g_opt.elevation = field(L"elevation") == L"1";
+        g_opt.homedir   = field(L"homedir") == L"1";
+        g_opt.autologin = field(L"autologin") == L"1";
+        g_opt.password  = field(L"password");
+        g_opt.pubkey    = field(L"key");
+        g_opt.ssh       = !g_opt.pubkey.empty();
+        g_failed = false;
+        g_installing = true;
+        CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    } else if (cmd == L"restart" && !g_installing) {
+        run(L"shutdown.exe /r /t 5 /c \"Restarting to finish setting up Vypr\"", true);
+        DestroyWindow(g_main);
+    } else if (cmd == L"close" && !g_installing) {
+        DestroyWindow(g_main);
+    } else if (cmd == L"copy") {
+        set_clipboard(field(L"text"));
+    } else if (cmd == L"source") {
+        // The one page the installer links to, opened in the real browser.
+        ShellExecuteW(nullptr, L"open", SOURCE_URL, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+/* Windows' own setting for apps, which is what the page follows too. */
+static bool apps_use_dark()
+{
+    DWORD v = 1, n = sizeof v;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &n);
+    return v == 0;
+}
+
+static LRESULT CALLBACK webproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_SIZE:
+        if (g_wvc) { RECT r; GetClientRect(h, &r); g_wvc->put_Bounds(r); }
+        return 0;
+
+    case WM_APP_LOG: {
+        std::wstring *line = (std::wstring *)l;
+        web_send(L"{\"type\":\"log\",\"text\":" + json_str(*line) + L"}");
+        delete line;
+        return 0;
+    }
+
+    case WM_STEP_DONE:
+        g_installing = false;
+        web_send(std::wstring(L"{\"type\":\"done\",\"failed\":") + (g_failed ? L"true" : L"false") + L"}");
+        return 0;
+
+    case WM_APP_FALLBACK:
+        g_wv.Reset();
+        if (g_wvc) { g_wvc->Close(); g_wvc.Reset(); }
+        g_web = false;
+        SetWindowLongPtrW(h, GWLP_USERDATA, 1);   // destroyed on purpose: do not quit
+        DestroyWindow(h);
+        return 0;
+
+    case WM_CLOSE:
+        if (g_installing &&
+            MessageBoxW(h, L"Setup is still working. Closing now leaves it half done.\n\nClose anyway?",
+                        L"Vypr Setup", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            return 0;
+        DestroyWindow(h);
+        return 0;
+
+    case WM_DESTROY:
+        if (GetWindowLongPtrW(h, GWLP_USERDATA) != 1) PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static std::wstring ui_html()
+{
+    HRSRC r = FindResourceW(g_inst, MAKEINTRESOURCEW(IDR_UI), RT_RCDATA);
+    if (!r) return L"";
+    const char *p = (const char *)LockResource(LoadResource(g_inst, r));
+    const int n = (int)SizeofResource(g_inst, r);
+    std::wstring out(n, L'\0');
+    out.resize(MultiByteToWideChar(CP_UTF8, 0, p, n, out.data(), n));
+    return out;
+}
+
+/*
+ * Bring up the web interface. False when WebView2 cannot even begin, so the
+ * caller shows the classic window instead; a failure further in arrives later,
+ * as WM_APP_FALLBACK, and has the same effect.
+ */
+static bool start_web()
+{
+    const bool dark = apps_use_dark();
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = webproc;
+    wc.hInstance = g_inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    // The page's own ground colour, so there is no white flash before it loads.
+    wc.hbrBackground = CreateSolidBrush(dark ? RGB(0x0d, 0x0f, 0x12) : RGB(0xf5, 0xf6, 0xf8));
+    wc.lpszClassName = L"VyprSetupWeb";
+    wc.hIcon = LoadIconW(g_inst, MAKEINTRESOURCEW(IDI_VYPR));
+    RegisterClassExW(&wc);
+
+    const UINT dpi = GetDpiForSystem();
+    RECT r{0, 0, MulDiv(920, dpi, 96), MulDiv(620, dpi, 96)};
+    const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
+    AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
+    g_main = CreateWindowExW(0, L"VyprSetupWeb", L"Vypr Setup", style, CW_USEDEFAULT, CW_USEDEFAULT,
+                             r.right - r.left, r.bottom - r.top, nullptr, nullptr, g_inst, nullptr);
+    if (!g_main) return false;
+    const BOOL immersive = dark;
+    DwmSetWindowAttribute(g_main, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &immersive, sizeof immersive);
+
+    // Torn down on purpose if this fails: the window must not end the program.
+    const auto give_up = [] {
+        g_web = false;
+        SetWindowLongPtrW(g_main, GWLP_USERDATA, 1);
+        DestroyWindow(g_main);
+        g_main = nullptr;
+        return false;
+    };
+
+    const std::wstring html = ui_html();
+    if (html.empty()) return give_up();
+
+    // Its own data folder, out of the way: the installer runs elevated, and a
+    // folder shared with an unelevated browser would be refused.
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring data = std::wstring(tmp) + L"VyprSetup.WebView2";
+
+    g_web = true;
+    const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, data.c_str(), nullptr,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [html, dark](HRESULT res, ICoreWebView2Environment *env) -> HRESULT {
+        if (FAILED(res) || !env) { PostMessageW(g_main, WM_APP_FALLBACK, 0, 0); return S_OK; }
+        return env->CreateCoreWebView2Controller(g_main,
+            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [html, dark](HRESULT res2, ICoreWebView2Controller *c) -> HRESULT {
+            if (FAILED(res2) || !c) { PostMessageW(g_main, WM_APP_FALLBACK, 0, 0); return S_OK; }
+            g_wvc = c;
+            g_wvc->get_CoreWebView2(&g_wv);
+
+            Microsoft::WRL::ComPtr<ICoreWebView2Controller2> c2;
+            if (SUCCEEDED(g_wvc.As(&c2))) {
+                COREWEBVIEW2_COLOR bg = dark ? COREWEBVIEW2_COLOR{255, 0x0d, 0x0f, 0x12}
+                                             : COREWEBVIEW2_COLOR{255, 0xf5, 0xf6, 0xf8};
+                c2->put_DefaultBackgroundColor(bg);
+            }
+
+            // An installer, not a browser: no menus, no dev tools, no zoom.
+            Microsoft::WRL::ComPtr<ICoreWebView2Settings> st;
+            g_wv->get_Settings(&st);
+            st->put_AreDevToolsEnabled(FALSE);
+            st->put_AreDefaultContextMenusEnabled(FALSE);
+            st->put_IsStatusBarEnabled(FALSE);
+            st->put_IsZoomControlEnabled(FALSE);
+            Microsoft::WRL::ComPtr<ICoreWebView2Settings3> st3;
+            if (SUCCEEDED(st.As(&st3))) st3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+
+            // Nothing navigates anywhere: the page is all there is.
+            EventRegistrationToken tok;
+            g_wv->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+                [](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *a) -> HRESULT {
+                    LPWSTR uri = nullptr;
+                    a->get_Uri(&uri);
+                    const bool ours = uri && (wcsncmp(uri, L"data:", 5) == 0 || wcscmp(uri, L"about:blank") == 0);
+                    if (!ours) a->put_Cancel(TRUE);
+                    CoTaskMemFree(uri);
+                    return S_OK;
+                }).Get(), &tok);
+            g_wv->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                [](ICoreWebView2 *, ICoreWebView2NewWindowRequestedEventArgs *a) -> HRESULT {
+                    a->put_Handled(TRUE);
+                    return S_OK;
+                }).Get(), &tok);
+            g_wv->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                [](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *a) -> HRESULT {
+                    LPWSTR m = nullptr;
+                    if (SUCCEEDED(a->TryGetWebMessageAsString(&m)) && m) on_web_message(m);
+                    CoTaskMemFree(m);
+                    return S_OK;
+                }).Get(), &tok);
+
+            RECT cr;
+            GetClientRect(g_main, &cr);
+            g_wvc->put_Bounds(cr);
+            g_wv->NavigateToString(html.c_str());
+            return S_OK;
+        }).Get());
+    }).Get());
+
+    if (FAILED(hr)) return give_up();
+
+    // Deliberately not the nCmdShow we were handed: launched from a scheduled
+    // task that is SW_HIDE, and an installer nobody can see is worse than no
+    // installer at all.
+    ShowWindow(g_main, SW_SHOWNORMAL);
+    SetForegroundWindow(g_main);
+    return true;
+}
+
+// ---------------------------------------------------------- the classic window
+
+static bool show_classic()
+{
+    RECT r{0, 0, 570, 700};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME, FALSE);
+    g_main = CreateWindowExW(0, L"VyprSetup", L"Vypr Setup",
+                             (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX),
+                             CW_USEDEFAULT, CW_USEDEFAULT,
+                             r.right - r.left, r.bottom - r.top,
+                             nullptr, nullptr, g_inst, nullptr);
+    if (!g_main) {
+        wchar_t err[128];
+        _snwprintf_s(err, _TRUNCATE, L"Could not create the window (error %lu).",
+                     GetLastError());
+        MessageBoxW(nullptr, err, L"Vypr Setup", MB_ICONERROR);
+        return false;
+    }
+    ShowWindow(g_main, SW_SHOWNORMAL);
+    SetForegroundWindow(g_main);
+    return true;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int)
+{
+    g_inst = inst;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -942,30 +1306,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_VYPR));
     RegisterClassExW(&wc);
 
-    RECT r{0, 0, 570, 700};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME, FALSE);
-    g_main = CreateWindowExW(0, L"VyprSetup", L"Vypr Setup",
-                             (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX),
-                             CW_USEDEFAULT, CW_USEDEFAULT,
-                             r.right - r.left, r.bottom - r.top,
-                             nullptr, nullptr, inst, nullptr);
-    if (!g_main) {
-        wchar_t err[128];
-        _snwprintf_s(err, _TRUNCATE, L"Could not create the window (error %lu).",
-                     GetLastError());
-        MessageBoxW(nullptr, err, L"Vypr Setup", MB_ICONERROR);
-        return 1;
+    // /classic forces the old window, for a machine where the new one misbehaves.
+    const bool classic = cmdline && wcsstr(cmdline, L"/classic");
+    if (classic || !start_web()) {
+        if (!show_classic()) return 1;
     }
-
-    // Deliberately not the nCmdShow we were handed: launched from a scheduled
-    // task that is SW_HIDE, and an installer nobody can see is worse than no
-    // installer at all.
-    ShowWindow(g_main, SW_SHOWNORMAL);
-    SetForegroundWindow(g_main);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(g_main, &msg)) {
+        // A late WebView2 failure destroys the web window; put the classic
+        // one up in its place rather than leaving nothing on screen.
+        if (msg.message == WM_APP_FALLBACK && msg.hwnd == g_main) {
+            DispatchMessageW(&msg);
+            if (!show_classic()) return 1;
+            continue;
+        }
+        if (g_web || !IsDialogMessageW(g_main, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

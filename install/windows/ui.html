@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark light">
+<title>Vypr Setup</title>
+<!--
+  The installer's interface. Built into vypr-setup.exe and shown through
+  WebView2; vypr-setup.cpp does all the actual work and streams its log here.
+  Opened directly in a browser it runs a demo of the whole flow instead, which
+  is how it is designed and checked without a VM.
+
+  Everything is local: no fonts, scripts or images are fetched. The faces are
+  ones Windows ships - Bahnschrift, Segoe UI Variable, Cascadia Mono.
+-->
+<style>
+:root {
+  --ground: #0d0f12;
+  --raised: #161a20;
+  --sunken: #0a0c0e;
+  --seam: #2a2f38;
+  --ink: #eef1f5;
+  --soft: #a7aeba;
+  --muted: #6f7785;
+  --signal: #7ea6ff;
+  --signal-ink: #0d1324;
+  --signal-soft: rgba(126,166,255,.14);
+  --pass: #55c487;
+  --fail: #ec6f78;
+  --warn: #e7b450;
+  --display: "Bahnschrift", "Segoe UI Variable Display", "Segoe UI", sans-serif;
+  --text: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  --ease: cubic-bezier(.22,.8,.24,1);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --ground: #f5f6f8;
+    --raised: #ffffff;
+    --sunken: #eceef2;
+    --seam: #d6dae2;
+    --ink: #11141a;
+    --soft: #434a57;
+    --muted: #6b7280;
+    --signal: #2f5bd3;
+    --signal-ink: #ffffff;
+    --signal-soft: rgba(47,91,211,.10);
+    --pass: #1f8a4c;
+    --fail: #c43d48;
+    --warn: #9a6a07;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font: 14px/1.5 var(--text);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+button, input, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; border-radius: 6px; }
+
+.app { display: grid; grid-template-columns: 236px 1fr; height: 100%; }
+
+/* ------------------------------------------------------------ the rail */
+.rail {
+  background: var(--sunken);
+  border-right: 1px solid var(--seam);
+  padding: 26px 22px 20px;
+  display: flex; flex-direction: column;
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-bottom: 34px; }
+.brand svg { width: 26px; height: 22px; color: var(--ink); }
+.brand b { font: 600 19px/1 var(--display); letter-spacing: .01em; }
+.brand span { margin-left: auto; font: 11px/1 var(--mono); color: var(--muted); }
+
+.steps { list-style: none; margin: 0; padding: 0; position: relative; }
+.steps li {
+  position: relative; display: flex; align-items: center; gap: 12px;
+  padding: 9px 0; color: var(--muted); transition: color .3s var(--ease);
+}
+.steps li + li::before {
+  content: ""; position: absolute; left: 7.5px; top: -9px; height: 18px; width: 1px;
+  background: var(--seam);
+}
+.steps .dot {
+  width: 16px; height: 16px; border-radius: 50%; flex: none;
+  border: 1.5px solid var(--seam); background: var(--sunken);
+  display: grid; place-items: center; transition: all .35s var(--ease);
+}
+.steps .dot svg { width: 9px; height: 9px; opacity: 0; transform: scale(.4); transition: all .3s var(--ease); }
+.steps li.now { color: var(--ink); }
+.steps li.now .dot { border-color: var(--signal); box-shadow: 0 0 0 4px var(--signal-soft); }
+.steps li.done { color: var(--soft); }
+.steps li.done .dot { background: var(--signal); border-color: var(--signal); }
+.steps li.done .dot svg { opacity: 1; transform: none; color: var(--signal-ink); }
+
+.rail-foot { margin-top: auto; font-size: 12px; color: var(--muted); }
+.rail-foot a { color: var(--soft); text-decoration: none; border-bottom: 1px solid var(--seam); cursor: pointer; }
+.rail-foot a:hover { color: var(--ink); border-color: var(--soft); }
+
+/* ----------------------------------------------------------- the stage */
+.stage { position: relative; display: flex; flex-direction: column; min-width: 0; }
+.pages { position: relative; flex: 1; overflow: hidden; }
+.page {
+  position: absolute; inset: 0; padding: 34px 44px 0;
+  overflow-y: auto; visibility: hidden; opacity: 0;
+  transform: translateX(22px);
+  transition: opacity .38s var(--ease), transform .45s var(--ease), visibility 0s .45s;
+}
+.page.active { visibility: visible; opacity: 1; transform: none; transition: opacity .38s var(--ease) .06s, transform .5s var(--ease) .06s; }
+.page.left { transform: translateX(-22px); }
+
+.eyebrow { font: 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 0 0 14px; }
+h1 {
+  font: 600 33px/1.08 var(--display); letter-spacing: -.005em;
+  font-stretch: 87%; margin: 0 0 12px; max-width: 18em;
+}
+.lede { color: var(--soft); max-width: 36em; margin: 0 0 22px; font-size: 14.5px; }
+
+/* the signature: a window's frames crossing the VM boundary */
+.crossing { width: 100%; max-width: 560px; height: auto; display: block; margin: 4px 0 18px; overflow: visible; }
+.crossing .seam { stroke: var(--seam); stroke-width: 1.4; stroke-dasharray: 3 7; }
+.crossing .zone { font: 10px var(--mono); letter-spacing: .14em; fill: var(--muted); }
+.crossing .win { fill: var(--raised); stroke: var(--seam); stroke-width: 1.2; }
+.crossing .bar { fill: var(--sunken); }
+.crossing .glyph { stroke: var(--muted); stroke-width: 1.2; fill: none; }
+.crossing .gdot { fill: var(--muted); }
+.crossing .frame { fill: var(--signal-soft); stroke: var(--signal); stroke-width: 1.3; opacity: 0; }
+.crossing .pulse { fill: var(--signal); opacity: 0; transform-box: fill-box; transform-origin: center; }
+.crossing .tile { fill: var(--sunken); stroke: var(--seam); stroke-width: 1; transition: fill .4s var(--ease), stroke .4s var(--ease); }
+.crossing .tile.on { fill: var(--signal); stroke: var(--signal); }
+.crossing .tile.bad { fill: var(--fail); stroke: var(--fail); }
+.crossing .landed { opacity: 0; transition: opacity .5s var(--ease); }
+.crossing.settled .landed { opacity: 1; }
+.crossing .check { stroke: var(--pass); stroke-width: 2.4; fill: none; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 40; stroke-dashoffset: 40; transition: stroke-dashoffset .7s var(--ease) .2s; }
+.crossing.settled .check { stroke-dashoffset: 0; }
+
+.crossing.running .frame,
+.crossing.running .pulse {
+  /* --i is set per element: three frames a third of a period apart. */
+  animation: cross var(--period, 2.6s) var(--ease) infinite;
+  animation-delay: calc(var(--period, 2.6s) * var(--i, 0) / -3);
+}
+.crossing.running .pulse { animation-name: pulse; animation-timing-function: ease-out; }
+@keyframes cross {
+  0%   { opacity: 0; transform: translate(0, 0) scale(.92); }
+  12%  { opacity: 1; }
+  78%  { opacity: 1; }
+  100% { opacity: 0; transform: translate(256px, 84px) scale(.92); }
+}
+@keyframes pulse {
+  0%, 44% { opacity: 0; transform: scale(.4); }
+  50% { opacity: .9; transform: scale(1); }
+  70%, 100% { opacity: 0; transform: scale(2.2); }
+}
+
+.facts { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 4px 0 0; padding: 0; list-style: none; color: var(--soft); font-size: 13px; }
+.facts li { display: flex; align-items: center; gap: 8px; }
+.facts li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--signal); opacity: .8; }
+
+/* ------------------------------------------------------------- choices */
+.choices { display: grid; gap: 10px; max-width: 600px; }
+.choice {
+  display: grid; grid-template-columns: 1fr auto; gap: 4px 18px; align-items: center;
+  background: var(--raised); border: 1px solid var(--seam); border-radius: 10px;
+  padding: 13px 16px; transition: border-color .25s var(--ease), background .25s var(--ease);
+}
+.choice:hover { border-color: var(--muted); }
+.choice.fixed { background: transparent; }
+.choice .t { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.choice .d { grid-column: 1; color: var(--soft); font-size: 13px; }
+.tag { font: 10.5px/1 var(--mono); letter-spacing: .06em; padding: 3px 6px; border-radius: 4px; border: 1px solid currentColor; text-transform: uppercase; }
+.tag.req { color: var(--muted); }
+.tag.risk { color: var(--warn); }
+.tag.have { color: var(--pass); }
+.switch { grid-row: 1 / span 2; grid-column: 2; position: relative; width: 42px; height: 24px; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.switch i {
+  position: absolute; inset: 0; border-radius: 12px; background: var(--sunken); border: 1px solid var(--seam);
+  transition: background .25s var(--ease), border-color .25s var(--ease); pointer-events: none;
+}
+.switch i::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--muted); transition: transform .3s var(--ease), background .25s var(--ease);
+}
+.switch input:checked + i { background: var(--signal); border-color: var(--signal); }
+.switch input:checked + i::after { transform: translateX(18px); background: var(--signal-ink); }
+.switch input:focus-visible + i { outline: 2px solid var(--signal); outline-offset: 2px; }
+.lockglyph { grid-row: 1 / span 2; grid-column: 2; color: var(--muted); width: 18px; height: 18px; }
+
+.reveal { grid-column: 1 / -1; overflow: hidden; max-height: 0; opacity: 0; transition: max-height .4s var(--ease), opacity .3s var(--ease), margin .4s var(--ease); }
+.reveal.open { max-height: 140px; opacity: 1; margin-top: 8px; }
+.field {
+  width: 100%; max-width: 320px; background: var(--sunken); border: 1px solid var(--seam); border-radius: 7px;
+  padding: 8px 10px; user-select: text; transition: border-color .2s var(--ease);
+}
+.field:focus { border-color: var(--signal); outline: none; }
+.note { color: var(--muted); font-size: 12px; margin: 6px 0 0; max-width: 36em; }
+
+/* -------------------------------------------------------------- the key */
+.keybox {
+  width: 100%; max-width: 600px; min-height: 92px; resize: none;
+  background: var(--raised); border: 1px solid var(--seam); border-radius: 10px;
+  padding: 12px 14px; font: 12.5px/1.5 var(--mono); user-select: text;
+  transition: border-color .25s var(--ease), box-shadow .25s var(--ease);
+}
+.keybox:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 4px var(--signal-soft); }
+.keybox.ok { border-color: var(--pass); }
+.keybox.bad { border-color: var(--fail); }
+.verdict { display: flex; align-items: center; gap: 8px; min-height: 24px; margin-top: 10px; font-size: 13px; color: var(--soft); max-width: 600px; }
+.verdict b { font-weight: 600; }
+.verdict.ok { color: var(--pass); }
+.verdict.bad { color: var(--fail); }
+.verdict code { font: 12px var(--mono); color: var(--soft); }
+
+/* -------------------------------------------------------- installing */
+.runs { list-style: none; margin: 0; padding: 0; max-width: 600px; }
+.run {
+  display: grid; grid-template-columns: 22px 1fr; gap: 2px 12px; padding: 9px 0;
+  border-top: 1px solid var(--seam); animation: rise .45s var(--ease) both;
+}
+.run:first-child { border-top: 0; }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.run .ic { width: 18px; height: 18px; margin-top: 1px; display: grid; place-items: center; }
+.run .ic svg { width: 18px; height: 18px; }
+.run .spin { animation: spin .9s linear infinite; color: var(--signal); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.run .t { font-weight: 600; }
+.run .t small { font-weight: 400; color: var(--muted); font-size: 12.5px; margin-left: 6px; }
+.run .s { grid-column: 2; color: var(--soft); font-size: 12.5px; min-height: 1em; }
+.run.ok .ic { color: var(--pass); }
+.run.bad .ic { color: var(--fail); }
+.run.bad .s { color: var(--fail); }
+.run.skip .ic { color: var(--muted); }
+.progressline { display: flex; align-items: baseline; gap: 12px; margin: -6px 0 14px; color: var(--muted); font: 12px var(--mono); }
+
+.details { margin-top: 14px; max-width: 600px; }
+.details summary { cursor: pointer; color: var(--soft); font-size: 13px; list-style: none; display: inline-flex; gap: 6px; align-items: center; }
+.details summary::before { content: "▸"; font-size: 10px; transition: transform .2s var(--ease); }
+.details[open] summary::before { transform: rotate(90deg); }
+.log {
+  margin-top: 10px; max-height: 170px; overflow-y: auto; background: var(--sunken); border: 1px solid var(--seam);
+  border-radius: 8px; padding: 10px 12px; font: 11.5px/1.55 var(--mono); color: var(--soft); white-space: pre-wrap; user-select: text;
+}
+
+/* -------------------------------------------------------------- done */
+.next { margin-top: 6px; max-width: 600px; }
+.next p { margin: 0 0 8px; color: var(--soft); }
+.cmd {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: var(--raised); border: 1px solid var(--seam); border-radius: 10px; padding: 11px 14px;
+  font: 13.5px var(--mono);
+}
+.cmd button { background: none; border: 0; color: var(--soft); cursor: pointer; font-size: 12px; padding: 4px 6px; border-radius: 6px; }
+.cmd button:hover { color: var(--ink); background: var(--sunken); }
+.problems { list-style: none; padding: 0; margin: 0 0 18px; max-width: 600px; }
+.problems li { padding: 8px 12px; border-left: 2px solid var(--fail); background: var(--raised); margin-bottom: 6px; border-radius: 0 8px 8px 0; font-size: 13px; }
+
+/* ------------------------------------------------------------- actions */
+.actions {
+  display: flex; align-items: center; gap: 10px; padding: 16px 44px 22px;
+  border-top: 1px solid var(--seam); background: var(--ground);
+}
+.actions .spacer { flex: 1; }
+.btn {
+  border-radius: 9px; padding: 9px 18px; cursor: pointer; border: 1px solid var(--seam);
+  background: var(--raised); font-weight: 600; transition: transform .15s var(--ease), background .2s var(--ease), border-color .2s var(--ease), opacity .2s;
+}
+.btn:hover { border-color: var(--muted); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: var(--signal); border-color: var(--signal); color: var(--signal-ink); }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--soft); }
+.btn.ghost:hover { color: var(--ink); border-color: var(--seam); }
+.btn[hidden] { display: none; }
+.btn:disabled { opacity: .45; cursor: default; transform: none; }
+.btn .arrow { display: inline-block; margin-left: 6px; transition: transform .25s var(--ease); }
+.btn.primary:hover .arrow { transform: translateX(3px); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
+  .crossing .frame { opacity: 0 !important; }
+  .crossing .landed { opacity: 1; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail" aria-label="Setup steps">
+    <div class="brand">
+      <svg viewBox="0 0 247 202" aria-hidden="true"><g fill="currentColor" fill-rule="evenodd">
+        <path d="M0 0 H56 L151 155 L123.5 202 Z"/><path d="M191 0 H247 L165 135 L137 88 Z"/></g></svg>
+      <b>Vypr</b><span id="ver">0.5.0</span>
+    </div>
+    <ol class="steps" id="steps">
+      <li data-p="welcome"><span class="dot"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.6" stroke="currentColor" stroke-width="1.8" fill="none"/></svg></span>Welcome</li>
+      <li data-p="choose"><span class="dot"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.6" stroke="currentColor" stroke-width="1.8" fill="none"/></svg></span>What to set up</li>
+      <li data-p="connect"><span class="dot"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.6" stroke="currentColor" stroke-width="1.8" fill="none"/></svg></span>Connect to Linux</li>
+      <li data-p="install"><span class="dot"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.6" stroke="currentColor" stroke-width="1.8" fill="none"/></svg></span>Install</li>
+      <li data-p="done"><span class="dot"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.6" stroke="currentColor" stroke-width="1.8" fill="none"/></svg></span>Restart</li>
+    </ol>
+    <div class="rail-foot">
+      Everything this does is in <a id="source" tabindex="0">the installer's source</a>.
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div class="pages">
+
+      <!-- ============================================================ welcome -->
+      <section class="page" id="p-welcome" aria-labelledby="h-welcome">
+        <p class="eyebrow" id="welcome-eyebrow">The Windows side of Vypr</p>
+        <h1 id="h-welcome">Windows apps, as windows on your Linux desktop.</h1>
+        <p class="lede" id="welcome-lede">This sets up the half of Vypr that runs in this VM. It takes about a
+          minute, and you choose everything it changes before anything happens.</p>
+        <svg class="crossing running" id="hero" viewBox="0 0 560 182" style="--period: 3.4s" aria-hidden="true"></svg>
+        <ul class="facts">
+          <li>About a minute</li>
+          <li>Nothing changes until you press Install</li>
+          <li>Safe to run again</li>
+        </ul>
+      </section>
+
+      <!-- ============================================================= choose -->
+      <section class="page" id="p-choose" aria-labelledby="h-choose">
+        <p class="eyebrow">Step 2 of 5</p>
+        <h1 id="h-choose">Choose what to set up.</h1>
+        <p class="lede">The first one is what Vypr is. The rest are yours to decide, and running setup again
+          changes nothing you have not ticked.</p>
+        <div class="choices">
+          <div class="choice fixed">
+            <div class="t">The Vypr agent <span class="tag req">Always</span></div>
+            <div class="d">Starts when you sign in, and locks a little memory for each window it shows &mdash;
+              that is how pictures leave this VM, with no driver.</div>
+            <svg class="lockglyph" viewBox="0 0 18 18" aria-hidden="true"><rect x="3.5" y="8" width="11" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6 8V5.8a3 3 0 0 1 6 0V8" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+          </div>
+          <label class="choice">
+            <div class="t">Mouse for games that capture it <span class="tag have" id="tag-parsec" hidden>Installed</span></div>
+            <div class="d">Parsec and its USB driver. Only games that read raw mouse input need it; everything
+              else works without.</div>
+            <span class="switch"><input type="checkbox" id="o-parsec" checked><i></i></span>
+          </label>
+          <label class="choice">
+            <div class="t">Let installers run without a prompt <span class="tag risk">Less secure</span></div>
+            <div class="d">Windows shows that prompt where Vypr can't show or answer it, so installers would
+              wait forever. This lowers this VM's security, not your Linux machine's.</div>
+            <span class="switch"><input type="checkbox" id="o-elevation" checked><i></i></span>
+          </label>
+          <label class="choice">
+            <div class="t">Your Linux folder, as a drive</div>
+            <div class="d">Mounts the folder the Linux installer shared. Adds WinFsp and the VM's file-sharing
+              service.</div>
+            <span class="switch"><input type="checkbox" id="o-homedir"><i></i></span>
+          </label>
+          <div class="choice" id="c-autologin">
+            <label class="t" for="o-autologin">Sign in automatically</label>
+            <div class="d">Vypr needs a signed-in desktop to show anything. Without this, someone has to sign in
+              on the VM's own screen after every start.</div>
+            <span class="switch"><input type="checkbox" id="o-autologin"><i></i></span>
+            <div class="reveal" id="pw-reveal">
+              <input class="field" type="password" id="o-password" placeholder="Windows password for this account"
+                     autocomplete="off" aria-label="Windows password for this account">
+              <p class="note">Written once, into Windows' own automatic sign-in setting. It goes nowhere else and
+                Vypr does not keep it.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================ connect -->
+      <section class="page" id="p-connect" aria-labelledby="h-connect">
+        <p class="eyebrow">Step 3 of 5</p>
+        <h1 id="h-connect">Let your Linux machine in.</h1>
+        <p class="lede">Paste the key the Linux installer printed. It lets your Linux machine, and only that
+          machine, start apps in here over SSH.</p>
+        <textarea class="keybox" id="o-key" spellcheck="false" placeholder="ssh-ed25519 AAAA… you@your-machine"
+                  aria-describedby="verdict"></textarea>
+        <div class="verdict" id="verdict" aria-live="polite"></div>
+      </section>
+
+      <!-- ============================================================ install -->
+      <section class="page" id="p-install" aria-labelledby="h-install">
+        <p class="eyebrow" id="install-eyebrow">Step 4 of 5</p>
+        <h1 id="h-install">Setting up.</h1>
+        <svg class="crossing running" id="work" viewBox="0 0 560 182" style="--period: 1.9s" aria-hidden="true"></svg>
+        <div class="progressline" aria-live="polite"><span id="count">Starting</span></div>
+        <ol class="runs" id="runs"></ol>
+        <details class="details">
+          <summary>Everything it printed</summary>
+          <div class="log" id="log" role="log"></div>
+        </details>
+        <div style="height: 22px"></div>
+      </section>
+
+      <!-- =============================================================== done -->
+      <section class="page" id="p-done" aria-labelledby="h-done">
+        <p class="eyebrow">Step 5 of 5</p>
+        <h1 id="h-done">Ready. One restart to go.</h1>
+        <p class="lede" id="done-lede">Windows applies the agent's new memory right the next time you sign in,
+          so restart before using Vypr.</p>
+        <svg class="crossing" id="rest" viewBox="0 0 560 182" aria-hidden="true"></svg>
+        <ul class="problems" id="problems" hidden></ul>
+        <div class="next">
+          <p>Then, on your Linux machine, let Vypr find what is installed in here:</p>
+          <div class="cmd"><span>vypr detect</span><button id="copy" type="button">Copy</button></div>
+        </div>
+      </section>
+    </div>
+
+    <footer class="actions">
+      <button class="btn ghost" id="back" type="button">Back</button>
+      <span class="spacer"></span>
+      <button class="btn" id="secondary" type="button" hidden></button>
+      <button class="btn primary" id="primary" type="button"></button>
+    </footer>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const host = window.chrome && window.chrome.webview ? window.chrome.webview : null;
+const PAGES = ["welcome", "choose", "connect", "install", "done"];
+let page = 0, installing = false, finished = false;
+
+/* ---------------------------------------------------------------- talking to setup */
+function send(cmd, fields) {
+  let msg = cmd;
+  for (const [k, v] of Object.entries(fields || {})) msg += "\n" + k + "=" + encodeURIComponent(v);
+  if (host) host.postMessage(msg); else demo(cmd, fields);
+}
+
+/* ------------------------------------------------------------- the crossing scene */
+function drawCrossing(svg) {
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, parent = svg) => {
+    const e = document.createElementNS(ns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    parent.appendChild(e); return e;
+  };
+  const win = (x, y, linux) => {
+    el("rect", { class: "win", x, y, width: 164, height: 58, rx: 6 });
+    el("rect", { class: "bar", x: x + 1, y: y + 1, width: 162, height: 13, rx: 5 });
+    if (linux) {
+      for (let i = 0; i < 3; i++) el("circle", { class: "gdot", cx: x + 146 - i * 9, cy: y + 7.5, r: 2.2 });
+    } else {
+      el("path", { class: "glyph", d: `M${x + 124} ${y + 8} h6 M${x + 137} ${y + 4.5} h6 v6 h-6 z M${x + 150} ${y + 4.5} l6 6 m0 -6 l-6 6` });
+    }
+    for (let i = 0; i < 3; i++) el("rect", { x: x + 12, y: y + 22 + i * 10, width: 80 - i * 22, height: 4, rx: 2, fill: "var(--seam)" });
+  };
+  el("text", { class: "zone", x: 0, y: 11 }).textContent = "IN THIS VM";
+  el("text", { class: "zone", x: 0, y: 122 }).textContent = "ON YOUR LINUX DESKTOP";
+  win(28, 20, false);
+  win(284, 104, true);
+  el("line", { class: "seam", x1: 0, y1: 92, x2: 560, y2: 92 });
+  for (let i = 0; i < 3; i++) el("rect", { class: "frame", x: 30, y: 22, width: 160, height: 54, rx: 5, style: "--i:" + i });
+  for (let i = 0; i < 3; i++) el("circle", { class: "pulse", cx: 237, cy: 92, r: 4, style: "--i:" + i });
+  const landed = el("g", { class: "landed" });
+  el("rect", { x: 285, y: 105, width: 162, height: 56, rx: 5, fill: "var(--signal-soft)", stroke: "var(--signal)", "stroke-width": 1.3 }, landed);
+  el("path", { class: "check", d: "M482 128 l8 8 l16 -18" });
+  for (let i = 0; i < 24; i++) el("rect", { class: "tile", x: i * 14 + 28, y: 172, width: 10, height: 10, rx: 2 });
+}
+drawCrossing($("hero"));
+drawCrossing($("work"));
+drawCrossing($("rest"));
+
+function fillTiles(svg, fraction, bad = false) {
+  const tiles = svg.querySelectorAll(".tile");
+  const n = Math.round(fraction * tiles.length);
+  // toggle() with an undefined force flips the class instead of setting it.
+  tiles.forEach((t, i) => { t.classList.toggle("on", i < n && !bad); t.classList.toggle("bad", i < n && !!bad); });
+}
+// The welcome scene fills its tiles slowly, as a hint of what is coming.
+let heroTick = 0;
+setInterval(() => { if (page === 0) fillTiles($("hero"), (heroTick = (heroTick + 1) % 25) / 24); }, 140);
+
+/* ------------------------------------------------------------------------ pages */
+function go(next) {
+  if (next < 0 || next >= PAGES.length || next === page) return;
+  const from = $("p-" + PAGES[page]), to = $("p-" + PAGES[next]);
+  from.classList.remove("active");
+  from.classList.toggle("left", next > page);
+  to.classList.remove("left");
+  to.classList.add("active");
+  page = next;
+  [...$("steps").children].forEach((li, i) => {
+    li.classList.toggle("now", i === page);
+    li.classList.toggle("done", i < page);
+    if (i === page) li.setAttribute("aria-current", "step"); else li.removeAttribute("aria-current");
+  });
+  buttons();
+  const focus = { connect: "o-key" }[PAGES[page]];
+  setTimeout(() => (focus ? $(focus) : $("primary")).focus({ preventScroll: true }), 420);
+}
+
+function buttons() {
+  const p = PAGES[page], prim = $("primary"), sec = $("secondary"), back = $("back");
+  back.hidden = page === 0 || installing || finished;
+  sec.hidden = true; prim.disabled = false;
+  if (p === "welcome")  prim.innerHTML = 'Choose what to set up<span class="arrow" aria-hidden="true">→</span>';
+  if (p === "choose")   prim.innerHTML = 'Next<span class="arrow" aria-hidden="true">→</span>';
+  if (p === "connect") {
+    const k = keyVerdict();
+    prim.innerHTML = k.state === "empty" ? 'Install without a key<span class="arrow" aria-hidden="true">→</span>' : 'Install<span class="arrow" aria-hidden="true">→</span>';
+    prim.disabled = k.state === "bad";
+  }
+  if (p === "install")  { prim.innerHTML = "Installing…"; prim.disabled = true; }
+  if (p === "done") {
+    prim.textContent = "Restart now";
+    sec.hidden = false; sec.textContent = "Restart later";
+  }
+}
+
+/* -------------------------------------------------------------------- choices */
+$("o-autologin").addEventListener("change", (e) => {
+  $("pw-reveal").classList.toggle("open", e.target.checked);
+  if (e.target.checked) setTimeout(() => $("o-password").focus(), 250);
+  else $("o-password").value = "";
+});
+
+/* ------------------------------------------------------------------------ key */
+function keyVerdict() {
+  const k = $("o-key").value.trim().replace(/\s+/g, " ");
+  if (!k) return { state: "empty" };
+  const m = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com)\s+([A-Za-z0-9+/]{40,}={0,3})(?:\s+(.+))?$/.exec(k);
+  if (!m) return { state: "bad" };
+  return { state: "ok", type: m[1].replace("ssh-", "").replace("sk-ssh-", "").replace("@openssh.com", ""), who: m[3] || "", key: k };
+}
+function showVerdict() {
+  const v = keyVerdict(), box = $("o-key"), out = $("verdict");
+  box.classList.toggle("ok", v.state === "ok");
+  box.classList.toggle("bad", v.state === "bad");
+  out.className = "verdict " + (v.state === "empty" ? "" : v.state);
+  if (v.state === "empty") out.textContent = "Without a key, Vypr can't start apps in here. You can add one by running setup again.";
+  else if (v.state === "bad") out.textContent = "That isn't an SSH public key. It is one line, starting with ssh-ed25519 or ssh-rsa.";
+  else { out.innerHTML = ""; const b = document.createElement("b"); b.textContent = "Key looks right"; out.append(b, " — " + v.type + (v.who ? ", from " : "")); if (v.who) { const c = document.createElement("code"); c.textContent = v.who; out.append(c); } }
+  if (PAGES[page] === "connect") buttons();
+}
+$("o-key").addEventListener("input", showVerdict);
+showVerdict();
+
+/* ------------------------------------------------------------------ installing */
+let runs = [], current = null, expected = 7, problems = [];
+
+function expectedSteps() {
+  // install_agent, grant_lock_pages and the audio naming always run.
+  let n = 3;
+  if ($("o-elevation").checked) n++;
+  if ($("o-parsec").checked) n += 3;
+  if (keyVerdict().state === "ok") n++;
+  if ($("o-homedir").checked) n++;
+  if ($("o-autologin").checked) n++;
+  return n;
+}
+
+function startInstall() {
+  installing = true; expected = expectedSteps();
+  go(3);
+  const k = keyVerdict();
+  send("install", {
+    parsec: $("o-parsec").checked ? 1 : 0,
+    elevation: $("o-elevation").checked ? 1 : 0,
+    homedir: $("o-homedir").checked ? 1 : 0,
+    autologin: $("o-autologin").checked ? 1 : 0,
+    password: $("o-autologin").checked ? $("o-password").value : "",
+    key: k.state === "ok" ? k.key : "",
+  });
+  $("o-password").value = "";
+}
+
+const icons = {
+  spin: '<svg class="spin" viewBox="0 0 18 18"><circle cx="9" cy="9" r="7" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/><path d="M9 2a7 7 0 0 1 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  ok: '<svg viewBox="0 0 18 18"><circle cx="9" cy="9" r="8" fill="currentColor" fill-opacity=".14"/><path d="M5.3 9.3 7.8 11.8 12.8 6.4" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  bad: '<svg viewBox="0 0 18 18"><circle cx="9" cy="9" r="8" fill="currentColor" fill-opacity=".14"/><path d="M6.2 6.2l5.6 5.6m0-5.6l-5.6 5.6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>',
+  skip: '<svg viewBox="0 0 18 18"><circle cx="9" cy="9" r="8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 9h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+};
+
+function finishRun(r) {
+  if (!r || r.final) return;
+  r.final = true;
+  const state = r.bad ? "bad" : (r.ok || !r.skipped) ? "ok" : "skip";
+  r.li.className = "run " + state;
+  r.li.querySelector(".ic").innerHTML = icons[state];
+  if (!r.status.textContent && state === "ok") r.status.textContent = "Done";
+}
+
+function onLog(line) {
+  const log = $("log");
+  log.textContent += line + "\n";
+  log.scrollTop = log.scrollHeight;
+  if (!line.trim()) return;
+
+  if (!/^\s/.test(line)) {
+    // A heading starts a step; the one before it is over.
+    finishRun(current);
+    const li = document.createElement("li");
+    li.className = "run";
+    const m = /^(.*?)\s*\((.*)\)\s*$/.exec(line);
+    li.innerHTML = '<span class="ic">' + icons.spin + '</span><div class="t"></div><div class="s"></div>';
+    const t = li.querySelector(".t");
+    t.textContent = m ? m[1] : line;
+    if (m) { const s = document.createElement("small"); s.textContent = m[2]; t.append(s); }
+    $("runs").append(li);
+    current = { li, status: li.querySelector(".s"), ok: false, bad: false, skipped: false, final: false };
+    runs.push(current);
+    $("count").textContent = "Step " + Math.min(runs.length, expected) + " of " + expected;
+    fillTiles($("work"), Math.min(1, (runs.length - 1) / expected), false);
+    li.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    return;
+  }
+  if (!current) return;
+  const tag = /^\s*\[(ok|!!|--)\]\s*(.*)$/.exec(line);
+  if (tag) {
+    current.status.textContent = tag[2];
+    if (tag[1] === "ok") current.ok = true;
+    if (tag[1] === "!!") { current.bad = true; problems.push(current.li.querySelector(".t").firstChild.textContent + ": " + tag[2]); }
+    if (tag[1] === "--") current.skipped = current.skipped || /skipped|not shared|nothing/i.test(tag[2]);
+  } else {
+    current.status.textContent = line.trim();
+  }
+}
+
+function onDone(failed) {
+  finishRun(current);
+  installing = false; finished = true;
+  const work = $("work");
+  work.classList.remove("running");
+  fillTiles(work, 1, failed && problems.length === runs.length);
+  work.classList.add("settled");
+  $("count").textContent = failed ? "Finished, with problems" : "Finished";
+  const rest = $("rest");
+  fillTiles(rest, 1, failed && problems.length === runs.length);
+  if (!failed) rest.classList.add("settled");
+  if (failed) {
+    $("h-done").textContent = "Done, with problems.";
+    $("done-lede").textContent = "Everything else is set up. Fix what is listed here and run setup again: it skips what is already done.";
+    const ul = $("problems"); ul.hidden = false;
+    for (const p of problems) { const li = document.createElement("li"); li.textContent = p; ul.append(li); }
+  }
+  setTimeout(() => go(4), 1100);
+}
+
+/* ------------------------------------------------------------------------ wiring */
+$("primary").addEventListener("click", () => {
+  const p = PAGES[page];
+  if (p === "welcome") go(1);
+  else if (p === "choose") {
+    if ($("o-autologin").checked && !$("o-password").value) { $("o-password").focus(); return; }
+    go(2);
+  }
+  else if (p === "connect") startInstall();
+  else if (p === "done") send("restart");
+});
+$("secondary").addEventListener("click", () => send("close"));
+$("back").addEventListener("click", () => go(page - 1));
+$("copy").addEventListener("click", () => { send("copy", { text: "vypr detect" }); $("copy").textContent = "Copied"; setTimeout(() => ($("copy").textContent = "Copy"), 1600); });
+$("source").addEventListener("click", () => send("source"));
+$("source").addEventListener("keydown", (e) => { if (e.key === "Enter") send("source"); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && document.activeElement.tagName !== "TEXTAREA" && document.activeElement.tagName !== "BUTTON" && !$("primary").disabled) $("primary").click();
+});
+
+if (host) {
+  host.addEventListener("message", (e) => {
+    const m = e.data;
+    if (m.type === "log") onLog(m.text);
+    else if (m.type === "done") onDone(m.failed);
+    else if (m.type === "init") init(m);
+  });
+}
+
+function init(m) {
+  if (m.version) $("ver").textContent = m.version;
+  if (m.parsec) $("tag-parsec").hidden = false;
+  if (m.installed) {
+    $("welcome-eyebrow").textContent = "Updating Vypr";
+    $("h-welcome").textContent = "Vypr is already set up here.";
+    $("welcome-lede").textContent = "This replaces the agent with version " + (m.version || "") + " and keeps everything else. You can change what is set up on the next page.";
+    $("primary").innerHTML = 'Review what is set up<span class="arrow" aria-hidden="true">→</span>';
+  }
+}
+
+page = -1; // so the first go() counts as a change
+document.querySelector("#p-welcome").classList.add("active");
+page = 0;
+[...$("steps").children][0].classList.add("now");
+buttons();
+send("ready");
+
+/* ------------------------------------------------------------------------- demo */
+// Only when opened outside the installer: plays the install from a recording,
+// so the interface can be designed and checked in an ordinary browser.
+function demo(cmd, f) {
+  if (cmd === "ready") return init({ version: "0.5.0", parsec: true, installed: false });
+  if (cmd !== "install") return;
+  const lines = [
+    "Installing the agent", "  [ok] vypr-agent.exe unpacked", "  [--] the agent logs to C:\\ProgramData\\Vypr\\agent.log", "  [ok] registered to start when you log in",
+    "Memory for frames (lets the agent lock pages to stream through)", "  [ok] 'Lock pages in memory' granted to this account", "  [--] it applies from the next sign-in, so reboot when this finishes",
+    "Administrator prompts (Vypr cannot show or answer them)", "  [ok] programs in here get administrator rights without a prompt",
+    "Parsec", "  downloading Parsec...", "  [ok] Parsec installed", "  [ok] registered so Vypr can start it",
+    "Parsec virtual USB driver (this is what fixes the mouse in games)", "  [ok] already installed",
+    "Controller support", "  [ok] already installed",
+    "SSH access, so the host can start things in here", "  enabling the OpenSSH server...", "  [ok] key authorised for this account",
+    "Naming the VM's audio devices", "  [ok] they appear as Vypr Speakers and Vypr Microphone",
+  ];
+  let i = 0;
+  const tick = () => { if (i < lines.length) { onLog(lines[i++]); setTimeout(tick, 260 + Math.random() * 420); } else onDone(false); };
+  setTimeout(tick, 500);
+}
+</script>
+</body>
+</html>

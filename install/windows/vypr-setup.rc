@@ -2,12 +2,16 @@
 
 #define IDR_AGENT  101
 #define IDI_VYPR   102
+#define IDR_UI     103
 
 // The agent is carried inside this executable rather than downloaded, so the
 // installer is the single file it is meant to be.
 IDR_AGENT RCDATA "vypr-agent.exe"
 
 IDI_VYPR  ICON   "vypr.ico"
+
+// The installer's interface, shown through WebView2.
+IDR_UI    RCDATA "ui.html"
 
 1 24 "vypr-setup.manifest"
 

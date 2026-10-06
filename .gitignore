@@ -1,3 +1,5 @@
 build/
 __pycache__/
 *.o
+install/windows/webview2/
+install/windows/wv2.zip
