@@ -684,6 +684,12 @@ GUEST_USER="$guest_user"
 # mouse work in games that read raw input. Set to 0 if you do not play those.
 USE_PARSEC=1
 
+# Let the VM grant administrator rights without a prompt. Windows draws that
+# prompt where Vypr cannot show or answer it, so with this off an installer that
+# asks for approval just hangs. It does lower the VM's security; set it to 0 to
+# keep the prompt (you will have to answer it on the VM's own screen).
+OPEN_ELEVATION=1
+
 # Shut the VM down once the last streamed window has been gone this long.
 # Relaunching anything during the countdown cancels it. Set to 0 to leave the
 # VM running after you close things.

@@ -37,6 +37,7 @@
 #define ID_PASSWORD      1014
 #define ID_SOURCE_LINK   1015
 #define ID_CHK_HOMEDIR   1016
+#define ID_CHK_ELEVATION 1017
 #define WM_STEP_DONE     (WM_APP + 1)
 
 static const wchar_t *PARSEC_APP_URL =
@@ -56,6 +57,7 @@ static const wchar_t *SOURCE_URL =
 
 static HWND g_main, g_log, g_key, g_install, g_progress;
 static HWND g_chk_drivers, g_chk_ssh, g_chk_autologin, g_chk_parsec, g_chk_homedir;
+static HWND g_chk_elevation;
 static HWND g_password, g_pw_label, g_pw_note, g_link;
 static HFONT g_font, g_font_bold;
 static bool  g_failed = false;
@@ -350,6 +352,30 @@ static void grant_lock_pages()
         if (st == 0) logf(L"  [--] it applies from the next sign-in, so reboot when this finishes");
     }
     LsaClose(policy);
+}
+
+/*
+ * Administrator prompts, opened.
+ *
+ * Windows draws the UAC prompt on the secure desktop and refuses injected input
+ * to it, so through Vypr it can be neither seen nor answered: an installer that
+ * asks for approval just waits forever. On a VM driven through Vypr the prompt
+ * is a deadlock rather than a safeguard, so this is on by default - and it is a
+ * checkbox, not something done quietly, because it is a real reduction in the
+ * VM's security. `vypr open-elevation --remove` on the Linux side undoes it.
+ */
+static void open_elevation()
+{
+    logf(L"Administrator prompts (Vypr cannot show or answer them)");
+    const wchar_t *key = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+    const DWORD zero = 0;
+    const bool ok =
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE, key, L"ConsentPromptBehaviorAdmin",
+                        REG_DWORD, &zero, sizeof(zero)) == ERROR_SUCCESS &&
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE, key, L"PromptOnSecureDesktop",
+                        REG_DWORD, &zero, sizeof(zero)) == ERROR_SUCCESS;
+    step_ok(ok, L"programs in here get administrator rights without a prompt");
+    if (ok) logf(L"  [--] 'vypr open-elevation --remove' on Linux puts the prompt back");
 }
 
 static void install_parsec_vud()
@@ -725,6 +751,7 @@ static DWORD WINAPI worker(LPVOID)
     bool want_ssh       = SendMessageW(g_chk_ssh, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_autologin = SendMessageW(g_chk_autologin, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_homedir   = SendMessageW(g_chk_homedir, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool want_elevation = SendMessageW(g_chk_elevation, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     int len = GetWindowTextLengthW(g_key);
     std::wstring pubkey(len + 1, L'\0');
@@ -746,6 +773,7 @@ static DWORD WINAPI worker(LPVOID)
 
     install_agent();
     grant_lock_pages();
+    if (want_elevation) open_elevation();
     if (want_parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
     if (want_ssh)       setup_ssh(pubkey);
     name_audio_endpoints();
@@ -801,37 +829,41 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_chk_homedir = mk(L"BUTTON",
                            L"Mount the folder your Linux machine shares, as a drive",
                            BS_AUTOCHECKBOX, 24, 180, 480, 22, ID_CHK_HOMEDIR, h);
+        g_chk_elevation = mk(L"BUTTON",
+                             L"Let installers run without a prompt Vypr cannot answer (less secure)",
+                             BS_AUTOCHECKBOX, 24, 204, 500, 22, ID_CHK_ELEVATION, h);
         g_chk_autologin = mk(L"BUTTON",
                              L"Log in to Windows automatically \x2014 Vypr needs a desktop to capture",
-                             BS_AUTOCHECKBOX, 24, 204, 480, 22, ID_CHK_AUTOLOGIN, h);
+                             BS_AUTOCHECKBOX, 24, 228, 480, 22, ID_CHK_AUTOLOGIN, h);
 
         SendMessageW(g_chk_drivers, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_parsec, BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(g_chk_ssh, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(g_chk_elevation, BM_SETCHECK, BST_CHECKED, 0);
 
         g_pw_label = mk(L"STATIC", L"Windows password for this account:",
-                        0, 44, 230, 480, 20, 0, h);
+                        0, 44, 254, 480, 20, 0, h);
         g_password = mk(L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL,
-                        44, 250, 300, 24, ID_PASSWORD, h);
+                        44, 274, 300, 24, ID_PASSWORD, h);
         g_pw_note = mk(L"STATIC",
             L"Used once, to write Windows' own automatic-login setting. It is "
             L"not sent anywhere and Vypr does not keep it. Windows stores it in "
             L"the registry \x2014 that is how automatic login works.",
-            0, 44, 280, 490, 72, 0, h);
+            0, 44, 304, 490, 72, 0, h);
         g_link = mk(L"STATIC", L"Read exactly what this does \x2014 the source of this installer",
-                    SS_NOTIFY, 44, 356, 490, 20, ID_SOURCE_LINK, h);
+                    SS_NOTIFY, 44, 380, 490, 20, ID_SOURCE_LINK, h);
 
         /* Off until asked for, so the field cannot be filled in by habit. */
         EnableWindow(g_password, FALSE);
         EnableWindow(g_pw_label, FALSE);
 
         mk(L"STATIC", L"Host public key (the Linux installer printed this):",
-           0, 24, 392, 480, 20, 0, h);
+           0, 24, 416, 480, 20, 0, h);
         g_key = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
-                   24, 414, 520, 24, ID_KEY, h);
+                   24, 438, 520, 24, ID_KEY, h);
 
         g_log = mk(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOSEL,
-                   24, 452, 520, 186, ID_LOG, h);
+                   24, 476, 520, 162, ID_LOG, h);
 
         g_install = mk(L"BUTTON", L"Install", BS_DEFPUSHBUTTON,
                        444, 650, 100, 30, ID_INSTALL, h);

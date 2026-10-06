@@ -406,7 +406,7 @@
         <li><b>The passed-through GPU needs a display</b> &mdash; a monitor or a dummy plug. The compositor has nothing to draw on otherwise.</li>
         <li><b>Clipboard is text only.</b> Images and file lists need a format negotiation the protocol does not have.</li>
         <li><b>Dragging goes one way, and files only.</b> Out of Windows is not implemented, and neither are folders.</li>
-        <li><b>Administrator prompts cannot be answered through Vypr.</b> Windows draws the UAC prompt on the secure desktop and refuses injected input to it. <code>vypr open-elevation</code> turns the prompt off inside the VM, which is what makes installers work.</li>
+        <li><b>Administrator prompts cannot be answered through Vypr.</b> Windows draws the UAC prompt on the secure desktop and refuses injected input to it. So by default Vypr turns the prompt off inside the VM, which is what makes installers work &mdash; and lowers the VM's security, which is why it says so and why <code>vypr open-elevation --remove</code> puts it back.</li>
         <li><b>A file outside the shared folder is copied, not shared.</b> Each saved version is copied back out, usually within seconds &mdash; invisible in ordinary use, and wrong if you edit the same file on both sides at once.</li>
       </ul>
     </div>

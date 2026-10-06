@@ -9,6 +9,7 @@
 #   vypr open <file>    open a Linux file in the Windows app that handles it
 #   vypr associate      make this desktop open .psd, .exe and friends that way
 #   vypr open-elevation let the guest elevate without a prompt Vypr cannot answer
+#                       (on by default; --remove turns it off and keeps it off)
 #   vypr guest-notifications  turn the guest's notifications back on
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr --debug resolution [WxH]  what size that screen is shown at
@@ -258,6 +259,34 @@ start_agent() {
     fi
 }
 
+# ------------------------------------------- administrator prompts, opened
+#
+# On by default: a session turns the guest's UAC prompt off unless the config
+# says OPEN_ELEVATION=0. The prompt cannot be answered through Vypr - Windows
+# refuses injected input to it - so on a VM driven through Vypr it is not a
+# safeguard but a deadlock, and an installer that asks for approval just hangs.
+# It is still a real reduction in the VM's security, so it is announced the one
+# time it is changed, and `vypr open-elevation --remove` turns it back off and
+# records OPEN_ELEVATION=0 so it stays off.
+UAC_KEY='HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+
+uac_open() {
+    guest "reg add \"$UAC_KEY\" /v PromptOnSecureDesktop /t REG_DWORD /d 0 /f" >/dev/null 2>&1 &&
+    guest "reg add \"$UAC_KEY\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f" >/dev/null 2>&1
+}
+
+ensure_open_elevation() {
+    [ "${OPEN_ELEVATION:-1}" = "1" ] || return 0
+    local consent
+    consent=$(guest "reg query \"$UAC_KEY\" /v ConsentPromptBehaviorAdmin" 2>/dev/null |
+              tr -d '\r' | awk '/ConsentPromptBehaviorAdmin/ { print $3 }')
+    [ "$consent" = "0x0" ] && return 0
+    if uac_open; then
+        say "Let the VM grant administrator rights without a prompt Vypr cannot answer."
+        say "OPEN_ELEVATION=0 in $CONF, or 'vypr open-elevation --remove', turns that off."
+    fi
+}
+
 # --------------------------------------------------- Parsec, for the mouse
 #
 # Not for streaming, and not for the display either - only for its driver.
@@ -441,6 +470,7 @@ cmd_run() {
     start_vm
     start_daemon MATCHES
     start_agent
+    ensure_open_elevation
     start_parsec
 
     if [ -n "${PROCESS:-}" ] && grep -qi "$PROCESS" <<<"$(guest 'tasklist' 2>/dev/null || true)"; then
@@ -697,6 +727,7 @@ cmd_open() {
     mapfile -t MATCHES < <(open_matches "$stem" "$base")
     start_daemon MATCHES
     start_agent
+    ensure_open_elevation
     start_parsec
 
     # The guest may be able to see the file already.
@@ -1233,6 +1264,7 @@ cmd_desktop() {
     start_vm
     start_daemon matches
     start_agent
+    ensure_open_elevation
     start_parsec
     start_watcher
 
@@ -1773,22 +1805,29 @@ cmd_doctor() {
     return "$bad"
 }
 
-# Let the guest elevate without asking.
+# Let the guest elevate without asking - or stop letting it.
 #
-# This is a security setting and it is weakened deliberately, so it is a
-# command the user runs rather than something an installer does quietly. The
-# reasoning: the prompt cannot be answered through Vypr - Windows will not let
-# injected input reach it, whatever integrity level the agent runs at - so on a
-# VM driven entirely through Vypr the prompt is not a safeguard, it is a
-# deadlock. On a VM you also use directly, leave it alone.
-cmd_open_elevation() {
-    local key='HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+# Sessions already do this unless OPEN_ELEVATION=0 (see ensure_open_elevation);
+# the command is for doing it now, with the trade-off spelled out, and for
+# undoing it. Undoing it also writes OPEN_ELEVATION=0 to the config, because
+# otherwise the next session would quietly turn it back on.
+set_config() {
+    local name=$1 value=$2
+    if grep -qE "^[[:space:]]*$name=" "$CONF" 2>/dev/null; then
+        sed -i "s|^[[:space:]]*$name=.*|$name=$value|" "$CONF"
+    else
+        printf '\n%s=%s\n' "$name" "$value" >> "$CONF"
+    fi
+}
 
+cmd_open_elevation() {
     if [ "${1:-}" = "--remove" ]; then
         resolve_guest || die "cannot reach the guest"
-        guest "reg add \"$key\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 5 /f" >/dev/null 2>&1
-        guest "reg add \"$key\" /v PromptOnSecureDesktop /t REG_DWORD /d 1 /f" >/dev/null 2>&1
-        say "Windows will ask for approval on the secure desktop again."
+        guest "reg add \"$UAC_KEY\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 5 /f" >/dev/null 2>&1
+        guest "reg add \"$UAC_KEY\" /v PromptOnSecureDesktop /t REG_DWORD /d 1 /f" >/dev/null 2>&1
+        set_config OPEN_ELEVATION 0
+        say "Windows will ask for approval on the secure desktop again, and sessions"
+        say "will leave it that way (OPEN_ELEVATION=0 in $CONF)."
         say "Installers launched through Vypr will appear to hang."
         return 0
     fi
@@ -1800,10 +1839,10 @@ This turns off two Windows safeguards inside the VM:
   PromptOnSecureDesktop      = 0   draw any prompt on the ordinary desktop
 
 After it, a program in the guest that asks for administrator rights gets them
-without a prompt. That is a real reduction in the VM's security and it is worth
-being deliberate about. It is here because the prompt cannot be answered
-through Vypr at all: Windows refuses injected input to it, so what you get
-instead is an installer waiting forever on a question you were never shown.
+without a prompt. That is a real reduction in the VM's security. It is the
+default because the prompt cannot be answered through Vypr at all: Windows
+refuses injected input to it, so what you get instead is an installer waiting
+forever on a question you were never shown.
 
 Only the VM is affected. This machine is untouched.
 EOF
@@ -1812,10 +1851,8 @@ EOF
     case "$reply" in [yY]*) ;; *) echo "Left alone."; return 0 ;; esac
 
     resolve_guest || die "cannot reach the guest - is the VM running?"
-    guest "reg add \"$key\" /v PromptOnSecureDesktop /t REG_DWORD /d 0 /f" >/dev/null 2>&1 ||
-        die "could not write the guest's settings"
-    guest "reg add \"$key\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f" >/dev/null 2>&1 ||
-        die "could not write the guest's settings"
+    uac_open || die "could not write the guest's settings"
+    set_config OPEN_ELEVATION 1
     say "Done. Installers will now run without asking."
     say "'vypr open-elevation --remove' puts both back."
 }
@@ -1838,7 +1875,7 @@ cmd_guest_notifications() {
     say "The guest will raise notifications again, and Vypr will forward them."
 }
 
-cmd_up()   { ensure_guest_ram; start_vm; start_agent; start_parsec; say "Session is up."; }
+cmd_up()   { ensure_guest_ram; start_vm; start_agent; ensure_open_elevation; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
     pkill -x vyprd 2>/dev/null
