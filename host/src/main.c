@@ -773,7 +773,7 @@ static void *link_thread(void *arg)
 
 static int parse_args(int argc, char **argv, struct options *o)
 {
-    o->shm_path  = "/dev/shm/vypr";
+    o->shm_path  = "/dev/shm/vypr-host";
     o->title     = "vypr";
     o->sock_path = NULL;
     o->backend   = NULL;
@@ -1992,7 +1992,7 @@ drop_pump(&drop);
             struct view *v = &views[i];
             struct vypr_frame_view f;
 
-            int rc = vypr_shm_acquire(&shm, v->slot, v->last_serial, &f);
+            int rc = vypr_shm_acquire(&shm, v->slot, v->window_id, v->last_serial, &f);
             if (rc == 0) {
                 if (f.width != v->src_w || f.height != v->src_h) {
                     v->src_w = f.width;
@@ -2034,11 +2034,9 @@ drop_pump(&drop);
                     stall_reported = false;
                 }
             } else if (rc == -1 && !v->is_popup) {
-                /* CLOSED is the guest saying the window went away; RETIRING is
-                 * the daemon having dropped it and waiting on the guest. Either
-                 * way there is nothing left to show. */
-                const uint32_t st = vypr_slot_state(&shm, v->slot);
-                if (st == VYPR_SLOT_CLOSED || st == VYPR_SLOT_RETIRING)
+                /* The daemon dropped the window, or gave its slot to another
+                 * one. Either way there is nothing left to show. */
+                if (vypr_slot_state(&shm, v->slot, v->window_id) == VYPR_SLOT_CLOSED)
                     running = 0;
             }
 

@@ -18,8 +18,9 @@ it is fine for a text editor and poor for anything that moves.
 Everything inside it arrives as one window with one identity, so it cannot make
 two guest apps into two host windows.
 
-**Looking Glass** proves the transport this project uses, but captures with DXGI
-Desktop Duplication, which returns the *composited desktop*. A window behind
+**Looking Glass** proved the shared-memory approach this project started from,
+but captures with DXGI Desktop Duplication, which returns the *composited
+desktop*. A window behind
 another simply is not present in that data, so windows cannot be cropped out of
 it afterwards.
 
@@ -33,7 +34,7 @@ that property.
 ```
 guest (Windows, C++)                       host (Linux, C)
 ┌───────────────────────────┐              ┌─────────────────────────────┐
-│ WGC capture per HWND      │── IVSHMEM ──▶│ vyprd, then one vypr-window │
+│ WGC capture per HWND      │─ guest RAM ─▶│ vyprd, then one vypr-window │
 │ publish under a seqlock   │   (pixels)   │ per top-level and its popups│
 │ SendInput injection       │◀── TCP ──────│ input, window lifecycle     │
 │ WASAPI loopback           │── TCP ──────▶│ playback                    │
@@ -41,21 +42,132 @@ guest (Windows, C++)                       host (Linux, C)
             two TCP connections on one port: control, and audio on its own
 ```
 
-**Pixels go through IVSHMEM uncompressed.** The guest has a passthrough GPU, and
-the shared BAR is host RAM, so a frame costs one write over PCIe and one read —
-no encode, no decode, no network stack, and no codec latency at all.
+**Pixels go through the guest's own RAM, uncompressed.** The agent locks each
+window's ring as physical pages and the host reads those pages straight out of
+QEMU's memory file, so a frame costs one copy in the guest and none on the host
+— no encode, no decode, no network stack, no codec latency, and no driver on
+either side. See *Frames travel through guest RAM* below.
 
 **Control goes over TCP** on the virtual bridge, where a round trip is tens of
 microseconds. One connection per session, not per window: window identity is an
 explicit `window_id` in every message, so a re-attaching stream can say which
 `HWND` it used to be.
 
-**The host owns allocation.** It carves slots and rings out of the region and
-tells the guest the offsets. Neither side needs a shared allocator and there are
-no cross-OS atomics in the allocation path.
+**The guest owns ring memory; the host never writes it.** The host decides
+slots and ring geometry and keeps them in a host-only table; the guest allocates
+each ring itself and is the only writer of it. Neither side needs a shared
+allocator, and a host bug cannot corrupt guest memory.
 
 **One host process per window**, so a wedged stream costs one window rather than
 the session, and the compositor sees the separate top-levels it needs to.
+
+### Frames travel through guest RAM
+
+Until 2026-10-06 frames went through an IVSHMEM device: a PCI BAR backed by a
+host file. That needed a kernel driver in the guest to map the BAR into user
+space, and the only signed one ships with Looking Glass. Windows will not load
+an unsigned kernel driver without test-signing mode, which means turning Secure
+Boot off - and which a lot of anti-cheat software refuses to run under - so
+"write our own driver" was never an option. The transport was redesigned so that
+no driver is needed at all.
+
+**The guest allocates.** On `ATTACH` the agent allocates the ring - one header
+page and three frame buffers - with Windows' AWE calls
+(`AllocateUserPhysicalPages`, `MapUserPhysicalPages`). They are the documented
+way for a user-mode process to hold physical pages and be told which pages they
+are, and the pages are locked: never paged out, never moved. The only
+requirement is the "Lock pages in memory" right, which `vypr-setup` grants.
+
+**The host reads them where they are.** QEMU keeps guest RAM in a shared memfd
+(`<memoryBacking>` with `memfd` and `shared`, which virtiofs already needed),
+reachable as `/proc/<qemu>/fd/N`. Linux only opens that for a process whose user
+*and* group match QEMU's, so `qemu.conf` has `group =` set to the user's own
+group, next to the `user =` line the microphone already needed.
+
+**Nothing is shown until every page checks out.** The agent stamps each page
+with a magic, a per-ring nonce, its index and its physical page number, and
+sends the page list (`RING_PAGES`, several messages for a big ring). vyprd maps
+guest RAM read-only, translates each page through QEMU's memory layout - it
+learns where the 4 GiB hole is from the first ring that reaches past it, by
+finding the one layout under which every stamp reads back - and only then
+writes the ring into its slot table and sends `RING_READY`. Until then the agent
+writes nothing, so the stamps are still there to check. A wrong translation, a
+stale list or a page shared between rings fails here rather than as a garbled
+window.
+
+**The host never writes guest memory.** When the agent exits, Windows takes its
+locked pages back at once and may hand them to anything, so a host store into
+one would corrupt some unrelated guest process. So vyprd maps guest RAM
+read-only, every host-side decision lives in a separate host-only region
+(`/dev/shm/vypr-host`), and the guest hears about them over TCP. A presenter
+maps the ring read-write only because Vulkan will not import a read-only
+mapping; nothing writes through it, and the GPU only ever copies out of it.
+
+**Scattered pages, still zero-copy.** A guest that has been running a while
+rarely has two free pages side by side: a 4K ring is ~24,000 pages in ~20,000
+pieces. The presenter reserves address space for the whole ring and maps each
+run into place - about 60 ms, once per window - which makes it one contiguous
+range again, so the Vulkan presenter still hands the whole ring to the GPU in
+one import. Measured on the RTX 5050 with `vypr-testsrc` at 3840x2160, a ring
+in 24,481 pieces: 60 fps, upload 0.0-0.1 ms, frame age 0.5 ms average, 1.0 ms
+worst - the same as the IVSHMEM path at its best.
+
+Rings cost guest RAM now (about 100 MiB for a 4K window, only while it is
+streamed) where the IVSHMEM device cost a fixed 512 MiB of host RAM whether
+anything was streamed or not. How scattered a ring is depends on how long the
+guest has been up: the 4K desktop's ring came back in 1,562 pieces just after a
+boot and in 23,755 after a day of use. Both map in well under a frame.
+
+### Reading frames back in bands (2026-10-06)
+
+Measured honestly (see the next section), most of the guest's cost per frame
+is not Vypr's copy at all but the GPU reading the frame back to system memory:
+about 6 of the 7.5 ms for a 2560x1440 frame on this VM, whose passthrough GPU
+sits on a PCIe x4 link. In one piece, the copy into the ring cannot start until
+the last row has arrived.
+
+So a frame of 8 MB or more (1080p and up) is read back as eight horizontal
+bands, each into its own staging texture with its own fence. The reader copies
+band 0 into the ring while the GPU is still reading bands 1-7, and so on down,
+which leaves only the last band's copy after the readback ends. The capture
+surface goes back to WGC's pool the moment the GPU is done with it - holding it
+until the reader got round to the last band cost frames, because the pool has
+three surfaces and DWM ran out. Smaller frames are read back whole: banding a
+720p frame bought 6-10% on average and cost a millisecond or two at the worst.
+Damage mode diffs the frame as a whole and is never banded.
+
+The copy itself uses non-temporal stores (`stream_copy` in `capture.cpp`).
+Rings are write-back RAM now, and an ordinary store reads each cache line before
+overwriting it and evicts something the game wanted; the old write-combined BAR
+got this for free.
+
+Measured with `bench.exe` - a D3D11 window redrawing every vsync - on this VM,
+old pipeline (IVSHMEM, Looking Glass's driver) against new, same session, same
+metric, several runs each:
+
+| | v2 capture→publish | v3 | v2 capture→host | v3 |
+|---|---|---|---|---|
+| 1280x720 window | 4.55-4.66 ms | 4.55-4.71 ms | | |
+| 1920x1080 window | 5.98 ms | **5.02 ms** | | |
+| 2560x1440 window | 7.42 ms | **6.29 ms** | 8.1 ms | **7.0 ms** |
+| 3200x1800 window | 10.80 ms (worst ~22.7) | **8.72 ms** (worst ~12.9) | | |
+| whole 4K desktop | 13.82 ms | **11.74 ms** | 14.5 ms | **12.6 ms** |
+
+Frame rate was the same throughout (58-60 fps, run-to-run noise ±0.5), with
+nothing dropped. The biggest remaining cost is the PCIe x4 link: the same GPU in
+an x16 slot would read a frame back four times faster, which no change on
+either side of the stream can match.
+
+### The capture timestamp was in the future
+
+Every latency figure before 2026-10-06 was too low. Frames were stamped with
+WGC's `SystemRelativeTime`, which for a window presenting on vsync is the
+vblank the composition is *for* - up to a frame after the capture. The agent's
+own capture-to-publish time came out negative (about -7 ms) and the host's
+frame age mostly read 0, because negative samples were discarded. A frame cannot
+have been captured after it arrived, so the stamp is now bounded by the
+arrival time, and both figures are positive and honest. Older numbers in this
+document were measured with the old stamp.
 
 ### Frame handoff
 
@@ -126,13 +238,16 @@ Three faults in the agent were costing more than the transport:
   without a priority runs at Task Scheduler's default of 7, so capture and input
   injection both queued behind any guest game. The agent raises itself to high
   priority at start, and the capture threads join MMCSS's "Capture" class.
-- **Publishing lacked write barriers.** The region is mapped write-combined,
+- **Publishing lacked write barriers.** The region was mapped write-combined,
   which x86's ordinary store ordering does not cover, so the record could become
-  visible before the pixels it describes. An `sfence` now precedes and follows
-  the publish.
+  visible before the pixels it describes. An `sfence` now precedes the publish.
+  Rings are ordinary write-back memory since moving into guest RAM, but a large
+  `memcpy` may still use non-temporal stores, so the fence stays.
 
 Live on the 4K guest desktop, frame age while things are moving went from 10-37
-ms average (60-180 ms worst) to 2-4 ms average (5-30 ms worst).
+ms average (60-180 ms worst) to 2-4 ms average (5-30 ms worst). These figures
+used the old capture timestamp, which read low - see *The capture timestamp was
+in the future*.
 
 ### Damage: sending only what changed (opt-in, 2026-10-05)
 
@@ -200,7 +315,7 @@ in host time on its own. The daemon aligns the two clocks over the control
 channel - ping, guest counter, pong - and assumes the guest read its counter
 halfway through the round trip. Measured round trip across the virtual bridge
 is **0.30 ms**, so that assumption is wrong by at most ~0.15 ms, far below a
-frame. The offset lands in the shared region because the process presenting
+frame. The offset lands in vyprd's slot table because the process presenting
 frames is not the one that owns the control channel.
 
 `--stats` then reports frame age: guest capture to host acquire, in host time.
@@ -625,9 +740,10 @@ past 2560x1440 mapped out of range.
 
 | Component | State |
 |---|---|
-| `include/vypr_shm.h` — region layout | done |
+| `include/vypr_shm.h` — ring and slot-table layout | done (v3: rings in guest RAM) |
 | `include/vypr_proto.h` — control protocol | spoken by both ends |
-| `host/src/shm.c` — mapping, allocation, seqlock reader | done, verified |
+| `host/src/shm.c` — slot table, ring mapping, seqlock reader | done, verified |
+| `host/src/guest_ram.c` — find guest RAM, verify rings | done, verified on Linux (scattered pages, 4 GiB hole) |
 | `host/src/main.c` — present a slot as a native window | working |
 | `host/src/present_vk.c` — zero-copy Vulkan path | working, default; ~5x faster at 4K than `gpu` |
 | `host/src/present_gpu.c` — SDL_GPU upload path | fallback |
@@ -636,11 +752,12 @@ past 2560x1440 mapped out of range.
 | `tools/vypr-testsrc.c` — reference producer | working |
 | Guest agent — publish path (`guest/src/publisher.cpp`) | verified on Linux, 1080p60, 0 drops |
 | Guest agent — WGC capture | **working** — Notepad at 60 fps |
-| Guest agent — IVSHMEM mapping | **working** — self-identifies by magic |
+| Guest agent — ring memory (`guest/src/awe.cpp`) | **working** on the real guest; replaces the IVSHMEM mapping |
+| Banded readback, streaming copy (`guest/src/capture.cpp`) | **working** — 13-19% lower latency from 1080p up |
 | Guest agent — input injection | **working** — typed into the host window, arrived in the guest |
 | Popups and menus | **working** — real popup surfaces, GDI fallback for menus |
-| IVSHMEM device on the VM | added — 512 MB, PCI 08:02 |
-| IVSHMEM driver in the guest | installed with Looking Glass |
+| VM memory shared with the host | memfd + shared, `qemu.conf` group = the user's |
+| Third-party drivers needed in the guest | none for frames (IVSHMEM and Looking Glass are gone); Parsec stays optional, for raw-input games |
 | `host/src/vyprd.c` — session daemon | working, verified end to end |
 | `host/src/msg.c` — framing, shared by both host processes | done |
 | Input path — pointer, keys, focus, resize, close | working, verified |
@@ -658,7 +775,7 @@ way to see what the guest is offering:
 ./build/vyprd --match Notepad --launch 'C:\\Windows\\System32\\notepad.exe'
 ```
 
-`vyprd` formats the region, waits for the agent, and spawns one `vypr-window` per
+`vyprd` formats its slot table, waits for the agent, and spawns one `vypr-window` per
 matching guest window. `--all` streams every window, which is the way to see what
 the guest is actually offering.
 
@@ -667,21 +784,26 @@ the guest is actually offering.
 The whole system runs with the guest powered off, daemon included:
 
 ```bash
-truncate -s 256M /dev/shm/vypr-test
-./build/vyprd --shm /dev/shm/vypr-test --match "test window" --port 47899 &
-./build/vypr-testagent --connect 127.0.0.1 --port 47899 --shm /dev/shm/vypr-test
+./build/vyprd --shm /dev/shm/vypr-test-host --guest-ram /dev/shm/vypr-test-ram \
+              --bind 127.0.0.1 --port 47899 --match "test window" &
+./build/vypr-testagent --connect 127.0.0.1 --port 47899 --guest-ram /dev/shm/vypr-test-ram
 ```
 
-`vypr-testagent` speaks the real control protocol and links the real
-`publisher.cpp`, so this covers slot allocation, attach, client spawning, the
-frame handoff and the input return path. Verified: window appears, streams at
-60fps, and pointer/focus/resize events arrive at the agent in guest coordinates.
+Guest RAM is a sparse 3 GiB file laid out like a q35 guest's, with the 4 GiB
+hole (`tools/fake_ram.c`), and the test agent hands out pages scattered the way
+a real guest does. `vypr-testagent` speaks the real control protocol and links
+the real `publisher.cpp`, so this covers slot allocation, the ring handshake and
+its page check, client spawning, the frame handoff and the input return path.
+Verified: a 2560x1440 ring in 14,257 pieces checks out, the window appears and
+streams at 60 fps, and pointer/focus events arrive at the agent. `--bad-ring`
+spoils one page's stamp, to show the daemon refusing it and both ends
+recovering.
 
 For the presenter alone, without the daemon:
 
 ```bash
-./build/vypr-testsrc --shm /dev/shm/vypr-test --size 1920x1080 --fps 60 &
-./build/vypr-window --shm /dev/shm/vypr-test --slot 0 --stats
+./build/vypr-testsrc --size 3840x2160 --fps 60 &
+./build/vypr-window --shm /dev/shm/vypr-test-host --slot 0 --window-id 3735928559 --stats
 ```
 
 ## Known hard problems

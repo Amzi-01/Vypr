@@ -20,12 +20,14 @@
 #include <stdint.h>
 
 /*
- * Bumped to 2 alongside the shared-memory layout, when ATTACH grew its `flags`
- * field for damage. Host and guest are built from one tree and so always agree,
- * but a stale binary paired with a fresh one would misread the longer ATTACH;
- * the mismatch is caught by this number and by the region's own version.
+ * Bumped to 3 when rings moved into guest RAM (see vypr_shm.h): ATTACH lost its
+ * region offset, and the guest now answers it with the ring's pages and waits
+ * for RING_READY before writing a frame. Host and guest are built from one tree
+ * and so always agree, but a stale binary paired with a fresh one would follow
+ * the old handshake against the new one; vyprd refuses an agent whose number
+ * differs rather than letting that half-work.
  */
-#define VYPR_PROTO_VERSION   2u
+#define VYPR_PROTO_VERSION   3u
 #define VYPR_CONTROL_PORT    47820u
 #define VYPR_MAX_MSG_BYTES   (64u * 1024u)
 
@@ -99,6 +101,16 @@ enum vypr_msg_type {
      * number reused for something else would be read as that something. */
 
     /*
+     * Where the guest put a window's ring: a list of guest physical page
+     * numbers, in ring order, split across as many messages as it takes.
+     *
+     * Sent in answer to ATTACH, before ATTACH_RESULT. A 4K ring is about
+     * 28,000 pages and the guest rarely has two of them side by side, so this
+     * is a few messages per window - once, when it opens.
+     */
+    VYPR_MSG_RING_PAGES       = 17,  /* vypr_msg_ring_pages + uint64 pfn[] */
+
+    /*
      * The same three, going the other way: an image copied here, on its way to
      * the guest's clipboard. Separate ids rather than reusing the ones above,
      * because a message travelling in both directions on one link is a bounce
@@ -165,6 +177,16 @@ enum vypr_msg_type {
 
     /* 81 was VYPR_MSG_DRAG_PROBE, removed with the drag-out work.
      * Left reserved for the same reason. */
+
+    /*
+     * The host has checked a ring and the guest may start writing frames into
+     * it - or, with a negative status, may not, and should let it go.
+     *
+     * The wait is what makes checking possible at all: the host verifies the
+     * ring by reading back the stamps on its pages, and the first frame would
+     * overwrite them.
+     */
+    VYPR_MSG_RING_READY       = 82,  /* vypr_msg_ring_ready */
 
 
     /* 128 and up are host-internal: they travel between vyprd and the per-window
@@ -276,7 +298,7 @@ struct vypr_msg_hello {
     uint32_t version;
     uint32_t _pad;
     uint64_t qpc_freq;           /* guest timer frequency, for latency maths */
-    uint64_t shm_bytes;          /* size of the BAR the guest can see */
+    uint64_t _reserved;          /* was the IVSHMEM BAR size; zero since v3 */
     uint32_t agent_pid;
     uint32_t capabilities;
 };
@@ -328,15 +350,16 @@ struct vypr_msg_window {
 #define VYPR_WIN_RESIZABLE       (1u << 3)
 #define VYPR_WIN_MINIMIZED       (1u << 4)
 
-/* Host assigns a slot and the ring geometry it carved for this window. The
- * guest may not publish a frame larger than max_width x max_height; if the
- * window grows past that it reports VYPR_MSG_WINDOW_CHANGED and waits for the
- * host to re-attach with a bigger ring. */
+/* Host assigns a slot and the ring geometry this window gets. The guest
+ * allocates the ring itself - a header page and VYPR_RING_FRAMES buffers of
+ * frame_bytes each - and answers with VYPR_MSG_RING_PAGES. It may not publish a
+ * frame larger than max_width x max_height; if the window grows past that it
+ * reports VYPR_MSG_WINDOW_CHANGED and waits for the host to re-attach with a
+ * bigger ring. */
 struct vypr_msg_attach {
     uint64_t window_id;
     uint32_t slot;
     uint32_t format;
-    uint64_t ring_offset;
     uint64_t frame_bytes;
     uint32_t max_width;
     uint32_t max_height;
@@ -361,7 +384,45 @@ struct vypr_msg_attach {
 struct vypr_msg_attach_result {
     uint64_t window_id;
     uint32_t slot;
-    int32_t  status;             /* 0 = streaming, negative = errno-ish */
+    int32_t  status;             /* 0 = ring sent, negative = errno-ish */
+};
+
+/*
+ * Why an attach failed, as ATTACH_RESULT and RING_READY carry it. Only the ones
+ * worth telling apart in a log are named; anything else negative is "it did
+ * not work".
+ */
+#define VYPR_ATTACH_NO_WINDOW    (-1)   /* the window is gone */
+#define VYPR_ATTACH_NO_CAPTURE   (-3)   /* Windows would not capture it */
+#define VYPR_ATTACH_NO_MEMORY    (-4)   /* the guest could not lock enough pages */
+#define VYPR_ATTACH_BAD_RING     (-5)   /* the host could not verify the ring */
+
+/*
+ * One piece of a ring's page list. `first` is the ring page the first pfn
+ * belongs to; the pfns follow the struct. `total_pages` is the same in every
+ * piece, so the host knows when it has the lot.
+ */
+struct vypr_msg_ring_pages {
+    uint64_t window_id;
+    uint32_t slot;
+    uint32_t epoch;              /* the ATTACH's generation, echoed */
+    uint64_t nonce;              /* the one stamped into every page */
+    uint32_t total_pages;
+    uint32_t first;
+    uint32_t count;
+    uint32_t _pad;
+};
+
+/* Room for this many pfns after the struct in one message. */
+#define VYPR_RING_PAGES_PER_MSG \
+    ((VYPR_MAX_MSG_BYTES - 64u - (uint32_t)sizeof(struct vypr_msg_ring_pages)) / 8u)
+
+struct vypr_msg_ring_ready {
+    uint64_t window_id;
+    uint32_t slot;
+    uint32_t epoch;
+    int32_t  status;             /* 0 = write frames, negative = let the ring go */
+    uint32_t _pad;
 };
 
 /*

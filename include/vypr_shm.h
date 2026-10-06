@@ -1,40 +1,49 @@
 /*
- * vypr_shm.h - layout of the shared-memory region between the Windows guest
- *              and the Linux host. Included verbatim by both sides, so it must
- *              stay free of platform headers and free of anything C++-only.
+ * vypr_shm.h - the memory frames travel through between the Windows guest and
+ *              the Linux host. Included verbatim by both sides, so it must stay
+ *              free of platform headers and free of anything C++-only.
  *
- * The region is an IVSHMEM BAR: the same physical pages appear as a PCI device
- * to the guest and as a file under /dev/shm to the host. There is no kernel
- * mediating access, which is the point - a frame costs one memcpy and no
- * encode, no decode, and no network stack.
+ * Frames live in the guest's own RAM. The agent allocates each window's ring
+ * as locked physical pages (Windows' AWE API, which reports the physical page
+ * numbers it hands out) and tells the host which pages they are. QEMU keeps
+ * guest RAM in a shared memory file, so the host maps exactly those pages out
+ * of it. Nothing mediates access and no driver is involved on either side - a
+ * frame still costs one memcpy in the guest, and no encode, no decode, no
+ * network stack.
+ *
+ * This replaced an IVSHMEM device, which needed a third-party kernel driver in
+ * the guest just to map a PCI BAR into user space.
  *
  * Ownership rules, which the whole design leans on:
  *
- *   - The HOST owns allocation. It carves slots and rings out of the region and
- *     tells the guest the offsets over the TCP control channel. Neither side
- *     needs a shared allocator, and cross-OS atomic allocation is avoided
- *     entirely.
- *   - The GUEST owns frame contents. It is the only writer of pixel data and of
- *     each slot's publish record.
- *   - Nothing here is a security boundary. A hostile guest can scribble over
- *     the whole region; it already has a passthrough GPU.
+ *   - The GUEST owns ring memory. It allocates it, it frees it, and it is the
+ *     only writer of pixel data and of each ring's header and publish record.
+ *   - The HOST never writes guest memory, at all. Pages a dead agent left
+ *     behind go straight back to Windows, which may hand them to anything, so
+ *     a host store into one would corrupt some unrelated guest process. Every
+ *     host-side decision - which slots exist, where each ring lives - is kept
+ *     in a second, host-only region (struct vypr_shm_header below) and reaches
+ *     the guest over the TCP control channel.
+ *   - Nothing here is a security boundary. A hostile guest can publish
+ *     whatever it likes into its own rings; it already has a passthrough GPU.
+ *     The host checks what it reads so that a confused guest drops a frame
+ *     rather than walking a presenter off the end of a mapping.
  */
 #ifndef VYPR_SHM_H
 #define VYPR_SHM_H
 
 #include <stdint.h>
 
-#define VYPR_SHM_MAGIC      0x52505956u  /* 'VYPR' little-endian */
+#define VYPR_SHM_MAGIC      0x52505956u  /* 'VYPR' little-endian: host region */
+#define VYPR_RING_MAGIC     0x47525956u  /* 'VYRG': a guest ring's header page */
 
 /*
- * Bumped to 2 when the publish record grew its damage rectangles. The whole
- * record is a plain struct at a fixed offset read on both sides, so a size
- * change is a wire break: a host and guest that disagree must not talk, and the
- * version check in vypr_shm_open / Publisher::bind is what stops them. An old
- * guest paired with a new host, or the reverse, fails that check and refuses,
- * rather than reading the damage array at the wrong offset.
+ * Bumped to 3 when rings moved out of an IVSHMEM BAR and into guest RAM. The
+ * slot table, the ring header and the attach handshake all changed shape, so a
+ * host and guest that disagree must not talk; the version checks on both ends
+ * are what stop them.
  */
-#define VYPR_SHM_VERSION    2u
+#define VYPR_SHM_VERSION    3u
 
 /* Slots are windows. Sixteen is far past what a person keeps open from one VM,
  * and keeping it fixed lets the header be a plain struct at a known offset. */
@@ -48,31 +57,24 @@
  * the only one the first version speaks. */
 #define VYPR_FMT_BGRA8      1u
 
-enum vypr_slot_state {
-    VYPR_SLOT_FREE     = 0,  /* host may allocate it */
-    VYPR_SLOT_ARMED    = 1,  /* host allocated, guest has not published yet */
-    VYPR_SLOT_LIVE     = 2,  /* guest is publishing frames */
-    VYPR_SLOT_CLOSED   = 3,  /* guest window is gone; host reclaims */
-    VYPR_SLOT_RETIRING = 4   /* host dropped the window, waiting for the guest */
-};
+/* The page size both sides count in. x86 guests only ever hand out 4 KiB
+ * pages through AWE, so this is a fact rather than a tunable. */
+#define VYPR_PAGE_BYTES     4096u
 
 /*
- * RETIRING is the handshake that lets shared memory be reused.
- *
- * A publisher writes a whole frame into the ring *before* it publishes it, so
- * "the host stopped asking for this window" is not the same as "nothing is
- * writing to it": a 4K copy in flight lands wherever the ring used to be, long
- * after the host decided the window was gone. Handing that range to a new
- * window right then is how one window's pixels turn up in another's.
- *
- * So the host stores RETIRING instead of FREE and waits. The guest tears the
- * capture down, which drains any copy in flight, and only then stores CLOSED -
- * that store is the acknowledgement, and the range is not reusable until it
- * lands. A slot never goes ARMED again straight from RETIRING.
- *
- * An old guest never writes 4 and never reads a state it did not expect, so
- * adding this state does not break one; the layout is unchanged.
+ * The largest ring, in pages: 512 MiB, three frames of a 7680x4320 window with
+ * headroom. The host keeps one run per contiguous stretch of guest pages and
+ * sizes its table for the worst case, where no two pages are adjacent - which
+ * on a guest that has been running a while is close to what really happens.
  */
+#define VYPR_MAX_RING_PAGES (512u * 256u)
+
+enum vypr_slot_state {
+    VYPR_SLOT_FREE     = 0,  /* host may allocate it */
+    VYPR_SLOT_ARMED    = 1,  /* ATTACH sent; the guest's ring is not verified yet */
+    VYPR_SLOT_LIVE     = 2,  /* ring verified and described; presenters may map it */
+    VYPR_SLOT_CLOSED   = 3   /* window gone; any presenter still reading should stop */
+};
 
 /*
  * Publish record. The guest writes pixels into ring buffer `index`, then
@@ -138,33 +140,114 @@ struct vypr_publish {
 #define VYPR_PUB_DAMAGE_FULL     (1u << 1)
 #define VYPR_PUB_DAMAGE_RECTS    (1u << 2)
 
+/* ------------------------------------------------------------ guest-owned */
+
+/*
+ * What the agent writes into the first 32 bytes of every ring page, before it
+ * tells the host where the pages are.
+ *
+ * The host knows a page by the guest's physical address and has to turn that
+ * into an offset in QEMU's RAM file, which depends on how QEMU laid memory out
+ * around the 4 GiB hole. Rather than guess, the host reads every page back
+ * through its own translation and checks that each one says what it should: a
+ * wrong translation, a stale page list or a page shared between two rings all
+ * fail here, before anything is shown. The stamps are overwritten by the first
+ * frames, which is fine - the agent does not write a frame until the host has
+ * said it checked them.
+ */
+#define VYPR_PAGE_MAGIC 0x4547415052505956ull  /* 'VYPRPAGE' */
+
+struct vypr_page_stamp {
+    uint64_t magic;
+    uint64_t nonce;    /* this ring's, so a page from an earlier ring fails */
+    uint64_t index;    /* which page of the ring this is */
+    uint64_t pfn;      /* the guest's own idea of where the page is */
+};
+
+/*
+ * Page 0 of every ring, written only by the guest.
+ *
+ * The frames follow at `frame_offset`. The host has its own copy of every
+ * geometry field in the slot table and only trusts the two to agree: the slot
+ * table is what the host decided, this is what the guest says it is writing.
+ */
+#define VYPR_RING_HEADER_BYTES  VYPR_PAGE_BYTES
+
+enum vypr_ring_state {
+    VYPR_RING_READY  = 1,   /* header written, no frame yet */
+    VYPR_RING_LIVE   = 2,   /* at least one frame published */
+    VYPR_RING_CLOSED = 3    /* the capture is torn down; nothing more will come */
+};
+
+struct vypr_ring_header {
+    uint32_t magic;              /* VYPR_RING_MAGIC, stored last */
+    uint32_t version;            /* VYPR_SHM_VERSION */
+    uint64_t nonce;              /* matches the page stamps the host checked */
+    uint64_t window_id;
+    uint32_t slot;
+    uint32_t epoch;              /* the attach this ring answers */
+    uint64_t frame_offset;       /* bytes from ring start to buffer 0 */
+    uint64_t frame_bytes;        /* bytes per ring buffer */
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t frame_stride;
+    uint32_t format;
+    volatile uint32_t state;     /* enum vypr_ring_state */
+    uint32_t _pad;
+    struct vypr_publish pub;
+};
+
+/* -------------------------------------------------------------- host-only */
+
+/*
+ * One contiguous stretch of a ring, as an offset into the guest RAM file.
+ *
+ * Runs are in ring order: the first run's pages are the ring's first pages,
+ * and so on, so laying them end to end gives the ring exactly as the guest
+ * sees it in its own address space.
+ */
+struct vypr_ring_run {
+    uint64_t offset;   /* bytes into the guest RAM file */
+    uint64_t pages;
+};
+
 struct vypr_slot {
     volatile uint32_t state;     /* enum vypr_slot_state */
     uint32_t format;             /* VYPR_FMT_* */
     uint64_t window_id;          /* guest HWND, as an opaque identity */
 
-    /* Ring geometry, written by the host at allocation and read-only to the
-     * guest. `frame_stride` is the allocation pitch, which does not shrink when
-     * a window is resized smaller - that would mean reallocating mid-stream. */
-    uint64_t ring_offset;        /* byte offset from region base */
+    /* Ring geometry, decided by the host at allocation. `frame_stride` is the
+     * allocation pitch, which does not shrink when a window is resized smaller
+     * - that would mean reallocating mid-stream. */
     uint64_t frame_bytes;        /* bytes reserved per ring buffer */
     uint32_t max_width;
     uint32_t max_height;
     uint32_t frame_stride;
 
     /*
-     * Incremented by the host every time this slot index is handed out.
-     *
-     * Slot indices get recycled when a window closes, and the guest's publisher
-     * for the previous occupant may still be running - its next publish would
-     * otherwise promote the freshly armed slot to LIVE and scribble the old
-     * window's pixels into the new one's ring. The publisher records the epoch
-     * it bound at and stops the moment it stops matching.
+     * Incremented every time this slot index is handed out. The guest echoes
+     * it in its ring header, so a ring left over from the slot's previous
+     * occupant is told apart from the one this window asked for.
      */
     uint32_t epoch;
 
-    struct vypr_publish pub;
+    /*
+     * Where the guest put the ring, once vyprd has checked it.
+     *
+     * `ring_seq` is a seqlock over the fields below it and the run table, odd
+     * while vyprd is rewriting them. A presenter that maps a ring reads it
+     * before and after copying the runs out and starts again if it moved.
+     */
+    volatile uint32_t ring_seq;
+    uint32_t run_count;
+    uint64_t ring_nonce;
+    uint64_t ring_pages;
+    uint64_t runs_offset;        /* bytes from region start to this slot's runs */
 };
+
+/* Room in the host region for every slot's worst-case run table. Most of it is
+ * never touched, and an untouched page of a tmpfs file costs nothing. */
+#define VYPR_RUNS_PER_SLOT  VYPR_MAX_RING_PAGES
 
 struct vypr_shm_header {
     uint32_t magic;
@@ -173,8 +256,8 @@ struct vypr_shm_header {
     uint32_t slot_count;
     uint32_t _pad;
 
-    /* Bumped by the host every time it re-carves the region, so a guest that
-     * reconnects can tell its cached offsets are stale. */
+    /* Bumped by vyprd every time it formats the region, so a presenter left
+     * over from an earlier session can tell. */
     volatile uint32_t generation;
     uint32_t _pad2;
 
@@ -195,13 +278,28 @@ struct vypr_shm_header {
      * uncertainty instead of implying precision they do not have. */
     uint32_t offset_rtt_us;
 
+    /*
+     * Where the guest's RAM can be opened, for presenters to map rings out of.
+     *
+     * A path under /proc/<qemu pid>/fd: QEMU keeps guest RAM in an anonymous
+     * memfd, and that is the only name it has. `guest_ram_seq` changes whenever
+     * vyprd finds a different one - the VM restarted under a running session -
+     * so a presenter holding the old file knows to let go of it.
+     */
+    volatile uint32_t guest_ram_seq;
+    uint32_t _pad3;
+    char     guest_ram_path[96];
+    uint64_t guest_ram_bytes;
+
     struct vypr_slot slots[VYPR_MAX_SLOTS];
 };
 
-/* Pixel data starts after the header, rounded up to a page so that ring buffers
- * are page-aligned and a memcpy out of one does not straddle needlessly. */
+/* The run tables start after the header, rounded up to a page. */
 #define VYPR_DATA_ALIGN     4096u
 #define VYPR_HEADER_BYTES   ((sizeof(struct vypr_shm_header) + VYPR_DATA_ALIGN - 1) \
                              & ~(uint64_t)(VYPR_DATA_ALIGN - 1))
+#define VYPR_HOST_REGION_BYTES \
+    (VYPR_HEADER_BYTES + (uint64_t)VYPR_MAX_SLOTS * VYPR_RUNS_PER_SLOT * \
+                         sizeof(struct vypr_ring_run))
 
 #endif /* VYPR_SHM_H */

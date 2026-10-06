@@ -39,6 +39,7 @@
 struct vk_import {
     const uint8_t  *base;
     uint64_t        bytes;
+    uint64_t        id;      /* the ring's nonce: a new ring can reuse an old address */
     VkBuffer        buf;
     VkDeviceMemory  mem;
 };
@@ -405,12 +406,12 @@ static const struct vk_import *import_ring(struct vk_shared *sh, const struct vy
     const uint8_t *lo = f->ring, *hi = f->ring + f->ring_bytes;
     for (int i = 0; i < sh->import_count; i++) {
         const struct vk_import *im = &sh->imports[i];
-        if (im->base == lo && im->bytes == f->ring_bytes) return im;
+        if (im->base == lo && im->bytes == f->ring_bytes && im->id == f->ring_id) return im;
     }
 
     if (((uintptr_t)lo % sh->import_align) || (f->ring_bytes % sh->import_align)) return NULL;
 
-    /* A ring the host re-carved: whatever overlaps it is stale. */
+    /* A ring mapped where an old one was: whatever overlaps it is stale. */
     for (int i = 0; i < sh->import_count; ) {
         const struct vk_import *im = &sh->imports[i];
         if (im->base < hi && lo < im->base + im->bytes) import_drop(sh, i);
@@ -425,7 +426,7 @@ static const struct vk_import *import_ring(struct vk_shared *sh, const struct vy
                                lo, &hpp) != VK_SUCCESS || !hpp.memoryTypeBits)
         return NULL;
 
-    struct vk_import im = { .base = lo, .bytes = f->ring_bytes };
+    struct vk_import im = { .base = lo, .bytes = f->ring_bytes, .id = f->ring_id };
     VkExternalMemoryBufferCreateInfo ebi = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,

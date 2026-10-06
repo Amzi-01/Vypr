@@ -6,8 +6,10 @@
 // unproven after this is only capture, mapping and input - not the frame
 // handoff, which is the part that fails subtly rather than loudly.
 //
-// It plays both roles: the host's allocator carves the slot, then the guest's
-// Publisher fills it.
+// Guest RAM is a sparse file laid out like a q35 guest's (see fake_ram.h), so
+// with --connect the whole v3 handshake runs for real: the ring's pages are
+// allocated scattered, stamped, sent, checked by vyprd, and only then written.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -20,8 +22,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <vector>
+
+#include "fake_ram.h"
 #include "publisher.hpp"
 extern "C" {
+#include "guest_ram.h"
 #include "msg.h"
 #include "shm.h"
 }
@@ -78,8 +84,29 @@ static void draw_block_rect(std::uint8_t* dst, std::uint32_t stride,
 // attached, publish into whatever slot the daemon assigns, and report the input
 // that comes back. This exercises vyprd, slot allocation, client spawning and
 // the input return path without a VM.
+// One ring, owned the way the agent owns its own: allocated on ATTACH, written
+// only after RING_READY, freed on DETACH.
+struct TestRing {
+    fake_ram*                  ram = nullptr;
+    void*                      base = nullptr;
+    std::uint32_t              pages = 0;
+    std::vector<std::uint64_t> pfns;
+    std::uint64_t              nonce = 0;
+    vypr_msg_attach            at{};
+
+    void release() {
+        if (base) fake_ram_free(ram, base, pages, pfns.data());
+        base = nullptr;
+        pages = 0;
+    }
+};
+
+// --bad-ring: spoil one page's stamp before sending, to prove the host refuses
+// a ring it cannot verify and that both ends recover from it.
+static bool g_bad_ring = false;
+
 static int run_connected(const std::string& host, std::uint16_t port,
-                         const std::string& shm_path, const std::string& title,
+                         const std::string& ram_path, const std::string& title,
                          std::uint32_t w, std::uint32_t h, std::uint32_t fps) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { std::perror("socket"); return 1; }
@@ -97,15 +124,15 @@ static int run_connected(const std::string& host, std::uint16_t port,
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    // Open the mapping before announcing, so HELLO can report its real size -
-    // the daemon formatted the region before it started listening.
-    struct vypr_shm shm;
-    if (vypr_shm_open(&shm, shm_path.c_str(), 0) < 0) return 1;
+    // Point vyprd at the same file with --guest-ram.
+    fake_ram ram{};
+    if (fake_ram_open(&ram, ram_path.c_str(), 3ull << 30, 2ull << 30) < 0) return 1;
+    TestRing ring;
+    ring.ram = &ram;
 
     vypr_msg_hello hello{};
     hello.version   = VYPR_PROTO_VERSION;
     hello.qpc_freq  = 1000000000ull;
-    hello.shm_bytes = shm.bytes;
     hello.agent_pid = (std::uint32_t)getpid();
     hello.capabilities = VYPR_CAP_RESIZE;
     msg_send(fd, VYPR_MSG_HELLO, &hello, sizeof(hello));
@@ -161,21 +188,65 @@ static int run_connected(const std::string& host, std::uint16_t port,
                     vypr_msg_attach_result res{};
                     res.window_id = at->window_id;
                     res.slot      = at->slot;
-                    if (pub.bind(shm.base, shm.bytes, at->slot)) {
-                        res.status = 0;
+
+                    ring.release();
+                    ring.at    = *at;
+                    ring.pages = (std::uint32_t)(vypr_ring_bytes(at->frame_bytes) / VYPR_PAGE_BYTES);
+                    ring.pfns.assign(ring.pages, 0);
+                    ring.base  = fake_ram_alloc(&ram, ring.pages, ring.pfns.data());
+                    if (!ring.base) {
+                        ring.pages = 0;
+                        res.status = VYPR_ATTACH_NO_MEMORY;
+                        msg_send(fd, VYPR_MSG_ATTACH_RESULT, &res, sizeof(res));
+                        break;
+                    }
+                    ring.nonce = now_ns() ^ ((std::uint64_t)getpid() << 32);
+                    vypr::stamp_pages(ring.base, ring.pages, ring.pfns.data(), ring.nonce);
+                    if (g_bad_ring)
+                        static_cast<std::uint8_t*>(ring.base)[(ring.pages / 2) * VYPR_PAGE_BYTES + 16] ^= 1;
+
+                    std::vector<std::uint8_t> m(VYPR_MAX_MSG_BYTES);
+                    for (std::uint32_t first = 0; first < ring.pages; ) {
+                        const std::uint32_t n = std::min<std::uint32_t>(VYPR_RING_PAGES_PER_MSG,
+                                                                        ring.pages - first);
+                        vypr_msg_ring_pages rp{};
+                        rp.window_id   = at->window_id;
+                        rp.slot        = at->slot;
+                        rp.epoch       = at->generation;
+                        rp.nonce       = ring.nonce;
+                        rp.total_pages = ring.pages;
+                        rp.first       = first;
+                        rp.count       = n;
+                        std::memcpy(m.data(), &rp, sizeof(rp));
+                        std::memcpy(m.data() + sizeof(rp), ring.pfns.data() + first, n * 8u);
+                        msg_send(fd, VYPR_MSG_RING_PAGES, m.data(), (std::uint32_t)(sizeof(rp) + n * 8u));
+                        first += n;
+                    }
+                    res.status = 0;
+                    msg_send(fd, VYPR_MSG_ATTACH_RESULT, &res, sizeof(res));
+                    std::fprintf(stderr, "vypr-testagent: ring of %u pages sent for slot %u\n",
+                                 ring.pages, at->slot);
+                    break;
+                }
+                case VYPR_MSG_RING_READY: {
+                    if (head.bytes < sizeof(vypr_msg_ring_ready)) break;
+                    auto* rr = (const vypr_msg_ring_ready*)payload;
+                    if (!ring.base || rr->window_id != ring.at.window_id) break;
+                    if (rr->status != 0) {
+                        std::fprintf(stderr, "vypr-testagent: host rejected the ring (%d)\n", rr->status);
+                        ring.release();
+                        break;
+                    }
+                    if (pub.bind(ring.base, (std::size_t)ring.pages * VYPR_PAGE_BYTES, ring.at, ring.nonce)) {
                         streaming = true;
-                        damage_on = (at->flags & VYPR_ATTACH_DAMAGE) != 0;
+                        damage_on = (ring.at.flags & VYPR_ATTACH_DAMAGE) != 0;
                         prev_bx = prev_by = 0;
                         next = now_ns();
                         std::fprintf(stderr,
-                            "vypr-testagent: attached to slot %u (%ux%u max)%s\n",
-                            at->slot, pub.max_width(), pub.max_height(),
+                            "vypr-testagent: streaming into slot %u (%ux%u max)%s\n",
+                            ring.at.slot, pub.max_width(), pub.max_height(),
                             damage_on ? ", damage on" : "");
-                    } else {
-                        res.status = -2;
-                        std::fprintf(stderr, "vypr-testagent: bind failed\n");
                     }
-                    msg_send(fd, VYPR_MSG_ATTACH_RESULT, &res, sizeof(res));
                     break;
                 }
                 case VYPR_MSG_POINTER: {
@@ -212,6 +283,7 @@ static int run_connected(const std::string& host, std::uint16_t port,
                     std::fprintf(stderr, "vypr-testagent: detached\n");
                     streaming = false;
                     pub.close();
+                    ring.release();
                     break;
                 default:
                     break;
@@ -252,14 +324,16 @@ static int run_connected(const std::string& host, std::uint16_t port,
     std::fprintf(stderr, "\nvypr-testagent: %u frames, %llu input events\n",
                  pub.serial(), (unsigned long long)input_events);
     pub.close();
+    ring.release();
+    fake_ram_close(&ram);
     msg_reader_free(&rx);
-    vypr_shm_close(&shm);
     close(fd);
     return 0;
 }
 
 int main(int argc, char** argv) {
-    std::string path = "/dev/shm/vypr-test";
+    std::string path = "/dev/shm/vypr-test-host";
+    std::string ram_path = "/dev/shm/vypr-test-ram";
     std::string connect_host, title = "vypr test window";
     std::uint16_t port = VYPR_CONTROL_PORT;
     std::uint32_t w = 1280, h = 720, fps = 60;
@@ -267,16 +341,19 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--shm" && i + 1 < argc)       path = argv[++i];
+        else if (a == "--guest-ram" && i + 1 < argc) ram_path = argv[++i];
         else if (a == "--size" && i + 1 < argc) std::sscanf(argv[++i], "%ux%u", &w, &h);
         else if (a == "--fps" && i + 1 < argc)  fps = (std::uint32_t)std::atoi(argv[++i]);
         else if (a == "--connect" && i + 1 < argc) connect_host = argv[++i];
         else if (a == "--port" && i + 1 < argc) port = (std::uint16_t)std::atoi(argv[++i]);
         else if (a == "--title" && i + 1 < argc) title = argv[++i];
+        else if (a == "--bad-ring") g_bad_ring = true;
         else {
-            std::fputs("usage: vypr-testagent [--shm PATH] [--size WxH] [--fps N]\n"
+            std::fputs("usage: vypr-testagent [--shm PATH] [--guest-ram PATH] [--size WxH] [--fps N]\n"
                        "                      [--connect HOST [--port N] [--title T]]\n"
-                       "\nWithout --connect it formats the region and publishes standalone.\n"
-                       "With --connect it behaves like the guest agent against vyprd.\n", stderr);
+                       "\nWithout --connect it formats the slot table and publishes standalone.\n"
+                       "With --connect it behaves like the guest agent against vyprd, which\n"
+                       "must be started with --guest-ram pointing at the same file.\n", stderr);
             return 2;
         }
     }
@@ -285,32 +362,53 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
 
     if (!connect_host.empty())
-        return run_connected(connect_host, port, path, title, w, h, fps);
+        return run_connected(connect_host, port, ram_path, title, w, h, fps);
 
-    int fd = open(path.c_str(), O_RDWR | O_CREAT, 0600);
-    if (fd < 0) { std::perror("open"); return 1; }
-    struct stat st{};
-    if (fstat(fd, &st) == 0 && st.st_size < 256ll * 1024 * 1024)
-        if (ftruncate(fd, 256ll * 1024 * 1024) < 0) { std::perror("ftruncate"); return 1; }
-    close(fd);
-
-    // Host half: format and carve.
+    // Host half: format and pick a slot.
     struct vypr_shm shm;
     if (vypr_shm_open(&shm, path.c_str(), 1) < 0) return 1;
 
+    const std::uint64_t window_id = 0x5a5480000001ull;
     struct vypr_msg_attach at;
-    if (vypr_shm_alloc(&shm, 0x5a5480000001ull, w, h, &at) < 0) return 1;
+    if (vypr_shm_alloc(&shm, window_id, w, h, &at) < 0) return 1;
 
-    // Guest half: bind and publish, exactly as the Windows agent will.
+    // Guest half: a ring of scattered pages, stamped.
+    fake_ram ram{};
+    if (fake_ram_open(&ram, ram_path.c_str(), 3ull << 30, 2ull << 30) < 0) return 1;
+    TestRing ring;
+    ring.ram   = &ram;
+    ring.at    = at;
+    ring.pages = (std::uint32_t)(vypr_ring_bytes(at.frame_bytes) / VYPR_PAGE_BYTES);
+    ring.pfns.assign(ring.pages, 0);
+    ring.base  = fake_ram_alloc(&ram, ring.pages, ring.pfns.data());
+    if (!ring.base) { std::fputs("vypr-testagent: out of fake guest RAM\n", stderr); return 1; }
+    ring.nonce = now_ns() ^ ((std::uint64_t)getpid() << 32);
+    vypr::stamp_pages(ring.base, ring.pages, ring.pfns.data(), ring.nonce);
+
+    // Host half again: check every page, as vyprd does, and describe the ring.
+    vypr_guest_ram gram{};
+    char why[256] = "";
+    std::vector<vypr_ring_run> runs(ring.pages);
+    if (vypr_guest_ram_open(&gram, ram_path.c_str(), why, sizeof(why)) < 0) {
+        std::fprintf(stderr, "vypr-testagent: %s\n", why);
+        return 1;
+    }
+    const int run_count = vypr_guest_ram_verify(&gram, ring.pfns.data(), ring.pages, ring.nonce,
+                                                runs.data(), ring.pages, why, sizeof(why));
+    if (run_count < 0) { std::fprintf(stderr, "vypr-testagent: ring check failed: %s\n", why); return 1; }
+    vypr_shm_set_guest_ram(&shm, ram_path.c_str(), ram.bytes);
+    vypr_shm_set_ring(&shm, at.slot, runs.data(), (std::uint32_t)run_count, ring.nonce, ring.pages);
+
+    // Guest half: bind and publish, exactly as the Windows agent does.
     vypr::Publisher pub;
-    if (!pub.bind(shm.base, shm.bytes, at.slot)) {
+    if (!pub.bind(ring.base, (std::size_t)ring.pages * VYPR_PAGE_BYTES, at, ring.nonce)) {
         std::fprintf(stderr, "vypr-testagent: bind failed for slot %u\n", at.slot);
         return 1;
     }
 
     std::printf("vypr-testagent: slot %u, %ux%u, stride %u\n", at.slot, w, h, pub.stride());
-    std::printf("present it with:  ./build/vypr-window --shm %s --slot %u --stats\n",
-                path.c_str(), at.slot);
+    std::printf("present it with:  ./build/vypr-window --shm %s --slot %u --window-id %llu --stats\n",
+                path.c_str(), at.slot, (unsigned long long)window_id);
 
     const std::uint64_t period = 1000000000ull / (fps ? fps : 60);
     std::uint64_t next = now_ns();
@@ -344,6 +442,10 @@ int main(int argc, char** argv) {
 
     std::printf("\nvypr-testagent: published %u frames\n", pub.serial());
     pub.close();
+    vypr_shm_free(&shm, at.slot);
+    ring.release();
+    fake_ram_close(&ram);
+    vypr_guest_ram_close(&gram);
     vypr_shm_close(&shm);
     return 0;
 }

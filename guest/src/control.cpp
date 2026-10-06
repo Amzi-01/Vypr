@@ -69,6 +69,8 @@ bool Control::send(std::uint16_t type, const void* payload, std::uint32_t bytes)
     std::memcpy(buf.data(), &head, sizeof(head));
     if (bytes) std::memcpy(buf.data() + sizeof(head), payload, bytes);
 
+    std::lock_guard<std::mutex> guard(send_lock_);
+    if (sock_ == ~0ull) return false;
     const char* p = reinterpret_cast<const char*>(buf.data());
     int left = static_cast<int>(buf.size());
     while (left > 0) {

@@ -8,7 +8,9 @@
  * is verified against it.
  *
  * It also means the entire host side can be developed and proven with the VM
- * powered off.
+ * powered off. Guest RAM is a sparse file laid out like a q35 guest's (see
+ * fake_ram.h), and the ring goes through the same page check vyprd does, so a
+ * presenter reading it takes exactly the path it takes against a real VM.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -23,6 +25,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fake_ram.h"
+#include "guest_ram.h"
 #include "shm.h"
 
 static volatile sig_atomic_t stop = 0;
@@ -33,20 +37,6 @@ static uint64_t now_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-/* Create the backing file when it does not exist, so the host side can be
- * exercised without the VM's IVSHMEM device present. */
-static int ensure_region(const char *path, size_t bytes)
-{
-    int fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) { perror("open"); return -1; }
-    struct stat st;
-    if (fstat(fd, &st) == 0 && (size_t)st.st_size < bytes) {
-        if (ftruncate(fd, (off_t)bytes) < 0) { perror("ftruncate"); close(fd); return -1; }
-    }
-    close(fd);
-    return 0;
 }
 
 static void draw(uint8_t *dst, uint32_t w, uint32_t h, uint32_t stride, uint32_t frame)
@@ -98,18 +88,19 @@ static void draw_block_rect(uint8_t *dst, uint32_t stride,
 
 int main(int argc, char **argv)
 {
-    const char *path = "/dev/shm/vypr-test";
+    const char *path = "/dev/shm/vypr-test-host";
+    const char *ram_path = "/dev/shm/vypr-test-ram";
     uint32_t w = 1280, h = 720, fps = 60;
     int damage = 0;
-    size_t region = 256u * 1024u * 1024u;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shm") && i + 1 < argc)        path = argv[++i];
+        else if (!strcmp(argv[i], "--guest-ram") && i + 1 < argc) ram_path = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc)  { sscanf(argv[++i], "%ux%u", &w, &h); }
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc)   fps = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--damage"))                damage = 1;
         else {
-            fputs("usage: vypr-testsrc [--shm PATH] [--size WxH] [--fps N] [--damage]\n", stderr);
+            fputs("usage: vypr-testsrc [--shm PATH] [--guest-ram PATH] [--size WxH] [--fps N] [--damage]\n", stderr);
             return 2;
         }
     }
@@ -117,19 +108,46 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    if (ensure_region(path, region) < 0) return 1;
-
     struct vypr_shm shm;
     if (vypr_shm_open(&shm, path, 1) < 0) return 1;
 
+    const uint64_t window_id = 0xdeadbeef;
     struct vypr_msg_attach at;
-    if (vypr_shm_alloc(&shm, 0xdeadbeef, w, h, &at) < 0) return 1;
-
+    if (vypr_shm_alloc(&shm, window_id, w, h, &at) < 0) return 1;
     struct vypr_slot *slot = &shm.hdr->slots[at.slot];
-    printf("vypr-testsrc: slot %u, %ux%u, ring at +%" PRIu64 ", %.1f MiB/frame\n",
-           at.slot, w, h, at.ring_offset, at.frame_bytes / 1048576.0);
-    printf("present it with:  ./build/vypr-window --shm %s --slot %u --stats\n",
-           path, at.slot);
+
+    /* The guest's half: a ring of scattered pages, each stamped. */
+    struct fake_ram ram;
+    if (fake_ram_open(&ram, ram_path, 3ull << 30, 2ull << 30) < 0) return 1;
+    const uint32_t pages = (uint32_t)(vypr_ring_bytes(at.frame_bytes) / VYPR_PAGE_BYTES);
+    uint64_t *pfns = malloc((size_t)pages * sizeof(*pfns));
+    uint8_t *ring_mem = pfns ? fake_ram_alloc(&ram, pages, pfns) : NULL;
+    if (!ring_mem) { fputs("vypr-testsrc: out of fake guest RAM\n", stderr); return 1; }
+    const uint64_t nonce = now_ns() ^ ((uint64_t)getpid() << 32);
+    for (uint32_t i = 0; i < pages; i++) {
+        struct vypr_page_stamp st = { VYPR_PAGE_MAGIC, nonce, i, pfns[i] };
+        memcpy(ring_mem + (size_t)i * VYPR_PAGE_BYTES, &st, sizeof(st));
+    }
+
+    /* The daemon's half: check every page and describe the ring. */
+    struct vypr_guest_ram gram;
+    struct vypr_ring_run *runs = malloc((size_t)pages * sizeof(*runs));
+    char why[256];
+    if (!runs || vypr_guest_ram_open(&gram, ram_path, why, sizeof(why)) < 0) {
+        fprintf(stderr, "vypr-testsrc: %s\n", why);
+        return 1;
+    }
+    const int run_count = vypr_guest_ram_verify(&gram, pfns, pages, nonce, runs, pages,
+                                                why, sizeof(why));
+    if (run_count < 0) { fprintf(stderr, "vypr-testsrc: ring check failed: %s\n", why); return 1; }
+    vypr_shm_set_guest_ram(&shm, ram_path, ram.bytes);
+    vypr_shm_set_ring(&shm, at.slot, runs, (uint32_t)run_count, nonce, pages);
+
+    printf("vypr-testsrc: slot %u, %ux%u, ring %.1f MiB in %d pieces, %.1f MiB/frame\n",
+           at.slot, w, h, pages * (double)VYPR_PAGE_BYTES / 1048576.0, run_count,
+           at.frame_bytes / 1048576.0);
+    printf("present it with:  ./build/vypr-window --shm %s --slot %u --window-id %" PRIu64 " --stats\n",
+           path, at.slot, window_id);
 
     /* This source stamps frames with the host's own monotonic clock, so the
      * guest-to-host offset the daemon normally measures is exactly zero.
@@ -140,9 +158,25 @@ int main(int argc, char **argv)
     shm.hdr->offset_rtt_us   = 0;
     __atomic_store_n(&shm.hdr->offset_valid, 1u, __ATOMIC_RELEASE);
 
-    __atomic_store_n(&slot->state, (uint32_t)VYPR_SLOT_LIVE, __ATOMIC_RELEASE);
+    /* The ring header, magic last - what a presenter waits for. */
+    struct vypr_ring_header *rh = (struct vypr_ring_header *)ring_mem;
+    memset(rh, 0, sizeof(*rh));
+    rh->version      = VYPR_SHM_VERSION;
+    rh->nonce        = nonce;
+    rh->window_id    = window_id;
+    rh->slot         = at.slot;
+    rh->epoch        = at.generation;
+    rh->frame_offset = VYPR_RING_HEADER_BYTES;
+    rh->frame_bytes  = at.frame_bytes;
+    rh->max_width    = at.max_width;
+    rh->max_height   = at.max_height;
+    rh->frame_stride = at.frame_stride;
+    rh->format       = at.format;
+    rh->state        = VYPR_RING_READY;
+    __atomic_store_n(&rh->magic, VYPR_RING_MAGIC, __ATOMIC_RELEASE);
 
-    uint8_t *ring = (uint8_t *)shm.base + slot->ring_offset;
+    uint8_t *ring = ring_mem + VYPR_RING_HEADER_BYTES;
+    struct vypr_publish *pub = &rh->pub;
     uint32_t serial = 0, index = 0;
     uint64_t period = 1000000000ull / (fps ? fps : 60);
     uint64_t next = now_ns();
@@ -184,28 +218,28 @@ int main(int argc, char **argv)
         /* Publish. Odd seq marks the record unstable, the fields are written
          * inside that window, and the even store releases it. The host retries
          * on a torn read rather than locking. */
-        uint32_t seq = slot->pub.seq;
-        __atomic_store_n(&slot->pub.seq, seq + 1, __ATOMIC_RELAXED);
+        uint32_t seq = pub->seq;
+        __atomic_store_n(&pub->seq, seq + 1, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_RELEASE);
 
-        slot->pub.index            = index;
-        slot->pub.serial           = ++serial;
-        slot->pub.width            = w;
-        slot->pub.height           = h;
-        slot->pub.stride           = slot->frame_stride;
-        slot->pub.capture_qpc      = now_ns();
-        slot->pub.capture_qpc_freq = 1000000000ull;
+        pub->index            = index;
+        pub->serial           = ++serial;
+        pub->width            = w;
+        pub->height           = h;
+        pub->stride           = slot->frame_stride;
+        pub->capture_qpc      = now_ns();
+        pub->capture_qpc_freq = 1000000000ull;
         if (partial) {
-            slot->pub.flags          = VYPR_PUB_DAMAGE_RECTS;
-            slot->pub.damage_count   = 1;
-            slot->pub.damage[0]      = (struct vypr_rect){ dmg_x, dmg_y, dmg_w, dmg_h };
+            pub->flags          = VYPR_PUB_DAMAGE_RECTS;
+            pub->damage_count   = 1;
+            pub->damage[0]      = (struct vypr_rect){ dmg_x, dmg_y, dmg_w, dmg_h };
         } else {
-            slot->pub.flags          = VYPR_PUB_DAMAGE_FULL;
-            slot->pub.damage_count   = 0;
+            pub->flags          = VYPR_PUB_DAMAGE_FULL;
+            pub->damage_count   = 0;
         }
 
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        __atomic_store_n(&slot->pub.seq, seq + 2, __ATOMIC_RELEASE);
+        __atomic_store_n(&pub->seq, seq + 2, __ATOMIC_RELEASE);
 
         index = (index + 1) % VYPR_RING_FRAMES;
 
@@ -220,8 +254,14 @@ int main(int argc, char **argv)
         }
     }
 
-    __atomic_store_n(&slot->state, (uint32_t)VYPR_SLOT_CLOSED, __ATOMIC_RELEASE);
+    vypr_shm_free(&shm, at.slot);
+    rh->state = VYPR_RING_CLOSED;
     printf("\nvypr-testsrc: published %u frames\n", serial);
+    fake_ram_free(&ram, ring_mem, pages, pfns);
+    fake_ram_close(&ram);
+    vypr_guest_ram_close(&gram);
+    free(runs);
+    free(pfns);
     vypr_shm_close(&shm);
     return 0;
 }

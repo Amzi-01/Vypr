@@ -6,38 +6,20 @@
 #include "vypr_shm.h"
 #include "vypr_proto.h"
 
-/* A range returned to the pool when a window went away. */
-struct vypr_free_range {
-    uint64_t offset;
-    uint64_t bytes;
-};
-
 /*
- * A range whose window is gone but whose writer might not be.
+ * One slot's ring, mapped out of guest RAM by a presenter.
  *
- * It is not reusable yet - see VYPR_SLOT_RETIRING in vypr_shm.h for why the
- * guest has to say so first.
+ * The guest's pages are scattered, so the ring is put back together here: a
+ * reserved stretch of address space with each run of pages mapped into its
+ * place. That makes it one contiguous range again, which is what lets the
+ * Vulkan presenter hand the whole ring to the GPU in one import.
  */
-struct vypr_pending_range {
-    uint64_t offset;
-    uint64_t bytes;
-    uint32_t slot;
-    uint64_t since_ns;    /* when the wait started, for the give-up deadline */
-    int      forfeited;   /* waited too long: slot recycled, range held back */
-};
-
-#define VYPR_MAX_FREE_RANGES    64
-#define VYPR_MAX_PENDING_RANGES 64
-
-/* How long to wait for the guest's acknowledgement before giving up on a
- * range. A guest that is answering at all acknowledges within a round trip;
- * this is long enough that only a wedged one hits it. */
-#define VYPR_RETIRE_TIMEOUT_NS (2000ull * 1000000ull)
-
-/* Whether anything in the guest could still be writing into a slot's ring. */
-enum vypr_writer {
-    VYPR_WRITER_NONE  = 0,  /* the guest was never told to attach, or refused */
-    VYPR_WRITER_MAYBE = 1   /* ATTACH went out; wait for the guest to finish */
+struct vypr_ring_map {
+    uint8_t  *base;
+    uint64_t  bytes;
+    uint32_t  ring_seq;      /* the slot's ring_seq when this was mapped */
+    uint64_t  nonce;
+    uint64_t  window_id;
 };
 
 struct vypr_shm {
@@ -45,15 +27,17 @@ struct vypr_shm {
     void     *base;
     size_t    bytes;
     struct vypr_shm_header *hdr;
-    uint64_t  alloc_cursor;   /* bump allocator position, host-private */
 
-    struct vypr_free_range freed[VYPR_MAX_FREE_RANGES];
-    int                    freed_count;
+    /* Presenter side: the guest RAM file and the rings mapped out of it. */
+    int       ram_fd;
+    uint32_t  ram_seq;
+    uint64_t  ram_bytes;
+    struct vypr_ring_map rings[VYPR_MAX_SLOTS];
 
-    struct vypr_pending_range pending[VYPR_MAX_PENDING_RANGES];
-    int                       pending_count;
-
-    uint64_t lost_bytes;      /* forfeited or spilled, for the failure message */
+    /* A ring that could not be mapped, by its ring_seq (+1, so zero means
+     * none). Not retried until the daemon describes a different ring: each try
+     * is tens of thousands of mmap calls, and the presenter asks every frame. */
+    uint32_t  map_failed[VYPR_MAX_SLOTS];
 };
 
 /* A borrowed view of the newest frame. Valid until the next acquire on the same
@@ -65,6 +49,9 @@ struct vypr_frame_view {
      * have the GPU read every later frame straight out of it. */
     const uint8_t *ring;
     uint64_t ring_bytes;
+    /* Which ring that is. A new ring can be mapped at the address an old one
+     * used, so the address alone does not say whether an import is current. */
+    uint64_t ring_id;
     uint32_t width, height, stride;
     uint32_t serial;
     uint64_t capture_qpc, capture_qpc_freq;
@@ -84,37 +71,43 @@ struct vypr_frame_view {
     struct vypr_rect damage[VYPR_MAX_DAMAGE_RECTS];
 };
 
-/* `format` on open: 1 to write a fresh header (the host is starting a session),
- * 0 to attach to a region a running session already carved. */
+/* `format` on open: 1 to create and format the region (the daemon is starting
+ * a session), 0 to attach to one a running session already formatted. */
 int  vypr_shm_open(struct vypr_shm *s, const char *path, int format);
 void vypr_shm_close(struct vypr_shm *s);
 
-/* Carve a slot and a ring big enough for max_w x max_h, and fill `out` with the
- * attach message to hand the guest. Returns 0, or -1 if the region is full. */
+/* Daemon: pick a free slot and decide a ring geometry big enough for
+ * max_w x max_h, and fill `out` with the ATTACH to send. Returns 0, or -1 if
+ * every slot is in use. */
 int  vypr_shm_alloc(struct vypr_shm *s, uint64_t window_id,
                     uint32_t max_w, uint32_t max_h, struct vypr_msg_attach *out);
 
-/*
- * Give a slot up. `writer` says whether the guest could still be writing into
- * it: with VYPR_WRITER_MAYBE the slot goes to RETIRING and neither it nor its
- * range comes back until vypr_shm_reap() sees the guest acknowledge.
- */
-void vypr_shm_free(struct vypr_shm *s, uint32_t slot, enum vypr_writer writer);
+/* Daemon: give a slot up. Presenters still reading it see CLOSED and stop. */
+void vypr_shm_free(struct vypr_shm *s, uint32_t slot);
 
-/* Collect ranges whose guest has acknowledged. Call it from the event loop;
- * returns how many slots came back. */
-int  vypr_shm_reap(struct vypr_shm *s);
+/* Daemon: describe a slot's ring, already verified, and make the slot live. */
+int  vypr_shm_set_ring(struct vypr_shm *s, uint32_t slot,
+                       const struct vypr_ring_run *runs, uint32_t run_count,
+                       uint64_t nonce, uint64_t pages);
 
-/* The agent is gone, so nothing in the guest can be writing: take everything
- * back at once, including ranges an earlier reap had given up on. */
-void vypr_shm_reap_all(struct vypr_shm *s);
+/* Daemon: say where guest RAM is, for presenters to open. */
+void vypr_shm_set_guest_ram(struct vypr_shm *s, const char *path, uint64_t bytes);
 
-/* 0 on success, -1 if the slot is not live, -2 if no new frame since `since`. */
-int  vypr_shm_acquire(struct vypr_shm *s, uint32_t slot, uint32_t since,
-                      struct vypr_frame_view *out);
+/* Presenter: the newest frame of `window_id`'s ring in `slot`. 0 on success,
+ * -1 if the slot is not live for that window, -2 if no new frame since
+ * `since` (or none yet). */
+int  vypr_shm_acquire(struct vypr_shm *s, uint32_t slot, uint64_t window_id,
+                      uint32_t since, struct vypr_frame_view *out);
 
-/* Current state of a slot, read with acquire ordering. Returns VYPR_SLOT_FREE
- * for an out-of-range index. */
-uint32_t vypr_slot_state(struct vypr_shm *s, uint32_t slot);
+/* Current state of a slot as far as `window_id` is concerned, read with
+ * acquire ordering. A slot that now belongs to another window reads CLOSED. */
+uint32_t vypr_slot_state(struct vypr_shm *s, uint32_t slot, uint64_t window_id);
+
+/* Bytes a ring for this geometry takes in the guest: the header page and the
+ * buffers. Both ends compute it, and both must agree. */
+static inline uint64_t vypr_ring_bytes(uint64_t frame_bytes)
+{
+    return VYPR_RING_HEADER_BYTES + frame_bytes * VYPR_RING_FRAMES;
+}
 
 #endif

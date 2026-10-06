@@ -19,7 +19,7 @@ add_executable(vypr-agent
     src/capture.cpp
     src/control.cpp
     src/input.cpp
-    src/ivshmem.cpp
+    src/awe.cpp
     src/publisher.cpp
     src/clipboard.cpp
     src/drop.cpp

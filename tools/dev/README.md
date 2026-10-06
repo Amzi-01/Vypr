@@ -13,11 +13,11 @@ read, and there is no generator to argue with.
 
 ## Restarting the agent
 
-**Stop `vyprd` and let the agent exit on its own.** Do not `taskkill` it: the
-IVSHMEM driver does not clean up after a TerminateProcess, and the process
-becomes an unkillable zombie still holding the shared-memory device. Nothing
-can map the region after that, `Disable-PnpDevice` on it fails, and only a
-guest reboot clears it. This has cost two reboots.
+**Stop `vyprd` and let the agent exit on its own.** It stops its captures and
+gives its rings back in order that way. Killing it is no longer the disaster it
+was under IVSHMEM, whose driver left an unkillable process holding the device:
+Windows takes a dead agent's locked pages back by itself, and vyprd stops
+reading the moment the link drops. It is simply untidier.
 
     pkill -x vyprd        # the agent exits within a few seconds
     ./gssh 'schtasks /end /tn vypr-agent'    # if it is being stubborn

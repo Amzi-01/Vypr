@@ -20,6 +20,7 @@
 #include <d3d11_4.h>
 #include <immintrin.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -53,6 +54,53 @@ using namespace winrt::Windows::Graphics::DirectX;
 using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 
 namespace vypr {
+
+namespace {
+
+/* QPC now, in the 100 ns ticks WGC's SystemRelativeTime is counted in. */
+std::int64_t qpc_100ns(std::uint64_t freq) {
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    const auto f = static_cast<std::int64_t>(freq ? freq : 10000000ull);
+    return (q.QuadPart / f) * 10000000 + (q.QuadPart % f) * 10000000 / f;
+}
+
+/*
+ * Copy pixels into a ring with non-temporal stores.
+ *
+ * Rings are ordinary write-back RAM, and an ordinary store to write-back memory
+ * first reads the cache line it is about to overwrite - for a frame, that is as
+ * much reading as writing, all of it wasted, and it evicts whatever the game
+ * had in cache on the way. Streaming stores go straight to memory without
+ * either. (The IVSHMEM BAR rings used to live in was write-combined, which got
+ * this for free; plain memcpy into write-back memory measured slower.)
+ *
+ * The caller fences afterwards: streaming stores are weakly ordered.
+ */
+void stream_copy(std::uint8_t* dst, const std::uint8_t* src, std::size_t n) {
+    std::size_t head = (16u - (reinterpret_cast<std::uintptr_t>(dst) & 15u)) & 15u;
+    if (head > n) head = n;
+    std::memcpy(dst, src, head);
+    dst += head; src += head; n -= head;
+
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 16));
+        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 32));
+        const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 48));
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i),      a);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 16), b);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 32), c);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i + 48), d);
+    }
+    for (; i + 16 <= n; i += 16)
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + i),
+                         _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
+    std::memcpy(dst + i, src + i, n - i);
+}
+
+}  // namespace
 
 bool capture_supported() {
     try {
@@ -99,11 +147,25 @@ struct WindowCapture::Impl {
      * picks up the newest frame rather than working through a backlog.
      */
     enum class StageState { Free, Copying, Queued, Reading };
+
+    /*
+     * Each stage is read back in horizontal bands, one staging texture each.
+     *
+     * Reading a frame back over PCIe is most of the guest's cost - about 6 ms
+     * of 7.5 for a 2560x1440 frame on this VM's x4 link - and in one piece the
+     * copy into the ring cannot start until the last row has arrived. In bands
+     * it starts as soon as the first one has, and copying band k overlaps the
+     * GPU reading band k+1, so only the last band's copy is left after the
+     * readback ends. One band for anything small, and for damage, which diffs
+     * the frame as a whole.
+     */
+    static constexpr std::uint32_t kMaxBands = 8;
     struct Stage {
-        com_ptr<ID3D11Texture2D> tex;
-        com_ptr<ID3D11Query>     query;       // fallback when there is no ID3D11Fence
+        std::array<com_ptr<ID3D11Texture2D>, kMaxBands> tex;
+        // Fallback when there is no ID3D11Fence.
+        std::array<com_ptr<ID3D11Query>, kMaxBands>     query;
+        std::array<std::uint64_t, kMaxBands>            fence_value{};
         StageState               state = StageState::Free;
-        std::uint64_t            fence_value = 0;
         std::uint32_t            w = 0, h = 0;
         std::int64_t             composed = 0;  // SystemRelativeTime, 100ns ticks
         // Held until the copy out of it has finished, so the pool cannot hand
@@ -113,6 +175,7 @@ struct WindowCapture::Impl {
     static constexpr int          kStages = 3;
     std::array<Stage, kStages>    stages;
     std::uint32_t                 staging_w = 0, staging_h = 0;
+    std::uint32_t                 staging_bands = 0;
 
     com_ptr<ID3D11DeviceContext4> context4;
     com_ptr<ID3D11Fence>          fence;
@@ -158,6 +221,7 @@ struct WindowCapture::Impl {
 
     double        pipeline_ms_total = 0;
     double        pipeline_ms_worst = 0;
+    double        copy_ms_total = 0;
     std::uint32_t pipeline_n = 0;
 
     // GDI fallback, for windows WGC will not capture at all.
@@ -170,6 +234,8 @@ struct WindowCapture::Impl {
     void on_frame(const Direct3D11CaptureFramePool& sender);
     void reader_loop();
     void write_out(Stage& st);
+    void wait_band(Stage& st, std::uint32_t band);
+    bool write_out_banded(Stage& st);
     void stop_reader();
     void gdi_loop();
 };
@@ -266,7 +332,14 @@ static void join_mmcss() {
 }
 
 bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
-    if (stages[0].tex && staging_w == w && staging_h == h) return true;
+    // Banded from about 1080p up, where it measured 15-19% faster on average
+    // and steadier at the worst. Below that the readback is short already:
+    // banding a 720p frame bought 6-10% on average but cost a millisecond or
+    // two at the worst, so small frames are read back whole, as before.
+    const std::size_t frame_bytes = (std::size_t)w * h * 4;
+    std::uint32_t bands = frame_bytes >= (8u << 20) ? kMaxBands : 1;
+    if (want_damage || h < bands * 16) bands = 1;
+    if (stages[0].tex[0] && staging_w == w && staging_h == h && staging_bands == bands) return true;
 
     /* Nothing may be reading a texture while it is replaced: drop what is
      * queued, and wait for the reader to finish with the one it has. */
@@ -300,20 +373,24 @@ bool WindowCapture::Impl::ensure_staging(std::uint32_t w, std::uint32_t h) {
     D3D11_QUERY_DESC qd{};
     qd.Query = D3D11_QUERY_EVENT;
 
-    staging_w = staging_h = 0;
+    staging_w = staging_h = staging_bands = 0;
     for (auto& st : stages) {
-        st.tex = nullptr;
-        st.query = nullptr;
+        st.tex = {};
+        st.query = {};
         st.state = StageState::Free;
         st.frame = nullptr;
-        if (FAILED(device->CreateTexture2D(&d, nullptr, st.tex.put()))) {
-            std::fprintf(stderr, "vypr: staging texture %ux%u failed\n", w, h);
-            return false;
+        for (std::uint32_t b = 0; b < bands; b++) {
+            d.Height = h * (b + 1) / bands - h * b / bands;
+            if (FAILED(device->CreateTexture2D(&d, nullptr, st.tex[b].put()))) {
+                std::fprintf(stderr, "vypr: staging texture %ux%u failed\n", w, d.Height);
+                return false;
+            }
+            if (!fence && FAILED(device->CreateQuery(&qd, st.query[b].put()))) return false;
         }
-        if (!fence && FAILED(device->CreateQuery(&qd, st.query.put()))) return false;
     }
     staging_w = w;
     staging_h = h;
+    staging_bands = bands;
     return true;
 }
 
@@ -326,6 +403,7 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
 
     auto frame = sender.TryGetNextFrame();
     if (!frame) return;
+    const std::int64_t arrived_at = qpc_100ns(qpc_freq);
 
     // Newest wins. Frames that queued up in the pool while this thread was
     // busy are already out of date; showing them would only add their age to
@@ -389,17 +467,19 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     }
     Stage& st = stages[i];
 
-    D3D11_BOX box{};
-    box.left = 0; box.top = 0; box.front = 0;
-    box.right = w; box.bottom = h; box.back = 1;
     {
         std::lock_guard<std::mutex> g(ctx_lock);
-        context->CopySubresourceRegion(st.tex.get(), 0, 0, 0, 0, src.get(), 0, &box);
-        if (fence) {
-            st.fence_value = ++fence_value;
-            context4->Signal(fence.get(), st.fence_value);
-        } else {
-            context->End(st.query.get());
+        for (std::uint32_t b = 0; b < staging_bands; b++) {
+            D3D11_BOX box{};
+            box.left = 0;  box.top = h * b / staging_bands;               box.front = 0;
+            box.right = w; box.bottom = h * (b + 1) / staging_bands;      box.back = 1;
+            context->CopySubresourceRegion(st.tex[b].get(), 0, 0, 0, 0, src.get(), 0, &box);
+            if (fence) {
+                st.fence_value[b] = ++fence_value;
+                context4->Signal(fence.get(), st.fence_value[b]);
+            } else {
+                context->End(st.query[b].get());
+            }
         }
         // Submit now: the reader is about to wait on this, and an unflushed
         // copy is one the GPU has not been told about.
@@ -407,7 +487,16 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     }
     st.w = w;
     st.h = h;
-    st.composed = frame.SystemRelativeTime().count();
+    /*
+     * When the frame was captured. SystemRelativeTime is when DWM composed it,
+     * which is what is wanted - except that for a window presenting on vsync
+     * it is the vblank the composition is *for*, up to a frame in the future.
+     * Stamped with that, the guest's own capture-to-publish time came out
+     * negative and the host's frame age read as nothing at all. A frame cannot
+     * have been captured after it arrived, so the arrival time bounds it.
+     */
+    st.composed = std::min<std::int64_t>(frame.SystemRelativeTime().count(),
+                                         arrived_at);
     st.frame = std::move(frame);
 
     {
@@ -494,12 +583,12 @@ static int compute_damage(const std::uint8_t* src, std::uint32_t src_pitch,
     return n;
 }
 
-void WindowCapture::Impl::write_out(Stage& st) {
-    // Wait for the copy on the GPU's own signal: no spinning, and the context
-    // stays free for the next frame's copy meanwhile.
+// Wait for one band's copy on the GPU's own signal: no spinning, and the
+// context stays free for the next frame's copy meanwhile.
+void WindowCapture::Impl::wait_band(Stage& st, std::uint32_t band) {
     if (fence) {
-        if (fence->GetCompletedValue() < st.fence_value &&
-            SUCCEEDED(fence->SetEventOnCompletion(st.fence_value, fence_event)))
+        if (fence->GetCompletedValue() < st.fence_value[band] &&
+            SUCCEEDED(fence->SetEventOnCompletion(st.fence_value[band], fence_event)))
             WaitForSingleObject(fence_event, 250);
     } else {
         for (;;) {
@@ -507,124 +596,211 @@ void WindowCapture::Impl::write_out(Stage& st) {
             HRESULT hr;
             {
                 std::lock_guard<std::mutex> g(ctx_lock);
-                hr = context->GetData(st.query.get(), &done, sizeof(done),
+                hr = context->GetData(st.query[band].get(), &done, sizeof(done),
                                       D3D11_ASYNC_GETDATA_DONOTFLUSH);
             }
             if (FAILED(hr) || (hr == S_OK && done)) break;
             SwitchToThread();
         }
     }
-    // The copy is done; the pool can have the surface back.
-    st.frame = nullptr;
+}
 
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    {
-        std::lock_guard<std::mutex> g(ctx_lock);
-        if (FAILED(context->Map(st.tex.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-            dropped++;
-            return;
-        }
-    }
-
-    const std::uint32_t w = st.w, h = st.h;
-    const auto* srcp = static_cast<const std::uint8_t*>(mapped.pData);
-    const std::uint32_t src_pitch = mapped.RowPitch;
-
-    bool published = false;
-    bool skipped   = false;
+/*
+ * A whole frame, band by band: each band is copied into the ring as soon as it
+ * has arrived, while the GPU is still reading back the ones after it. Returns
+ * whether it published.
+ *
+ * The publisher lock is held only to take a buffer and to publish, not across
+ * the waits: the frame callback takes it too, and stalling it behind a readback
+ * would delay the next frame's copy being issued. Nothing else can be using the
+ * publisher meanwhile - stop() waits for this thread before it lets go of it.
+ */
+bool WindowCapture::Impl::write_out_banded(Stage& st) {
+    const std::uint32_t w = st.w, h = st.h, bands = staging_bands;
+    std::uint32_t stride = 0;
+    std::uint8_t* dst = nullptr;
     {
         std::lock_guard<std::mutex> guard(lock);
-        std::uint32_t stride = 0;
-        std::uint8_t* dst = (pub && pub->bound()) ? pub->begin_frame(&stride) : nullptr;
-        if (dst) {
-            // Decide whole-frame vs damage. A damage frame needs a previous
-            // frame of the same shape to diff against; anything else is whole,
-            // which also (re)establishes `prev`.
-            vypr_rect rects[VYPR_MAX_DAMAGE_RECTS];
-            int nd = -1;
-            const bool have_prev = want_damage && prev_w == w && prev_h == h &&
-                                   prev_stride == stride &&
-                                   prev.size() >= (std::size_t)stride * h;
-            if (have_prev)
-                nd = compute_damage(srcp, src_pitch, prev.data(), stride, w, h, rects);
+        dst = (pub && pub->bound()) ? pub->begin_frame(&stride) : nullptr;
+    }
 
-            if (have_prev && nd == 0) {
-                // Nothing changed. Publishing would only repeat the frame the
-                // host already shows, so leave the serial where it is.
-                skipped = true;
-            } else if (have_prev && nd > 0) {
-                // Partial: write and patch only the changed rectangles.
-                for (int r = 0; r < nd; r++) {
-                    const vypr_rect d = rects[r];
-                    for (std::uint32_t y = d.y; y < d.y + d.h; y++) {
-                        const std::size_t ro = (std::size_t)y * stride + (std::size_t)d.x * 4;
-                        const std::size_t so = (std::size_t)y * src_pitch + (std::size_t)d.x * 4;
-                        std::memcpy(dst + ro, srcp + so, (std::size_t)d.w * 4);
-                        std::memcpy(prev.data() + ro, srcp + so, (std::size_t)d.w * 4);
-                    }
-                }
-                _mm_sfence();
-                std::uint64_t stamp, stamp_freq;
-                if (st.composed > 0) { stamp = (std::uint64_t)st.composed; stamp_freq = 10000000ull; }
-                else { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); stamp = (std::uint64_t)q.QuadPart; stamp_freq = qpc_freq; }
-                published = pub->publish(w, h, stride, stamp, stamp_freq,
-                                         VYPR_PUB_DAMAGE_RECTS, rects, (std::uint32_t)nd);
-            } else {
-                /*
-                 * Whole frame, copied in bands in parallel once it is big
-                 * enough to be worth it. The destination is write-combined
-                 * memory across the VM boundary, and one core can only keep so
-                 * many WC fill buffers in flight; a 4K frame is 33 MB, and
-                 * splitting it lets several cores stream at once. Below a few
-                 * megabytes the hand-off costs more than it saves.
-                 */
-                const std::size_t row = (std::size_t)w * 4;
-                const std::uint32_t bands = ((std::size_t)w * h * 4 >= (8u << 20)) ? 4 : 1;
-                std::array<std::uint32_t, 4> band_ids{ 0, 1, 2, 3 };
-                auto copy_band = [&](std::uint32_t b) {
-                    const std::uint32_t y0 = h * b / bands, y1 = h * (b + 1) / bands;
-                    if (stride == src_pitch) {
-                        std::memcpy(dst + (std::size_t)y0 * stride,
-                                    srcp + (std::size_t)y0 * src_pitch,
-                                    (std::size_t)(y1 - y0) * stride);
-                    } else {
-                        for (std::uint32_t y = y0; y < y1; y++)
-                            std::memcpy(dst + (std::size_t)y * stride,
-                                        srcp + (std::size_t)y * src_pitch, row);
-                    }
-                    _mm_sfence();   // each core drains its own fill buffers
-                };
-                if (bands > 1)
-                    std::for_each(std::execution::par, band_ids.begin(), band_ids.begin() + bands, copy_band);
-                else
-                    copy_band(0);
+    const std::int64_t copy_start = qpc_100ns(qpc_freq);
+    double waited_ms = 0;
+    bool ok = dst != nullptr;
+    const std::size_t row = (std::size_t)w * 4;
+    /*
+     * Give the capture surface back the moment the GPU has finished reading
+     * it, not when this loop gets round to waiting for the last band. The pool
+     * has three surfaces, and holding one through the copies of the bands
+     * before it left DWM without a free one often enough to cost frames.
+     */
+    const auto release_if_done = [&] {
+        if (st.frame && fence && fence->GetCompletedValue() >= st.fence_value[bands - 1])
+            st.frame = nullptr;
+    };
+    for (std::uint32_t b = 0; b < bands; b++) {
+        const std::int64_t wait_start = qpc_100ns(qpc_freq);
+        wait_band(st, b);
+        waited_ms += (qpc_100ns(qpc_freq) - wait_start) / 10000.0;
+        release_if_done();
+        if (b == bands - 1) st.frame = nullptr;   // in, whatever kind of wait it was
+        if (!ok) continue;
 
-                // Keep this whole frame as the baseline for the next diff, in
-                // the ring's own layout so a damage copy addresses both alike.
-                if (want_damage) {
-                    prev.assign((std::size_t)stride * h, 0);
-                    for (std::uint32_t y = 0; y < h; y++)
-                        std::memcpy(prev.data() + (std::size_t)y * stride,
-                                    srcp + (std::size_t)y * src_pitch, row);
-                    prev_w = w; prev_h = h; prev_stride = stride;
-                }
-
-                // Stamp when DWM composed the frame, not when we finished
-                // copying it. A QPC reading here would come after the readback
-                // and the copy, so the host's "age" would leave out exactly the
-                // guest-side pipeline - which is where the time goes.
-                // SystemRelativeTime is 100ns ticks on the QPC timebase, so the
-                // frequency is reported as 10 MHz to match.
-                std::uint64_t stamp, stamp_freq;
-                if (st.composed > 0) { stamp = (std::uint64_t)st.composed; stamp_freq = 10000000ull; }
-                else { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); stamp = (std::uint64_t)q.QuadPart; stamp_freq = qpc_freq; }
-                published = pub->publish(w, h, stride, stamp, stamp_freq, VYPR_PUB_DAMAGE_FULL);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        {
+            std::lock_guard<std::mutex> g(ctx_lock);
+            if (FAILED(context->Map(st.tex[b].get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                ok = false;
+                continue;
             }
         }
+        const std::uint32_t y0 = h * b / bands, y1 = h * (b + 1) / bands;
+        const auto* srcp = static_cast<const std::uint8_t*>(mapped.pData);
+        if (stride == mapped.RowPitch) {
+            stream_copy(dst + (std::size_t)y0 * stride, srcp, (std::size_t)(y1 - y0) * stride);
+        } else {
+            for (std::uint32_t y = y0; y < y1; y++)
+                stream_copy(dst + (std::size_t)y * stride,
+                            srcp + (std::size_t)(y - y0) * mapped.RowPitch, row);
+        }
+        {
+            std::lock_guard<std::mutex> g(ctx_lock);
+            context->Unmap(st.tex[b].get(), 0);
+        }
+        release_if_done();
     }
-    {
-        std::lock_guard<std::mutex> g(ctx_lock);
-        context->Unmap(st.tex.get(), 0);
+    _mm_sfence();
+    // Time spent copying, not waiting for the GPU to deliver the next band.
+    copy_ms_total += (qpc_100ns(qpc_freq) - copy_start) / 10000.0 - waited_ms;
+    if (!ok) return false;
+
+    std::lock_guard<std::mutex> guard(lock);
+    if (!pub || !pub->bound()) return false;
+    std::uint64_t stamp, stamp_freq;
+    if (st.composed > 0) { stamp = (std::uint64_t)st.composed; stamp_freq = 10000000ull; }
+    else { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); stamp = (std::uint64_t)q.QuadPart; stamp_freq = qpc_freq; }
+    return pub->publish(w, h, stride, stamp, stamp_freq, VYPR_PUB_DAMAGE_FULL);
+}
+
+void WindowCapture::Impl::write_out(Stage& st) {
+    bool published = false;
+    bool skipped   = false;
+
+    if (staging_bands > 1) {
+        published = write_out_banded(st);
+    } else {
+        wait_band(st, 0);
+        // The copy is done; the pool can have the surface back.
+        st.frame = nullptr;
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        {
+            std::lock_guard<std::mutex> g(ctx_lock);
+            if (FAILED(context->Map(st.tex[0].get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                dropped++;
+                return;
+            }
+        }
+
+        const std::uint32_t w = st.w, h = st.h;
+        const auto* srcp = static_cast<const std::uint8_t*>(mapped.pData);
+        const std::uint32_t src_pitch = mapped.RowPitch;
+
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            std::uint32_t stride = 0;
+            std::uint8_t* dst = (pub && pub->bound()) ? pub->begin_frame(&stride) : nullptr;
+            if (dst) {
+                // Decide whole-frame vs damage. A damage frame needs a previous
+                // frame of the same shape to diff against; anything else is whole,
+                // which also (re)establishes `prev`.
+                vypr_rect rects[VYPR_MAX_DAMAGE_RECTS];
+                int nd = -1;
+                const bool have_prev = want_damage && prev_w == w && prev_h == h &&
+                                       prev_stride == stride &&
+                                       prev.size() >= (std::size_t)stride * h;
+                if (have_prev)
+                    nd = compute_damage(srcp, src_pitch, prev.data(), stride, w, h, rects);
+
+                if (have_prev && nd == 0) {
+                    // Nothing changed. Publishing would only repeat the frame the
+                    // host already shows, so leave the serial where it is.
+                    skipped = true;
+                } else if (have_prev && nd > 0) {
+                    // Partial: write and patch only the changed rectangles.
+                    for (int r = 0; r < nd; r++) {
+                        const vypr_rect d = rects[r];
+                        for (std::uint32_t y = d.y; y < d.y + d.h; y++) {
+                            const std::size_t ro = (std::size_t)y * stride + (std::size_t)d.x * 4;
+                            const std::size_t so = (std::size_t)y * src_pitch + (std::size_t)d.x * 4;
+                            stream_copy(dst + ro, srcp + so, (std::size_t)d.w * 4);
+                            std::memcpy(prev.data() + ro, srcp + so, (std::size_t)d.w * 4);
+                        }
+                    }
+                    _mm_sfence();
+                    std::uint64_t stamp, stamp_freq;
+                    if (st.composed > 0) { stamp = (std::uint64_t)st.composed; stamp_freq = 10000000ull; }
+                    else { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); stamp = (std::uint64_t)q.QuadPart; stamp_freq = qpc_freq; }
+                    published = pub->publish(w, h, stride, stamp, stamp_freq,
+                                             VYPR_PUB_DAMAGE_RECTS, rects, (std::uint32_t)nd);
+                } else {
+                    /*
+                     * Whole frame, copied in bands in parallel once it is big
+                     * enough to be worth it. One core can only keep so many
+                     * streaming stores in flight; a 4K frame is 33 MB, and
+                     * splitting it lets several cores stream at once. Below a few
+                     * megabytes the hand-off costs more than it saves.
+                     */
+                    const std::int64_t copy_start = qpc_100ns(qpc_freq);
+                    const std::size_t row = (std::size_t)w * 4;
+                    const std::uint32_t bands = ((std::size_t)w * h * 4 >= (8u << 20)) ? 4 : 1;
+                    std::array<std::uint32_t, 4> band_ids{ 0, 1, 2, 3 };
+                    auto copy_band = [&](std::uint32_t b) {
+                        const std::uint32_t y0 = h * b / bands, y1 = h * (b + 1) / bands;
+                        if (stride == src_pitch) {
+                            stream_copy(dst + (std::size_t)y0 * stride,
+                                        srcp + (std::size_t)y0 * src_pitch,
+                                        (std::size_t)(y1 - y0) * stride);
+                        } else {
+                            for (std::uint32_t y = y0; y < y1; y++)
+                                stream_copy(dst + (std::size_t)y * stride,
+                                            srcp + (std::size_t)y * src_pitch, row);
+                        }
+                        _mm_sfence();   // each core orders its own streaming stores
+                    };
+                    if (bands > 1)
+                        std::for_each(std::execution::par, band_ids.begin(), band_ids.begin() + bands, copy_band);
+                    else
+                        copy_band(0);
+                    copy_ms_total += (qpc_100ns(qpc_freq) - copy_start) / 10000.0;
+
+                    // Keep this whole frame as the baseline for the next diff, in
+                    // the ring's own layout so a damage copy addresses both alike.
+                    if (want_damage) {
+                        prev.assign((std::size_t)stride * h, 0);
+                        for (std::uint32_t y = 0; y < h; y++)
+                            std::memcpy(prev.data() + (std::size_t)y * stride,
+                                        srcp + (std::size_t)y * src_pitch, row);
+                        prev_w = w; prev_h = h; prev_stride = stride;
+                    }
+
+                    // Stamp when DWM composed the frame, not when we finished
+                    // copying it. A QPC reading here would come after the readback
+                    // and the copy, so the host's "age" would leave out exactly the
+                    // guest-side pipeline - which is where the time goes.
+                    // SystemRelativeTime is 100ns ticks on the QPC timebase, so the
+                    // frequency is reported as 10 MHz to match.
+                    std::uint64_t stamp, stamp_freq;
+                    if (st.composed > 0) { stamp = (std::uint64_t)st.composed; stamp_freq = 10000000ull; }
+                    else { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); stamp = (std::uint64_t)q.QuadPart; stamp_freq = qpc_freq; }
+                    published = pub->publish(w, h, stride, stamp, stamp_freq, VYPR_PUB_DAMAGE_FULL);
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> g(ctx_lock);
+            context->Unmap(st.tex[0].get(), 0);
+        }
     }
 
     if (skipped) return;             // a no-op, not a drop
@@ -635,17 +811,16 @@ void WindowCapture::Impl::write_out(Stage& st) {
     // says the frame was captured to the moment it is published. This needs no
     // host/guest alignment, so it cannot be blamed on clock error.
     if (st.composed > 0) {
-        LARGE_INTEGER at_publish{};
-        QueryPerformanceCounter(&at_publish);
-        const double ms = (static_cast<double>(at_publish.QuadPart) -
-                           static_cast<double>(st.composed)) * 1000.0 / qpc_freq;
+        const double ms = (qpc_100ns(qpc_freq) - st.composed) / 10000.0;
         pipeline_ms_total += ms;
         if (ms > pipeline_ms_worst) pipeline_ms_worst = ms;
         if (++pipeline_n >= 240) {
             std::fprintf(stderr,
-                "vypr: capture->publish avg %.2f ms worst %.2f ms over %u frames\n",
-                pipeline_ms_total / pipeline_n, pipeline_ms_worst, pipeline_n);
-            pipeline_ms_total = 0; pipeline_ms_worst = 0; pipeline_n = 0;
+                "vypr: capture->publish avg %.2f ms worst %.2f ms, copy avg %.2f ms, "
+                "over %u frames\n",
+                pipeline_ms_total / pipeline_n, pipeline_ms_worst,
+                copy_ms_total / pipeline_n, pipeline_n);
+            pipeline_ms_total = 0; pipeline_ms_worst = 0; copy_ms_total = 0; pipeline_n = 0;
         }
     }
 }
@@ -850,10 +1025,10 @@ void WindowCapture::stop() {
     std::lock_guard<std::mutex> guard(impl_->lock);
     impl_->pub = nullptr;
     for (auto& st : impl_->stages) {
-        st.tex = nullptr;
-        st.query = nullptr;
+        st.tex = {};
+        st.query = {};
     }
-    impl_->staging_w = impl_->staging_h = 0;
+    impl_->staging_w = impl_->staging_h = impl_->staging_bands = 0;
     impl_->fence = nullptr;
     impl_->context4 = nullptr;
     impl_->prev.clear();

@@ -2,8 +2,14 @@
  * vyprd - the host session daemon.
  *
  * Owns three things the per-window clients must not each own separately:
- * the shared region and its allocation, the single control link to the guest
- * agent, and the decision about which guest windows become host windows.
+ * the slot table and the guest rings it describes, the single control link to
+ * the guest agent, and the decision about which guest windows become host
+ * windows.
+ *
+ * Frames never pass through here. The agent allocates each window's ring in
+ * guest RAM and sends its page list; the daemon checks every page against
+ * QEMU's memory file, writes down where the ring is, and the window's client
+ * maps it from there. See vypr_shm.h.
  *
  *   agent (TCP 47820) ──▶ vyprd ──▶ spawns vypr-window per window
  *                          ▲                    │
@@ -33,6 +39,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "guest_ram.h"
 #include "msg.h"
 #include "shm.h"
 
@@ -62,8 +69,13 @@ struct window {
     uint64_t owner_id;      /* nonzero for popups */
     uint32_t slot;
     int      has_slot;
-    int      attach_sent;   /* the guest was told to attach; it may be writing */
-    int      attached;
+    int      attach_sent;   /* the guest was told to attach */
+    int      attached;      /* ring verified and RING_READY sent */
+
+    /* The ring's page list, as RING_PAGES delivers it. Freed once checked. */
+    uint64_t *ring_pfns;
+    uint32_t  ring_total, ring_have;
+    uint64_t  ring_nonce;
     int      is_popup;      /* presented by its owner's client, not its own */
     pid_t    child;
     int      client_fd;
@@ -80,6 +92,17 @@ struct window {
 struct daemon {
     struct vypr_shm shm;
     const char     *shm_path;
+
+    /* Guest RAM, read-only, found when the agent says hello. `vm` names the
+     * libvirt domain to look in; `guest_ram` overrides the search with a file,
+     * which is how the tests run without a VM. */
+    struct vypr_guest_ram ram;
+    const char     *vm;
+    const char     *guest_ram;
+    char            ram_problem[512];
+
+    /* Set by a handler that wants the agent link closed once it returns. */
+    int             drop_agent;
 
     int  tcp_listen;
     int  unix_listen;
@@ -315,12 +338,10 @@ static void window_release(struct daemon *d, struct window *w, int tell_agent)
         struct vypr_msg_window_id gone = { .window_id = w->id };
         msg_send(d->agent_fd, VYPR_MSG_DETACH, &gone, sizeof(gone));
     }
-    /* The allocator has to know whether the guest could still be part-way
-     * through a frame in this window's ring: if it might be, the range is held
-     * until the guest says otherwise rather than handed to the next window. */
-    if (w->has_slot)
-        vypr_shm_free(&d->shm, w->slot,
-                      w->attach_sent ? VYPR_WRITER_MAYBE : VYPR_WRITER_NONE);
+    /* The ring is guest memory and goes back to the guest with the DETACH;
+     * the slot is only bookkeeping and can be reused at once. */
+    if (w->has_slot) vypr_shm_free(&d->shm, w->slot);
+    free(w->ring_pfns);
     memset(w, 0, sizeof(*w));
     w->client_fd = -1;
 }
@@ -420,6 +441,13 @@ static int spawn_client(struct daemon *d, struct window *w)
 static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
                           const char *title)
 {
+    /*
+     * Without guest RAM there is nowhere to see a ring, so attaching would only
+     * get as far as the agent allocating one and the check failing. Say why
+     * once, when the agent connects, rather than once per window.
+     */
+    if (!d->ram.base) return;
+
     struct window *w = window_find(d, desc->window_id);
     if (w && w->has_slot) return;
     if (!w) w = window_alloc(d, desc->window_id);
@@ -466,16 +494,15 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
         return;
     }
 
-    /* Headroom, so an ordinary resize does not force a re-attach. A closed
-     * window's range does come back now, but only once the guest has finished
-     * with it (see VYPR_SLOT_RETIRING), so a re-attach still costs a stall and
-     * a wait. */
+    /* Headroom, so an ordinary resize does not force a re-attach, which means
+     * the guest allocating, stamping and sending a whole new ring - a visible
+     * stall. */
     uint32_t alloc_w = desc->width  + 256;
     uint32_t alloc_h = desc->height + 256;
 
     struct vypr_msg_attach at;
     if (vypr_shm_alloc(&d->shm, w->id, alloc_w, alloc_h, &at) < 0) {
-        fprintf(stderr, "vyprd: no region left for '%s'\n", title);
+        fprintf(stderr, "vyprd: cannot stream '%s'\n", title);
         memset(w, 0, sizeof(*w));
         w->client_fd = -1;
         return;
@@ -490,8 +517,8 @@ static void attach_window(struct daemon *d, const struct vypr_msg_window *desc,
         fprintf(stderr, "vyprd: failed to send ATTACH for '%s'\n", title);
         return;
     }
-    /* From here the guest may bind and start writing, and that stays true until
-     * it acknowledges the detach - ATTACH_RESULT has not even arrived yet. */
+    /* The guest now allocates the ring and sends its pages; nothing is written
+     * into it until RING_READY says the pages checked out. */
     w->attach_sent = 1;
 }
 
@@ -589,11 +616,35 @@ static void on_agent_message(struct daemon *d, uint16_t type,
     case VYPR_MSG_HELLO: {
         if (bytes < sizeof(struct vypr_msg_hello)) break;
         const struct vypr_msg_hello *h = (const void *)payload;
-        fprintf(stderr, "vyprd: agent up, protocol %u, pid %u, %.0f MiB region\n",
-                h->version, h->agent_pid, h->shm_bytes / 1048576.0);
-        if (h->version != VYPR_PROTO_VERSION)
-            fprintf(stderr, "vyprd: WARNING agent speaks %u, host speaks %u\n",
+        fprintf(stderr, "vyprd: agent up, protocol %u, pid %u\n", h->version, h->agent_pid);
+        if (h->version != VYPR_PROTO_VERSION) {
+            /*
+             * Not a warning any more. Since version 3 the two ends disagree
+             * about where frames even live, so a mismatched pair would connect,
+             * offer windows, and never show one. Refusing says so up front.
+             */
+            fprintf(stderr, "vyprd: the agent speaks protocol %u and this host speaks %u; "
+                            "install the matching agent in the guest\n",
                     h->version, VYPR_PROTO_VERSION);
+            d->drop_agent = 1;
+            break;
+        }
+
+        /* Find the guest's RAM now: the VM is certainly running, and a VM that
+         * restarted under a running daemon has a new QEMU to look in. */
+        vypr_guest_ram_close(&d->ram);
+        d->ram_problem[0] = 0;
+        const int found = d->guest_ram
+            ? vypr_guest_ram_open(&d->ram, d->guest_ram, d->ram_problem, sizeof(d->ram_problem))
+            : vypr_guest_ram_find(&d->ram, d->vm, d->ram_problem, sizeof(d->ram_problem));
+        if (found < 0) {
+            fprintf(stderr, "vyprd: no windows can be shown: %s\n", d->ram_problem);
+        } else {
+            vypr_shm_set_guest_ram(&d->shm, d->ram.path, d->ram.bytes);
+            fprintf(stderr, "vyprd: guest RAM %.1f GiB at %s\n",
+                    d->ram.bytes / 1073741824.0, d->ram.path);
+        }
+
         if (d->launch)
             msg_send(d->agent_fd, VYPR_MSG_LAUNCH, d->launch, (uint32_t)strlen(d->launch));
 
@@ -709,20 +760,101 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
+    case VYPR_MSG_RING_PAGES: {
+        if (bytes < sizeof(struct vypr_msg_ring_pages)) break;
+        const struct vypr_msg_ring_pages *rp = (const void *)payload;
+        struct window *w = window_find(d, rp->window_id);
+        if (!w || !w->has_slot || w->attached || rp->slot != w->slot) break;
+
+        const struct vypr_slot *sl = &d->shm.hdr->slots[w->slot];
+        const uint64_t want = vypr_ring_bytes(sl->frame_bytes) / VYPR_PAGE_BYTES;
+        const uint32_t count = rp->count;
+        /* Each piece has to fit its message, belong to this attach, describe
+         * a ring of the size the slot was given, and carry on from the last. */
+        if (rp->epoch != sl->epoch || rp->total_pages != want ||
+            count == 0 || (uint64_t)count * 8u > bytes - sizeof(*rp) ||
+            rp->first > rp->total_pages || count > rp->total_pages - rp->first) {
+            fprintf(stderr, "vyprd: malformed ring pages for '%s'\n", w->title);
+            break;
+        }
+        if (rp->first == 0) {
+            free(w->ring_pfns);
+            w->ring_pfns  = malloc((size_t)rp->total_pages * sizeof(uint64_t));
+            w->ring_total = rp->total_pages;
+            w->ring_have  = 0;
+            w->ring_nonce = rp->nonce;
+            if (!w->ring_pfns) { w->ring_total = 0; break; }
+        }
+        if (!w->ring_pfns || rp->first != w->ring_have || rp->nonce != w->ring_nonce ||
+            rp->total_pages != w->ring_total)
+            break;
+        memcpy(w->ring_pfns + rp->first, payload + sizeof(*rp), (size_t)count * 8u);
+        w->ring_have += count;
+        break;
+    }
+
     case VYPR_MSG_ATTACH_RESULT: {
         if (bytes < sizeof(struct vypr_msg_attach_result)) break;
         const struct vypr_msg_attach_result *r = (const void *)payload;
         struct window *w = window_find(d, r->window_id);
         if (!w) break;
         if (r->status != 0) {
-            fprintf(stderr, "vyprd: agent refused '%s' (status %d)\n", w->title, r->status);
-            /* It never started capturing, so nothing there can be writing and
-             * the ring can go straight back rather than waiting on a detach
-             * acknowledgement that is never coming. */
+            /*
+             * Either the agent never got as far as a ring (the window is gone,
+             * the guest is short of memory), or it got one, was told to go
+             * ahead, and then Windows would not capture the window. Both end
+             * the same way; the agent has already let go of its side.
+             */
+            fprintf(stderr, "vyprd: agent refused '%s' (%s)\n", w->title,
+                    r->status == VYPR_ATTACH_NO_MEMORY  ? "the guest could not lock enough memory for it" :
+                    r->status == VYPR_ATTACH_NO_CAPTURE ? "Windows would not capture it" :
+                    r->status == VYPR_ATTACH_NO_WINDOW  ? "the window is gone" : "error");
             w->attach_sent = 0;
             window_release(d, w, 0);
             break;
         }
+        if (w->attached) break;
+
+        /*
+         * Check the ring before anything reads it: every page has to read back,
+         * through QEMU's memory file, as exactly what the guest stamped into
+         * it. Only then is the slot described and the agent told to write.
+         */
+        struct vypr_msg_ring_ready ready = {
+            .window_id = w->id, .slot = w->slot,
+            .epoch = d->shm.hdr->slots[w->slot].epoch,
+        };
+        char why[256] = "";
+        int runs = -1;
+        struct vypr_ring_run *table = NULL;
+        if (!w->ring_pfns || w->ring_have != w->ring_total) {
+            snprintf(why, sizeof(why), "only %u of %u ring pages arrived",
+                     w->ring_have, w->ring_total);
+        } else if (!(table = malloc((size_t)w->ring_total * sizeof(*table)))) {
+            snprintf(why, sizeof(why), "out of memory");
+        } else {
+            runs = vypr_guest_ram_verify(&d->ram, w->ring_pfns, w->ring_total,
+                                         w->ring_nonce, table, w->ring_total,
+                                         why, sizeof(why));
+        }
+        if (runs < 0 || vypr_shm_set_ring(&d->shm, w->slot, table, (uint32_t)runs,
+                                          w->ring_nonce, w->ring_total) < 0) {
+            fprintf(stderr, "vyprd: cannot use the ring for '%s': %s\n", w->title,
+                    why[0] ? why : "it does not fit the slot table");
+            free(table);
+            ready.status = VYPR_ATTACH_BAD_RING;
+            msg_send(d->agent_fd, VYPR_MSG_RING_READY, &ready, sizeof(ready));
+            w->attach_sent = 0;
+            window_release(d, w, 0);
+            break;
+        }
+        fprintf(stderr, "vyprd: '%s' ring: %.1f MiB in %d piece%s\n", w->title,
+                w->ring_total * (double)VYPR_PAGE_BYTES / 1048576.0, runs, runs == 1 ? "" : "s");
+        free(table);
+        free(w->ring_pfns);
+        w->ring_pfns = NULL;
+
+        msg_send(d->agent_fd, VYPR_MSG_RING_READY, &ready, sizeof(ready));
         w->attached = 1;
 
         if (w->is_popup) {
@@ -1142,9 +1274,12 @@ static void find_self_dir(struct daemon *d)
 
 static void usage(void)
 {
-    fputs("usage: vyprd [--shm PATH] [--bind ADDR] [--port N] [--match SUBSTR]... [--all]\n"
-          "             [--launch 'C:\\path\\app.exe']\n"
+    fputs("usage: vyprd [--vm NAME] [--shm PATH] [--bind ADDR] [--port N]\n"
+          "             [--match SUBSTR]... [--all] [--launch 'C:\\path\\app.exe']\n"
           "\n"
+          "  --vm     the libvirt VM whose RAM frames are read from; needed only\n"
+          "           when more than one VM is running\n"
+          "  --guest-ram PATH  read guest RAM from this file instead (testing)\n"
           "  --match  stream guest windows whose title contains SUBSTR (repeatable)\n"
           "  --all    stream every guest window; useful for seeing what is there\n"
           "  --bind   interface to accept the agent on; defaults to the virtual\n"
@@ -1188,6 +1323,38 @@ static int send_match(const char *runtime_dir, const char *term)
     return rc < 0 ? 1 : 0;
 }
 
+/*
+ * The agent link is gone - closed by the guest, or refused here.
+ *
+ * Every ring went with the agent: Windows takes a dead process's locked pages
+ * straight back. Each client is told to stop before anything else can be put
+ * in those pages, and the daemon lets go of guest RAM too - the VM may be
+ * restarting, and the next agent will say where it is.
+ */
+static void agent_lost(struct daemon *d)
+{
+    fprintf(stderr, "vyprd: agent %s\n", d->drop_agent ? "refused" : "disconnected");
+    close(d->agent_fd);
+    d->agent_fd = -1;
+    d->drop_agent = 0;
+    msg_reader_free(&d->agent_rx);
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        window_release(d, &d->windows[i], 0);
+    vypr_guest_ram_close(&d->ram);
+}
+
+/* Handle every message already buffered on the agent link. Returns -1 if the
+ * link should be dropped. */
+static int agent_drain(struct daemon *d)
+{
+    struct vypr_msg_head head;
+    const uint8_t *payload;
+    int rc = 0;
+    while (!d->drop_agent && (rc = msg_reader_next(&d->agent_rx, &head, &payload)) == 1)
+        on_agent_message(d, head.type, payload, head.bytes);
+    return (d->drop_agent || rc < 0) ? -1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++)
@@ -1195,9 +1362,10 @@ int main(int argc, char **argv)
             return send_match(getenv("XDG_RUNTIME_DIR"), argv[i + 1]);
 
     struct daemon d = {0};
-    d.shm_path   = "/dev/shm/vypr";
+    d.shm_path   = "/dev/shm/vypr-host";
     d.agent_fd   = -1;
     d.audio_fd   = -1;
+    d.ram.fd     = -1;
     for (size_t i = 0; i < sizeof(d.pending) / sizeof(d.pending[0]); i++)
         d.pending[i].fd = -1;
     uint16_t port = VYPR_CONTROL_PORT;
@@ -1210,6 +1378,8 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--shm") && i + 1 < argc)    d.shm_path = argv[++i];
+        else if (!strcmp(argv[i], "--vm") && i + 1 < argc) d.vm = argv[++i];
+        else if (!strcmp(argv[i], "--guest-ram") && i + 1 < argc) d.guest_ram = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (uint16_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_addr = argv[++i];
         else if (!strcmp(argv[i], "--match") && i + 1 < argc) {
@@ -1240,16 +1410,16 @@ int main(int argc, char **argv)
     snprintf(d.unix_path, sizeof(d.unix_path), "%s/vypr.sock",
              runtime ? runtime : "/tmp");
 
-    /* Format before listening: the agent looks for the magic to tell our region
-     * from Looking Glass's, so it must already be there when it connects. */
+    /* Format before listening, so a presenter left from an earlier session
+     * sees the new generation before any window of this one exists. */
     if (vypr_shm_open(&d.shm, d.shm_path, 1) < 0) return 1;
 
     d.tcp_listen  = listen_tcp(bind_addr, port);
     d.unix_listen = listen_unix(d.unix_path);
     if (d.tcp_listen < 0 || d.unix_listen < 0) return 1;
 
-    fprintf(stderr, "vyprd: region %s (%.0f MiB), waiting for agent on %s:%u\n",
-            d.shm_path, d.shm.bytes / 1048576.0, bind_addr, port);
+    fprintf(stderr, "vyprd: slot table %s, waiting for agent on %s:%u\n",
+            d.shm_path, bind_addr, port);
 
     struct msg_reader client_rx[MAX_WINDOWS] = {0};
     struct window    *client_owner[MAX_WINDOWS] = {0};
@@ -1299,10 +1469,6 @@ int main(int argc, char **argv)
             perror("poll");
             break;
         }
-
-        /* Collect the rings of windows the guest has finished with. Cheap: it
-         * reads one word per closed window and usually finds none. */
-        vypr_shm_reap(&d.shm);
 
         /* Re-align periodically: the two clocks drift, and a stale offset shows
          * up as latency slowly wandering away from the truth. */
@@ -1365,6 +1531,11 @@ int main(int argc, char **argv)
                 d.pending[i].fd = -1;
                 fprintf(stderr, "vyprd: agent connected\n");
                 on_agent_message(&d, head.type, payload, head.bytes);
+                /* Whatever arrived in the same read - usually the first
+                 * windows - is handled now. Left in the buffer it would wait
+                 * for the agent's next message, which is a round trip at
+                 * best and never if the agent has nothing more to say. */
+                if (agent_drain(&d) < 0) agent_lost(&d);
             } else {
                 close(d.pending[i].fd);
                 msg_reader_free(&d.pending[i].rx);
@@ -1439,25 +1610,8 @@ int main(int argc, char **argv)
         }
 
         if (agent_slot >= 0 && (pfd[agent_slot].revents & (POLLIN | POLLHUP))) {
-            if (msg_reader_fill(&d.agent_rx, d.agent_fd) < 0) {
-                fprintf(stderr, "vyprd: agent disconnected\n");
-                close(d.agent_fd);
-                d.agent_fd = -1;
-                msg_reader_free(&d.agent_rx);
-                for (int i = 0; i < MAX_WINDOWS; i++)
-                    window_release(&d, &d.windows[i], 0);
-                /* Every publisher went with the agent, so nothing is left that
-                 * could write into the region: take all of it back now rather
-                 * than waiting for acknowledgements that cannot arrive. */
-                vypr_shm_reap_all(&d.shm);
-            } else {
-                struct vypr_msg_head head;
-                const uint8_t *payload;
-                int rc;
-                while ((rc = msg_reader_next(&d.agent_rx, &head, &payload)) == 1)
-                    on_agent_message(&d, head.type, payload, head.bytes);
-                if (rc < 0) { close(d.agent_fd); d.agent_fd = -1; }
-            }
+            if (msg_reader_fill(&d.agent_rx, d.agent_fd) < 0 || agent_drain(&d) < 0)
+                agent_lost(&d);
         }
 
         for (int i = 0, p = first_client; i < MAX_WINDOWS; i++) {
@@ -1514,6 +1668,7 @@ int main(int argc, char **argv)
     close(d.unix_listen);
     unlink(d.unix_path);
     msg_reader_free(&d.agent_rx);
+    vypr_guest_ram_close(&d.ram);
     vypr_shm_close(&d.shm);
     return 0;
 }

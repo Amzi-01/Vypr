@@ -23,13 +23,13 @@ else()
 endif()
 
 # The session daemon: owns the region, the agent link, and which windows stream.
-add_executable(vyprd src/vyprd.c src/shm.c src/msg.c)
+add_executable(vyprd src/vyprd.c src/shm.c src/msg.c src/guest_ram.c)
 target_include_directories(vyprd PRIVATE src ../include)
 
 # The stand-in guest. Built alongside the host because it is how the host is
 # tested, not an optional extra.
-add_executable(vypr-testsrc ../tools/vypr-testsrc.c src/shm.c)
-target_include_directories(vypr-testsrc PRIVATE src ../include)
+add_executable(vypr-testsrc ../tools/vypr-testsrc.c ../tools/fake_ram.c src/shm.c src/guest_ram.c)
+target_include_directories(vypr-testsrc PRIVATE src ../include ../tools)
 target_link_libraries(vypr-testsrc PRIVATE m)
 
 # The guest agent's publish path, compiled for Linux and run against the host
@@ -38,5 +38,5 @@ enable_language(CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(vypr-testagent ../tools/vypr-testagent.cpp ../guest/src/publisher.cpp src/shm.c src/msg.c)
-target_include_directories(vypr-testagent PRIVATE src ../include ../guest/src)
+add_executable(vypr-testagent ../tools/vypr-testagent.cpp ../tools/fake_ram.c ../guest/src/publisher.cpp src/shm.c src/msg.c src/guest_ram.c)
+target_include_directories(vypr-testagent PRIVATE src ../include ../guest/src ../tools)

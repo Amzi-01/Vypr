@@ -26,10 +26,11 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vypr"
 CONF="$CONF_DIR/config"
 APPS="$CONF_DIR/apps"
 BIN="$(dirname "$(readlink -f "$0")")"
-SHM=/dev/shm/vypr
+# vyprd's slot table. Host-only: frames themselves are read out of the VM's
+# RAM, so nothing here is shared with QEMU any more.
+SHM=/dev/shm/vypr-host
 KEY="$HOME/.ssh/vypr-guest"
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
-SHM_SIZE_MB_DEFAULT=512
 
 [ -f "$CONF" ] || { echo "vypr: not configured - run the installer first" >&2; exit 1; }
 # shellcheck source=/dev/null
@@ -187,23 +188,25 @@ PS1
     [ -s "$out" ]
 }
 
-# ---------------------------------------------------------- the shared region
+# ------------------------------------------------------- the VM's memory
 #
-# The tmpfiles rule recreates /dev/shm/vypr at every boot with the right owner,
-# but tmpfiles has no way to give a file a size, so it comes back empty. vyprd
-# reads the size from the file and refuses one that is too small, and QEMU only
-# sizes it if the VM happens to start first. Rather than depend on that order,
-# give it its size here - the owner can, and it costs nothing when already right.
-ensure_region() {
-    local want=$(( ${SHM_SIZE_MB:-$SHM_SIZE_MB_DEFAULT} * 1024 * 1024 ))
-    if [ ! -e "$SHM" ]; then
-        die "$SHM does not exist - the tmpfiles rule the installer printed was never applied"
-    fi
-    local have
-    have=$(stat -c%s "$SHM" 2>/dev/null || echo 0)
-    if [ "$have" -lt "$want" ]; then
-        truncate -s "$want" "$SHM" 2>/dev/null || \
-            die "$SHM is $have bytes and could not be grown to $want"
+# Frames are read straight out of the guest's RAM: the agent locks a ring of
+# pages and vyprd finds them in QEMU's memory file. That file is only reachable
+# through /proc/<qemu>/fd, and Linux only shows one process another's files when
+# user *and* group match - so QEMU has to run under this user's group, not
+# libvirt's. One line in qemu.conf, next to the user = line the microphone
+# already needed.
+qemu_conf() {
+    grep -sE "^[[:space:]]*$1[[:space:]]*=" /etc/libvirt/qemu.conf 2>/dev/null | tail -1 |
+        sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?.*/\1/'
+}
+
+ensure_guest_ram() {
+    local want; want=$(id -gn)
+    if [ "$(qemu_conf group)" != "$want" ]; then
+        die "QEMU does not run under your group, so Vypr cannot read frames out of the VM. Run:
+  sudo sed -i 's|^#\\?group = .*|group = \"$want\"|' /etc/libvirt/qemu.conf && sudo systemctl restart virtqemud
+then restart the VM ('virsh shutdown $VM', then 'vypr run' again)"
     fi
 }
 
@@ -241,9 +244,10 @@ start_vm() {
 
 # ----------------------------------------------------------- the guest agent
 #
-# Never taskkill the agent: the IVSHMEM driver does not clean up after a
-# TerminateProcess and leaves an unkillable process holding the device, which
-# takes a guest reboot to clear. Ending the scheduled task lets it exit.
+# Ending the scheduled task rather than killing the process lets the agent stop
+# its captures and give its rings back in order. Killing it is no longer a
+# disaster - Windows takes a dead process's locked pages back by itself, and
+# vyprd stops reading the moment the link drops - but there is no reason to.
 start_agent() {
     local ps
     ps=$(guest 'tasklist /fi "imagename eq vypr-agent.exe" /fo csv /nh' 2>/dev/null || true)
@@ -355,7 +359,7 @@ start_daemon() {
         # win for a mostly-still desktop app, a cost for full-screen motion like
         # a game. The user opts in per their workload, so it is never forced on.
         [ "${VYPR_DAMAGE:-0}" = "1" ] && args+=(--damage)
-        nohup "$BIN/vyprd" --shm "$SHM" "${args[@]}" \
+        nohup "$BIN/vyprd" --shm "$SHM" --vm "$VM" "${args[@]}" \
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2
     fi
@@ -433,7 +437,7 @@ cmd_run() {
     : "${MATCHES:?$profile does not set MATCHES}"
     : "${TASK:?$profile does not set TASK}"
 
-    ensure_region
+    ensure_guest_ram
     start_vm
     start_daemon MATCHES
     start_agent
@@ -685,7 +689,7 @@ cmd_open() {
     stem="${base%.*}"
     APP_NAME="$base"
 
-    ensure_region
+    ensure_guest_ram
     start_vm
     resolve_guest || die "cannot work out where the guest is - is the VM running?"
 
@@ -1225,7 +1229,7 @@ cmd_desktop() {
     # scaled to fit and clicks still land where they are pointed.
     : "${DESKTOP_SIZE:=}"
 
-    ensure_region
+    ensure_guest_ram
     start_vm
     start_daemon matches
     start_agent
@@ -1520,32 +1524,40 @@ cmd_status() {
     # pgrep -c prints 0 and *also* exits non-zero when nothing matches, so a
     # '|| echo 0' fallback appends a second count rather than supplying one.
     printf '  windows open   %s\n' "$(pgrep -xc vypr-window 2>/dev/null || true)"
-    if [ -e "$SHM" ]; then
-        printf '  region         %s (%s MiB)\n' "$SHM" "$(( $(stat -c%s "$SHM") / 1024 / 1024 ))"
+    if [ "$(qemu_conf group)" = "$(id -gn)" ]; then
+        printf '  guest memory   readable\n'
     else
-        printf '  region         missing\n'
+        printf '  guest memory   NOT readable - see vypr doctor\n'
     fi
 }
 
 # A health check for the parts that are easy to get wrong and quiet when they
-# are: a region recreated empty by tmpfiles, a domain that lost its shmem device
-# to an edit in virt-manager, a guest that is up but not answering.
+# are: QEMU running under a group that hides the VM's memory, a domain whose
+# memory is not shared, a guest that is up but not answering.
 cmd_doctor() {
-    local want=$(( ${SHM_SIZE_MB:-$SHM_SIZE_MB_DEFAULT} * 1024 * 1024 ))
     local bad=0
 
-    echo "region"
-    if [ -e "$SHM" ]; then
-        local size owner
-        size=$(stat -c%s "$SHM"); owner=$(stat -c'%U:%G %a' "$SHM")
-        printf '  %s  %s  %s MiB\n' "$SHM" "$owner" "$(( size / 1024 / 1024 ))"
-        if [ "$size" -lt "$want" ]; then
-            echo "  it is smaller than the configured $(( want / 1024 / 1024 )) MiB;"
-            echo "  this is normal after a reboot and 'vypr run' fixes it"
-        fi
+    echo "guest memory"
+    local qgroup; qgroup=$(qemu_conf group)
+    if [ "$qgroup" = "$(id -gn)" ]; then
+        printf '  qemu.conf group  %s, matching this session\n' "$qgroup"
     else
-        echo "  MISSING - apply the tmpfiles rule the installer printed"
+        printf '  qemu.conf group  %s - should be %s, or frames cannot be read\n' \
+            "${qgroup:-the libvirt default}" "$(id -gn)"
+        echo "  fix: sudo sed -i 's|^#\\?group = .*|group = \"$(id -gn)\"|' /etc/libvirt/qemu.conf"
+        echo "       sudo systemctl restart virtqemud, then restart the VM"
         bad=1
+    fi
+    local qpid
+    qpid=$(pgrep -f -- "-name guest=$VM," | head -1)
+    if [ -n "$qpid" ]; then
+        if ls "/proc/$qpid/fd" >/dev/null 2>&1; then
+            echo "  running VM       its memory is readable"
+        else
+            echo "  running VM       its memory is NOT readable - it was started before"
+            echo "                   the group changed; restart it"
+            bad=1
+        fi
     fi
 
     echo "binaries"
@@ -1686,9 +1698,13 @@ cmd_doctor() {
         bad=1
     else
         local xml; xml=$(virsh dumpxml --inactive "$VM" 2>/dev/null)
+        grep -q "<access mode='shared'/>" <<<"$xml" \
+            && echo "  memory        shared with the host" \
+            || { echo "  memory        NOT shared - re-run install/install.sh"; bad=1; }
         grep -q "shmem name='vypr'" <<<"$xml" \
-            && echo "  shmem device  present" \
-            || { echo "  shmem device  MISSING - re-run install/install.sh"; bad=1; }
+            && echo "  shmem device  left over from an older Vypr; harmless, and"
+        grep -q "shmem name='vypr'" <<<"$xml" \
+            && echo "                re-running install/install.sh removes it (frees 512 MiB)"
         grep -q topoext <<<"$xml" \
             && echo "  topoext       required" \
             || echo "  topoext       absent (the guest will not see SMT)"
@@ -1822,7 +1838,7 @@ cmd_guest_notifications() {
     say "The guest will raise notifications again, and Vypr will forward them."
 }
 
-cmd_up()   { ensure_region; start_vm; start_agent; start_parsec; say "Session is up."; }
+cmd_up()   { ensure_guest_ram; start_vm; start_agent; start_parsec; say "Session is up."; }
 cmd_down() {
     pkill -x vypr-window 2>/dev/null
     pkill -x vyprd 2>/dev/null

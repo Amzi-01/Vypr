@@ -1,9 +1,10 @@
 // Vypr - Windows guest installer.
 //
-// One executable, run inside the Windows VM. It puts the agent in place, gives
-// the Linux host a way in over SSH, and installs the two drivers that Vypr
-// cannot work without: IVSHMEM, which is how frames leave the VM, and Parsec's
-// virtual USB driver, which is what makes the mouse behave in games.
+// One executable, run inside the Windows VM. It puts the agent in place, lets it
+// lock memory - frames leave the VM as locked pages of its own RAM, which the
+// host reads directly, so no driver is involved - and gives the Linux host a way
+// in over SSH. Parsec's virtual USB driver, for games that read raw mouse input,
+// is an optional extra.
 //
 // The work runs on a background thread so the window stays responsive, and
 // every step reports into the log box rather than throwing up dialogs. A step
@@ -11,6 +12,7 @@
 // get the agent and SSH, and be told what is missing.
 
 #include <windows.h>
+#include <ntsecapi.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -37,8 +39,6 @@
 #define ID_CHK_HOMEDIR   1016
 #define WM_STEP_DONE     (WM_APP + 1)
 
-static const wchar_t *LG_HOST_URL =
-    L"https://looking-glass.io/artifact/stable/host";
 static const wchar_t *PARSEC_APP_URL =
     L"https://builds.parsec.app/package/parsec-windows.exe";
 static const wchar_t *PARSEC_VUD_URL =
@@ -245,9 +245,8 @@ static void install_agent()
 
     std::wstring exe = dir + L"\\vypr-agent.exe";
 
-    // A running agent holds the IVSHMEM device open, and the driver does not
-    // release it if the process is killed - that takes a reboot to clear. So
-    // ask the task to end and give it a moment, rather than terminating it.
+    // Ask a running agent to end rather than terminating it, so it stops its
+    // captures and gives its memory back in order before the file is replaced.
     run(L"schtasks /end /tn vypr-agent", true);
     Sleep(2000);
 
@@ -293,48 +292,64 @@ static void install_agent()
 
 // ------------------------------------------------------------------ drivers
 
-static bool device_has_driver(const wchar_t *hwid_fragment)
+/*
+ * The agent's ring memory.
+ *
+ * Frames leave the VM as pages of its own RAM: the agent locks them with
+ * Windows' AWE calls, which say exactly which physical pages it got, and the
+ * host reads those pages straight out of QEMU's memory file. That needs no
+ * driver at all - only the right to lock pages, which Windows gives nobody by
+ * default. It is granted to the account the agent runs as, which is this one,
+ * and like any user right it applies from the next sign-in.
+ */
+static void grant_lock_pages()
 {
-    std::wstring q =
-        L"$d = Get-PnpDevice | Where-Object { $_.InstanceId -like '*" +
-        std::wstring(hwid_fragment) + L"*' -and $_.Status -eq 'OK' }\n"
-        L"if ($d) { exit 0 } else { exit 1 }\n";
-    return powershell(q, true) == 0;
-}
+    logf(L"Memory for frames (lets the agent lock pages to stream through)");
 
-static void install_ivshmem()
-{
-    logf(L"IVSHMEM driver (this is how frames leave the VM)");
+    HANDLE token = nullptr;
+    BYTE buf[256];
+    DWORD got = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) ||
+        !GetTokenInformation(token, TokenUser, buf, sizeof(buf), &got)) {
+        if (token) CloseHandle(token);
+        step_ok(false, L"could not tell which account this is");
+        return;
+    }
+    CloseHandle(token);
+    PSID sid = reinterpret_cast<TOKEN_USER *>(buf)->User.Sid;
 
-    if (device_has_driver(L"VEN_1AF4&DEV_1110")) {
-        logf(L"  [ok] already installed");
+    LSA_OBJECT_ATTRIBUTES oa{};
+    LSA_HANDLE policy = nullptr;
+    if (LsaOpenPolicy(nullptr, &oa, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, &policy) != 0) {
+        step_ok(false, L"could not open the local security policy");
         return;
     }
 
-    std::wstring zip = temp_dir() + L"looking-glass-host.zip";
-    std::wstring dir = temp_dir() + L"vypr-lg";
+    wchar_t name[] = L"SeLockMemoryPrivilege";
+    LSA_UNICODE_STRING right;
+    right.Buffer        = name;
+    right.Length        = (USHORT)(wcslen(name) * sizeof(wchar_t));
+    right.MaximumLength = right.Length + sizeof(wchar_t);
 
-    logf(L"  downloading the Looking Glass host package...");
-    if (URLDownloadToFileW(nullptr, LG_HOST_URL, zip.c_str(), 0, nullptr) != S_OK) {
-        logf(L"  [!!] could not download it. The driver ships with the Looking");
-        logf(L"       Glass host package - install that by hand from");
-        logf(L"       looking-glass.io and run this again.");
-        g_failed = true;
-        return;
+    bool had = false;
+    PLSA_UNICODE_STRING rights = nullptr;
+    ULONG count = 0;
+    if (LsaEnumerateAccountRights(policy, sid, &rights, &count) == 0) {
+        for (ULONG i = 0; i < count; i++)
+            if (rights[i].Length == right.Length &&
+                _wcsnicmp(rights[i].Buffer, name, right.Length / sizeof(wchar_t)) == 0)
+                had = true;
+        LsaFreeMemory(rights);
     }
 
-    // It is the only package that carries a signed ivshmem.inf; its installer
-    // lays the files down, and pnputil then binds them to the device.
-    powershell(L"Expand-Archive -LiteralPath '" + zip + L"' -DestinationPath '" +
-               dir + L"' -Force", true);
-    if (run_bounded(L"\"" + dir + L"\\looking-glass-host-setup.exe\" /S", 180000)
-        == (DWORD)-2)
-        logf(L"  [!!] the Looking Glass installer did not finish in time");
-
-    std::wstring inf = L"C:\\Program Files\\Looking Glass (host)\\ivshmem.inf";
-    run(L"pnputil /add-driver \"" + inf + L"\" /install", true);
-
-    step_ok(device_has_driver(L"VEN_1AF4&DEV_1110"), L"IVSHMEM driver installed");
+    if (had) {
+        logf(L"  [ok] this account can already lock pages");
+    } else {
+        const NTSTATUS st = LsaAddAccountRights(policy, sid, &right, 1);
+        step_ok(st == 0, L"'Lock pages in memory' granted to this account");
+        if (st == 0) logf(L"  [--] it applies from the next sign-in, so reboot when this finishes");
+    }
+    LsaClose(policy);
 }
 
 static void install_parsec_vud()
@@ -706,7 +721,6 @@ static void setup_autologin(std::wstring &password)
 
 static DWORD WINAPI worker(LPVOID)
 {
-    bool want_drivers   = SendMessageW(g_chk_drivers, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_parsec    = SendMessageW(g_chk_parsec, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_ssh       = SendMessageW(g_chk_ssh, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool want_autologin = SendMessageW(g_chk_autologin, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -731,7 +745,7 @@ static DWORD WINAPI worker(LPVOID)
     }
 
     install_agent();
-    if (want_drivers)   install_ivshmem();
+    grant_lock_pages();
     if (want_parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
     if (want_ssh)       setup_ssh(pubkey);
     name_audio_endpoints();
@@ -774,8 +788,11 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l)
            L"except the agent.",
            0, 24, 56, 520, 40, 0, h);
 
-        g_chk_drivers = mk(L"BUTTON", L"IVSHMEM driver \x2014 how frames leave the VM",
-                           BS_AUTOCHECKBOX, 24, 108, 480, 22, ID_CHK_DRIVERS, h);
+        // Not a choice any more - frames cannot leave the VM without it - but
+        // shown, so the one change to Windows security policy is not a secret.
+        g_chk_drivers = mk(L"BUTTON",
+                           L"Let the agent lock memory \x2014 how frames leave the VM (always)",
+                           BS_AUTOCHECKBOX | WS_DISABLED, 24, 108, 480, 22, ID_CHK_DRIVERS, h);
         g_chk_parsec = mk(L"BUTTON",
                           L"Input drivers \x2014 a mouse games accept, controllers, and a display",
                           BS_AUTOCHECKBOX, 24, 132, 480, 22, ID_CHK_PARSEC, h);

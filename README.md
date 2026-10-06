@@ -137,15 +137,19 @@ Two installers, one per side.
 ```
 
 It builds and installs the binaries, configures your VM, generates a key for the
-guest, and prints the two commands that need root rather than asking for your
-password. It only changes the VM where something is actually missing, and saves
+guest, and prints the few commands that need root rather than asking for your
+password - among them one line in `/etc/libvirt/qemu.conf` that lets Vypr read
+frames straight out of the VM's memory. It only changes the VM where something is actually missing, and saves
 the original settings before it does.
 
 **In Windows**, run `vypr-setup.exe` from the
 [latest release](https://github.com/Amzi-01/Vypr/releases/latest) inside the VM.
-One file, nothing to unpack: it carries the agent, installs the two drivers Vypr
-needs, and authorises the key the Linux installer printed. Windows will ask you
-to accept the drivers, which only a person can click.
+One file, nothing to unpack: it carries the agent, gives it the one Windows right
+it needs to stream ("Lock pages in memory" - no driver is involved), and
+authorises the key the Linux installer printed. It can also install Parsec's
+mouse driver, for games that read raw mouse input; Windows will ask you to
+accept that one, which only a person can click. Restart Windows afterwards so
+the new right applies.
 
 It can also turn on automatic login, because Vypr needs a logged-in desktop to
 capture — a VM sitting at the lock screen has nothing to show. That asks for your

@@ -33,7 +33,7 @@
 #include "drop.hpp"
 #include "notify.hpp"
 #include "input.hpp"
-#include "ivshmem.hpp"
+#include "awe.hpp"
 #include "publisher.hpp"
 #include "geometry.hpp"
 #include "windows_list.hpp"
@@ -41,10 +41,18 @@
 namespace {
 
 struct Stream {
+    /* Declared first so it is destroyed last: the capture writes into the
+     * ring through the publisher until it is stopped. */
+    vypr::GuestRing     ring;
     vypr::Publisher     pub;
     vypr::WindowCapture capture;
     std::uint32_t       slot = 0;
     bool                want_damage = false;   /* carried into a restart */
+
+    /* What the host asked for, and how this ring's pages were stamped. */
+    vypr_msg_attach     at{};
+    std::uint64_t       nonce = 0;
+    HWND                hwnd = nullptr;
 
     /* For noticing that WGC has stopped calling back. */
     std::uint64_t last_arrived = 0;
@@ -59,10 +67,10 @@ public:
 private:
     void on_message(std::uint16_t type, const std::uint8_t* payload, std::uint32_t bytes);
     void handle_attach(const vypr_msg_attach& msg);
+    void handle_ring_ready(const vypr_msg_ring_ready& msg);
     void handle_detach(std::uint64_t window_id);
     void watch_windows();
 
-    vypr::Region       region_;
     vypr::Control      control_;
     vypr::Control      audio_link_;   /* audio only; written by one thread */
     vypr::AudioCapture audio_;
@@ -74,6 +82,14 @@ private:
 
     std::mutex                                          lock_;
     std::map<std::uint64_t, std::unique_ptr<Stream>>    streams_;
+    /* Rings sent to the host and waiting for RING_READY. Kept apart so the
+     * watcher, which restarts captures it thinks have stalled, never sees a
+     * stream that has not started yet. */
+    std::map<std::uint64_t, std::unique_ptr<Stream>>    pending_;
+
+    /* Whether this process may lock pages; without it no ring can exist. */
+    bool          locked_pages_ = false;
+    std::string   lock_problem_;
     std::map<std::uint64_t, vypr::WindowInfo>           known_;
 
     std::atomic<bool> stop_{false};
@@ -299,31 +315,112 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
     if (!whole_desktop) vypr::nudge_onscreen(msg.window_id);
 
     auto stream = std::make_unique<Stream>();
-    stream->slot = msg.slot;
+    stream->slot        = msg.slot;
+    stream->at          = msg;
+    stream->hwnd        = hwnd;
+    stream->want_damage = (msg.flags & VYPR_ATTACH_DAMAGE) != 0;
 
-    if (!stream->pub.bind(region_.base(), region_.bytes(), msg.slot)) {
-        std::fprintf(stderr, "vypr: slot %u not armed for us; host re-carved the region\n",
-                     msg.slot);
-        result.status = -2;
+    /*
+     * The ring: a header page and the frame buffers, as locked pages of this
+     * guest's own RAM. Allocated here rather than up front, so a window costs
+     * memory only while it is being streamed, and only what its size needs.
+     */
+    const std::uint64_t ring_bytes = VYPR_RING_HEADER_BYTES +
+                                     msg.frame_bytes * VYPR_RING_FRAMES;
+    if (msg.frame_bytes == 0 || (msg.frame_bytes % VYPR_PAGE_BYTES) ||
+        ring_bytes / VYPR_PAGE_BYTES > VYPR_MAX_RING_PAGES) {
+        result.status = VYPR_ATTACH_NO_MEMORY;
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+    if (!locked_pages_ || !stream->ring.allocate(static_cast<std::size_t>(ring_bytes))) {
+        const std::string why = locked_pages_
+            ? "the guest is too short of free memory to lock a ring for this window"
+            : lock_problem_;
+        std::fprintf(stderr, "vypr: cannot stream HWND %p: %s\n",
+                     reinterpret_cast<void*>(hwnd), why.c_str());
+        control_.send(VYPR_MSG_LOG, why.data(), static_cast<std::uint32_t>(why.size()));
+        result.status = VYPR_ATTACH_NO_MEMORY;
         control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
         return;
     }
 
-    const bool want_damage = (msg.flags & VYPR_ATTACH_DAMAGE) != 0;
-    stream->want_damage = want_damage;
-    if (!stream->capture.start(hwnd, &stream->pub, want_damage)) {
-        result.status = -3;
-        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
-        return;
+    /* Stamp every page, then say where they are. The host reads each stamp
+     * back before it allows a single frame to be written. */
+    stream->nonce = vypr::ring_nonce();
+    vypr::stamp_pages(stream->ring.base(), stream->ring.pages(), stream->ring.pfns(),
+                      stream->nonce);
+
+    std::vector<std::uint8_t> buf(VYPR_MAX_MSG_BYTES);
+    const auto total = static_cast<std::uint32_t>(stream->ring.pages());
+    for (std::uint32_t first = 0; first < total; ) {
+        const std::uint32_t n = std::min<std::uint32_t>(VYPR_RING_PAGES_PER_MSG, total - first);
+        vypr_msg_ring_pages rp{};
+        rp.window_id   = msg.window_id;
+        rp.slot        = msg.slot;
+        rp.epoch       = msg.generation;
+        rp.nonce       = stream->nonce;
+        rp.total_pages = total;
+        rp.first       = first;
+        rp.count       = n;
+        std::memcpy(buf.data(), &rp, sizeof(rp));
+        std::memcpy(buf.data() + sizeof(rp), stream->ring.pfns() + first, n * sizeof(std::uint64_t));
+        control_.send(VYPR_MSG_RING_PAGES, buf.data(),
+                      static_cast<std::uint32_t>(sizeof(rp) + n * sizeof(std::uint64_t)));
+        first += n;
     }
 
     {
         std::lock_guard<std::mutex> guard(lock_);
-        streams_[msg.window_id] = std::move(stream);
+        pending_[msg.window_id] = std::move(stream);
     }
-
     result.status = 0;
     control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
+}
+
+void Agent::handle_ring_ready(const vypr_msg_ring_ready& msg) {
+    std::unique_ptr<Stream> stream;
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        auto it = pending_.find(msg.window_id);
+        if (it == pending_.end()) return;
+        if (it->second->at.slot != msg.slot || it->second->at.generation != msg.epoch) return;
+        stream = std::move(it->second);
+        pending_.erase(it);
+    }
+
+    vypr_msg_attach_result result{};
+    result.window_id = msg.window_id;
+    result.slot      = msg.slot;
+
+    if (msg.status != 0) {
+        /* The host could not verify the ring. Nothing was written to it; the
+         * stream and its pages simply go. */
+        std::fprintf(stderr, "vypr: host rejected the ring for HWND %p (%d)\n",
+                     reinterpret_cast<void*>(stream->hwnd), msg.status);
+        return;
+    }
+
+    if (!stream->pub.bind(stream->ring.base(), stream->ring.bytes(), stream->at, stream->nonce)) {
+        result.status = VYPR_ATTACH_NO_MEMORY;
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+
+    if (!stream->capture.start(stream->hwnd, &stream->pub, stream->want_damage)) {
+        /* Late, but the host handles a refusal after the ring went out the
+         * same way as one before it: it drops the window. */
+        stream->pub.close();
+        result.status = VYPR_ATTACH_NO_CAPTURE;
+        control_.send(VYPR_MSG_ATTACH_RESULT, &result, sizeof(result));
+        return;
+    }
+
+    const HWND hwnd = stream->hwnd;
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        streams_[msg.window_id] = std::move(stream);
+    }
     std::fprintf(stderr, "vypr: streaming HWND %p into slot %u\n",
                  reinterpret_cast<void*>(hwnd), msg.slot);
 
@@ -338,12 +435,19 @@ void Agent::handle_detach(std::uint64_t window_id) {
     {
         std::lock_guard<std::mutex> guard(lock_);
         auto it = streams_.find(window_id);
-        if (it == streams_.end()) return;
-        dying = std::move(it->second);
-        streams_.erase(it);
+        if (it != streams_.end()) {
+            dying = std::move(it->second);
+            streams_.erase(it);
+        } else {
+            // Detached before the host said its ring was ready: nothing was
+            // started, so there is only the memory to give back.
+            pending_.erase(window_id);
+            return;
+        }
     }
     // Destroyed outside the lock: stopping a capture waits for an in-flight
-    // frame callback, which itself wants the lock.
+    // frame callback, which itself wants the lock. The ring goes last, with
+    // the stream - only once nothing can be writing into it.
     dying->capture.stop();
     dying->pub.close();
 }
@@ -352,6 +456,9 @@ void Agent::on_message(std::uint16_t type, const std::uint8_t* payload, std::uin
     switch (type) {
     case VYPR_MSG_ATTACH:
         if (auto* m = as<vypr_msg_attach>(payload, bytes)) handle_attach(*m);
+        break;
+    case VYPR_MSG_RING_READY:
+        if (auto* m = as<vypr_msg_ring_ready>(payload, bytes)) handle_ring_ready(*m);
         break;
     case VYPR_MSG_GAMEPAD:
         if (auto* m = as<vypr_msg_gamepad>(payload, bytes)) gamepads_.apply(*m);
@@ -729,11 +836,11 @@ bool Agent::run(const char* host, std::uint16_t port) {
         std::fprintf(stderr, "vypr: no audio channel; sound disabled\n");
     }
 
-    // The region only exists once the host has formatted it, so this comes
-    // after the connection rather than before.
-    for (int attempt = 0; attempt < 20 && !region_.open(); attempt++)
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    if (!region_.valid()) return false;
+    // Rings are locked pages of this guest's RAM; without the right to lock
+    // them nothing can be streamed. Connect anyway, so the host can say why.
+    locked_pages_ = vypr::enable_locked_pages(&lock_problem_);
+    if (!locked_pages_)
+        std::fprintf(stderr, "vypr: no windows can be streamed: %s\n", lock_problem_.c_str());
 
     LARGE_INTEGER freq{};
     QueryPerformanceFrequency(&freq);
@@ -741,7 +848,6 @@ bool Agent::run(const char* host, std::uint16_t port) {
     vypr_msg_hello hello{};
     hello.version      = VYPR_PROTO_VERSION;
     hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
-    hello.shm_bytes    = region_.bytes();
     hello.agent_pid    = GetCurrentProcessId();
     hello.capabilities = VYPR_CAP_RESIZE;
     control_.send(VYPR_MSG_HELLO, &hello, sizeof(hello));
@@ -764,6 +870,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
         s->pub.close();
     }
     streams_.clear();
+    pending_.clear();
     return true;
 }
 

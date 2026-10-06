@@ -1,34 +1,44 @@
 # VM changes vypr needs
 
-The VM already passes through the RTX 5050 and has a 128 MB IVSHMEM device named
-`looking-glass`. vypr needs its own, larger region, added alongside rather than
-replacing it so Looking Glass keeps working.
+`install/install.sh` makes the domain changes below and prints the two lines of
+`qemu.conf` it needs root for. All of this requires the guest powered off.
 
-All of this requires the guest powered off.
+## 1. Guest memory shared with the host
 
-## 1. A second IVSHMEM device
-
-`virsh edit RDPWindows`, then add inside `<devices>`:
+Frames travel through the guest's own RAM: the agent locks each window's ring
+as physical pages and the host reads those pages out of QEMU's memory file. That
+file only exists when the domain's memory is a shared memfd:
 
 ```xml
-<shmem name='vypr'>
-  <model type='ivshmem-plain'/>
-  <size unit='M'>512</size>
-</shmem>
+<memoryBacking>
+  <source type='memfd'/>
+  <access mode='shared'/>
+</memoryBacking>
 ```
 
-512 MB holds three 4K buffers for one window plus several 1080p windows.
-Uncompressed rings are large: a 4K slot is 96 MB, a 1080p slot 24 MB.
+virtiofs needs exactly the same, so a VM with a home share already has it.
 
-The region appears on the host as `/dev/shm/vypr`, owned by the qemu user, so
-the host tools need it group-readable — the same arrangement the existing
-`looking-glass` region already uses.
+Older versions of Vypr added an IVSHMEM device instead (`<shmem name='vypr'>`,
+512 MB). It needed Looking Glass's kernel driver in the guest and is not used any
+more; the installer removes it, which also gives the 512 MB of host RAM back.
 
-## 2. IVSHMEM driver in the guest
+## 2. QEMU under your group
 
-Not currently installed. It ships with Looking Glass, not with virtio-win: the
-signed `ivshmem` driver from the Looking Glass release matching the host tools.
-Without it the guest sees an unknown PCI device and the BAR is unreachable.
+The host finds guest RAM at `/proc/<qemu pid>/fd/N`, and Linux only lets one
+process open another's files when both user *and* group match. libvirt runs QEMU
+under its own group by default, so `/etc/libvirt/qemu.conf` needs, next to the
+`user =` line the microphone already needed:
+
+```
+user = "lucy"
+group = "lucy"
+```
+
+then `sudo systemctl restart virtqemud`, and a restart of the VM so it picks the
+new group up. `vypr doctor` checks both halves.
+
+No driver is needed in the guest for frames. The agent needs one Windows user
+right, "Lock pages in memory", which `vypr-setup` grants.
 
 ## 3. Build environment in the guest
 
@@ -45,8 +55,8 @@ out without copying through the network:
 </filesystem>
 ```
 
-virtiofs also needs `<memoryBacking><access mode='shared'/></memoryBacking>` on
-the domain, and WinFsp installed in the guest.
+virtiofs also needs the shared memory backing from step 1, and WinFsp installed
+in the guest.
 
 ## 4. A display must be attached
 
@@ -80,8 +90,7 @@ virsh detach-device RDPWindows tablet.xml --live --config
 
 Leaving only `<input type='mouse' bus='ps2'/>`, a relative device. The cost is
 that the SPICE console pointer now needs to be grabbed rather than tracking the
-host pointer, which does not matter when the guest is driven through vypr or
-Looking Glass.
+host pointer, which does not matter when the guest is driven through vypr.
 
 ## 6. Parsec, running in the tray - for the mouse
 

@@ -10,8 +10,7 @@ set -uo pipefail
 
 VERSION="0.1.0"
 PREFIX="${PREFIX:-$HOME/.local}"
-SHM_NAME="vypr"
-SHM_SIZE_MB=512
+SHM_NAME="vypr"   # the shared-memory device older versions added
 PORT=47820
 BRIDGE_IP="${BRIDGE_IP:-192.168.122.1}"
 KEY="$HOME/.ssh/vypr-guest"
@@ -223,9 +222,9 @@ trap 'rm -rf "$tmp"' EXIT
 virsh dumpxml --inactive "$DOMAIN" > "$tmp/domain.xml"
 cp "$tmp/domain.xml" "$tmp/domain.bak.xml"
 
-changes=$(python3 - "$tmp/domain.xml" "$SHM_NAME" "$SHM_SIZE_MB" <<'PY'
+changes=$(python3 - "$tmp/domain.xml" "$SHM_NAME" <<'PY'
 import sys, xml.etree.ElementTree as ET
-path, name, size = sys.argv[1], sys.argv[2], sys.argv[3]
+path, name = sys.argv[1], sys.argv[2]
 
 # Passthrough domains routinely carry a <qemu:commandline> block. Without
 # registering the prefix, ElementTree would rewrite it as ns0: and libvirt
@@ -233,17 +232,38 @@ path, name, size = sys.argv[1], sys.argv[2], sys.argv[3]
 for prefix, uri in (
     ("qemu", "http://libvirt.org/schemas/domain/qemu/1.0"),
     ("lxc",  "http://libvirt.org/schemas/domain/lxc/1.0"),
+    ("libosinfo", "http://libosinfo.org/xmlns/libvirt/domain/1.0"),
 ):
     ET.register_namespace(prefix, uri)
 
 tree = ET.parse(path); root = tree.getroot(); dev = root.find("devices")
 changed = []
 
-if not any(s.get("name") == name for s in dev.findall("shmem")):
-    sh = ET.SubElement(dev, "shmem"); sh.set("name", name)
-    ET.SubElement(sh, "model").set("type", "ivshmem-plain")
-    sz = ET.SubElement(sh, "size"); sz.set("unit", "M"); sz.text = size
-    changed.append("added the %s shared-memory device (%s MiB)" % (name, size))
+# Frames used to travel through an IVSHMEM device, which needed a third-party
+# driver in the guest. They are read out of guest RAM now (below), so an older
+# install's device is only 512 MiB of host memory held for nothing.
+for sh in list(dev.findall("shmem")):
+    if sh.get("name") == name:
+        dev.remove(sh)
+        changed.append("removed the old %s shared-memory device, no longer needed" % name)
+
+# Frames are read straight out of guest RAM, which QEMU only exposes when the
+# RAM is a shared memory file. virtiofs needs the same thing, so a domain with a
+# home share already has it.
+mb = root.find("memoryBacking")
+if mb is None:
+    mb = ET.Element("memoryBacking")
+    # libvirt wants it early in the domain; after <currentMemory> is right.
+    anchor = root.find("currentMemory") if root.find("currentMemory") is not None else root.find("memory")
+    root.insert(list(root).index(anchor) + 1 if anchor is not None else 0, mb)
+if mb.find("source") is None and mb.find("hugepages") is None:
+    ET.SubElement(mb, "source").set("type", "memfd")
+    changed.append("gave the VM memfd memory, so the host can read its frames")
+if mb.find("access") is None or mb.find("access").get("mode") != "shared":
+    acc = mb.find("access")
+    if acc is None: acc = ET.SubElement(mb, "access")
+    acc.set("mode", "shared")
+    changed.append("shared the VM's memory with the host")
 
 # An absolute pointing device makes raw-input games throw the view into a
 # corner, whoever is sending the input. It cannot be compensated for on the host.
@@ -510,6 +530,19 @@ else
     MANUAL+=("sudo sed -i 's|^#\\?user = .*|user = \"$USER\"|' /etc/libvirt/qemu.conf && sudo systemctl restart virtqemud   # let the VM use your mic")
 fi
 
+# And under your group. Frames are read out of the VM's RAM through
+# /proc/<qemu>/fd, which Linux only opens for a process whose user *and* group
+# both match QEMU's - libvirt's default group shuts Vypr out.
+my_group=$(id -gn)
+qemu_group=$(grep -sE "^[[:space:]]*group[[:space:]]*=" /etc/libvirt/qemu.conf 2>/dev/null |
+             tail -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ "$qemu_group" = "$my_group" ]; then
+    ok "QEMU runs under your group, so Vypr can read frames out of the VM"
+else
+    warn "QEMU does not run under your group, so Vypr cannot read frames yet"
+    MANUAL+=("sudo sed -i 's|^#\\?group = .*|group = \"$my_group\"|' /etc/libvirt/qemu.conf && sudo systemctl restart virtqemud   # let Vypr read frames; restart the VM after")
+fi
+
 # ------------------------------------------------------------- home folder
 head2 "Sharing your home folder"
 
@@ -579,20 +612,14 @@ PY
     fi
 fi
 
-# ---------------------------------------------------------------- shared region
-head2 "Shared memory"
-
-if [ ! -e "/dev/shm/$SHM_NAME" ]; then
-    install -m 0660 /dev/null "/dev/shm/$SHM_NAME" 2>/dev/null && \
-        chgrp kvm "/dev/shm/$SHM_NAME" 2>/dev/null && \
-        truncate -s "${SHM_SIZE_MB}M" "/dev/shm/$SHM_NAME" && \
-        ok "created /dev/shm/$SHM_NAME" || warn "could not create /dev/shm/$SHM_NAME"
-else
-    ok "/dev/shm/$SHM_NAME exists"
+# ------------------------------------------------------- the old shared region
+# Before frames moved into guest RAM, a tmpfiles rule kept /dev/shm/vypr around
+# for the IVSHMEM device. Nothing uses it now, and once a VM has run with the
+# device it holds 512 MiB of RAM until it is removed.
+if [ -e /etc/tmpfiles.d/10-vypr.conf ] || [ -e /dev/shm/vypr ]; then
+    warn "the old shared-memory region from an earlier Vypr is still set up"
+    MANUAL+=("sudo rm -f /etc/tmpfiles.d/10-vypr.conf; rm -f /dev/shm/$SHM_NAME   # the old frame region, unused since frames moved into the VM's RAM")
 fi
-# Printed for the user to paste, so it has to work in whatever shell they run.
-# A here-string is bash syntax and fish rejects it outright; a pipe is universal.
-MANUAL+=("echo 'f /dev/shm/$SHM_NAME 0660 $USER kvm -' | sudo install -Dm644 /dev/stdin /etc/tmpfiles.d/10-vypr.conf   # so it survives a reboot")
 
 # --------------------------------------------------------------------- firewall
 head2 "Firewall"
@@ -653,10 +680,6 @@ VM="$DOMAIN"
 GUEST="$guest_ip"
 GUEST_USER="$guest_user"
 
-# Must match the <shmem> size in the domain. The launcher grows the region to
-# this before starting anything, because the tmpfiles rule recreates it empty.
-SHM_SIZE_MB=$SHM_SIZE_MB
-
 # Parsec is started alongside the session because its driver is what makes the
 # mouse work in games that read raw input. Set to 0 if you do not play those.
 USE_PARSEC=1
@@ -693,10 +716,11 @@ cat <<EOF
 
     ${bold}vypr-setup.exe${rst}   (from the release page, or install/windows/)
 
-  Copy it into the VM and run it. It installs the agent, the IVSHMEM driver,
-  and the drivers that make the mouse and audio behave, then registers the
-  agent to start with the desktop. It will ask you to accept a driver prompt
-  or two, which Windows requires a person to click.
+  Copy it into the VM and run it. It installs the agent, gives it the one
+  Windows right it needs to stream (no driver: frames are read straight out
+  of the VM's memory), and registers it to start with the desktop. If you
+  tick Parsec's mouse driver for raw-input games, Windows will ask you to
+  accept it, which only a person can click. Restart Windows afterwards.
 
   It needs this public key, so the host can drive it:
 
@@ -705,7 +729,7 @@ $(sed 's/^/    /' "$KEY.pub")
 EOF
 
 if [ "${#MANUAL[@]}" -gt 0 ]; then
-    printf '  %sTwo of these need root, so they are yours to run:%s\n\n' "$bold" "$rst"
+    printf '  %sThese need root, so they are yours to run:%s\n\n' "$bold" "$rst"
     for m in "${MANUAL[@]}"; do printf '    %s\n' "$m"; done
     printf '\n'
 fi

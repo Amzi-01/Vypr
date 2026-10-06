@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,12 @@ private:
 
     std::uint64_t sock_ = ~0ull;   // SOCKET, kept opaque
     std::vector<std::uint8_t> rx_;
+
+    // Held across a whole message. Several threads send - the control thread,
+    // the window watcher, clipboard and notification callbacks - and a send
+    // that goes out in two pieces would otherwise let another thread's message
+    // land in the middle of it, which the far end reads as garbage from then on.
+    std::mutex send_lock_;
 };
 
 }  // namespace vypr

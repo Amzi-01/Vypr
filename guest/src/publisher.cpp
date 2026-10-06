@@ -10,15 +10,11 @@ namespace vypr {
 
 namespace {
 // std::atomic_ref rather than atomics in the struct itself: the layout is a C
-// struct shared with the host and with the kernel's view of the BAR, so it must
-// stay a plain struct. atomic_ref gives the ordering without changing that.
+// struct shared with the host, so it must stay a plain struct. atomic_ref
+// gives the ordering without changing that.
 inline void store_release(volatile std::uint32_t& v, std::uint32_t x) {
     std::atomic_ref<std::uint32_t> r(const_cast<std::uint32_t&>(v));
     r.store(x, std::memory_order_release);
-}
-inline std::uint32_t load_acquire(const volatile std::uint32_t& v) {
-    std::atomic_ref<std::uint32_t> r(const_cast<std::uint32_t&>(v));
-    return r.load(std::memory_order_acquire);
 }
 inline void store_relaxed(volatile std::uint32_t& v, std::uint32_t x) {
     std::atomic_ref<std::uint32_t> r(const_cast<std::uint32_t&>(v));
@@ -26,75 +22,88 @@ inline void store_relaxed(volatile std::uint32_t& v, std::uint32_t x) {
 }
 
 /*
- * Drain the write-combining buffers.
+ * Order streaming stores.
  *
- * The region is mapped write-combined (see ivshmem.cpp), and x86's ordinary
- * store ordering does not cover WC memory: stores to it may become visible out
- * of order and may sit in a fill buffer indefinitely. The C++ fences below
- * compile to nothing on x86, so on their own they order the compiler and not
- * the hardware - the host could see the even sequence number before the last
- * rows of pixels, or not see it at all until the buffer happens to evict.
- * SFENCE is the instruction that makes WC stores globally visible, in order.
+ * Rings are ordinary write-back RAM now, where x86 keeps plain stores in
+ * order by itself - but a large memcpy is free to use non-temporal stores, and
+ * those are weakly ordered: the host could see the even sequence number before
+ * the last rows of pixels. SFENCE is the instruction that puts them in order.
+ * The C++ fences below compile to nothing on x86, so on their own they would
+ * order the compiler and not the hardware.
  */
-inline void wc_fence() {
+inline void store_fence() {
 #if defined(_M_X64) || defined(__x86_64__)
     _mm_sfence();
 #endif
 }
 }  // namespace
 
-bool Publisher::bind(void* base, std::size_t region_bytes, std::uint32_t slot_index) {
-    slot_ = nullptr;
-    if (!base || slot_index >= VYPR_MAX_SLOTS) return false;
+void stamp_pages(void* ring, std::size_t pages, const std::uint64_t* pfns,
+                 std::uint64_t nonce) {
+    auto* base = static_cast<std::uint8_t*>(ring);
+    for (std::size_t i = 0; i < pages; i++) {
+        vypr_page_stamp st{VYPR_PAGE_MAGIC, nonce, i, pfns[i]};
+        std::memcpy(base + i * VYPR_PAGE_BYTES, &st, sizeof(st));
+    }
+    store_fence();
+}
 
-    auto* hdr = static_cast<vypr_shm_header*>(base);
-    if (load_acquire(hdr->magic) != VYPR_SHM_MAGIC) return false;
-    if (hdr->version != VYPR_SHM_VERSION) return false;
+bool Publisher::bind(void* ring, std::size_t ring_bytes, const vypr_msg_attach& at,
+                     std::uint64_t nonce) {
+    hdr_ = nullptr;
+    if (!ring || at.frame_bytes == 0 || at.frame_stride == 0) return false;
 
-    vypr_slot* slot = &hdr->slots[slot_index];
-    if (load_acquire(slot->state) != VYPR_SLOT_ARMED) return false;
+    // The host computed these, but a mismatch here writes pixels outside the
+    // ring, so check rather than trust.
+    const std::uint64_t need = VYPR_RING_HEADER_BYTES + at.frame_bytes * VYPR_RING_FRAMES;
+    if (need > ring_bytes) return false;
+    if (static_cast<std::uint64_t>(at.frame_stride) * at.max_height > at.frame_bytes) return false;
+    static_assert(sizeof(vypr_ring_header) <= VYPR_RING_HEADER_BYTES, "ring header outgrew its page");
 
-    // The host computes these, but a mismatch here writes pixels outside the
-    // region, so check rather than trust.
-    if (slot->frame_bytes == 0 || slot->frame_stride == 0) return false;
-    const std::uint64_t span = slot->ring_offset +
-                               slot->frame_bytes * VYPR_RING_FRAMES;
-    if (span > region_bytes) return false;
-    if (static_cast<std::uint64_t>(slot->frame_stride) * slot->max_height >
-        slot->frame_bytes) return false;
+    auto* h = static_cast<vypr_ring_header*>(ring);
+    // The page still holds the stamp the host checked. Clear it, so nothing of
+    // it can be mistaken for a field.
+    std::memset(h, 0, sizeof(*h));
+    h->version      = VYPR_SHM_VERSION;
+    h->nonce        = nonce;
+    h->window_id    = at.window_id;
+    h->slot         = at.slot;
+    h->epoch        = at.generation;
+    h->frame_offset = VYPR_RING_HEADER_BYTES;
+    h->frame_bytes  = at.frame_bytes;
+    h->max_width    = at.max_width;
+    h->max_height   = at.max_height;
+    h->frame_stride = at.frame_stride;
+    h->format       = at.format;
+    h->state        = VYPR_RING_READY;
+    // Magic last: the host reads nothing until it sees it.
+    std::atomic_thread_fence(std::memory_order_release);
+    store_fence();
+    store_release(*reinterpret_cast<volatile std::uint32_t*>(&h->magic), VYPR_RING_MAGIC);
 
-    base_   = static_cast<std::uint8_t*>(base);
-    bytes_  = region_bytes;
-    slot_   = slot;
-    epoch_  = slot->epoch;
-    ring_   = base_ + slot->ring_offset;
-    index_  = 0;
-    serial_ = 0;
+    hdr_         = h;
+    frames_      = static_cast<std::uint8_t*>(ring) + VYPR_RING_HEADER_BYTES;
+    frame_bytes_ = at.frame_bytes;
+    index_       = 0;
+    serial_      = 0;
     return true;
 }
 
 std::uint8_t* Publisher::begin_frame(std::uint32_t* out_stride) const {
-    if (!slot_) return nullptr;
-    if (out_stride) *out_stride = slot_->frame_stride;
-    return ring_ + static_cast<std::size_t>(index_) * slot_->frame_bytes;
+    if (!hdr_) return nullptr;
+    if (out_stride) *out_stride = hdr_->frame_stride;
+    return frames_ + static_cast<std::size_t>(index_) * frame_bytes_;
 }
 
 bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t stride,
                         std::uint64_t capture_ts, std::uint64_t ts_freq,
                         std::uint32_t flags,
                         const vypr_rect* damage, std::uint32_t damage_count) {
-    if (!slot_) return false;
-
-    // The host handed this slot index to somebody else. Writing now would put
-    // this window's pixels into theirs, so stop for good rather than race.
-    if (load_acquire(slot_->epoch) != epoch_) {
-        slot_ = nullptr;
-        return false;
-    }
+    if (!hdr_) return false;
 
     if (width == 0 || height == 0) return false;
-    if (width > slot_->max_width || height > slot_->max_height) return false;
-    if (static_cast<std::uint64_t>(stride) * height > slot_->frame_bytes) return false;
+    if (width > hdr_->max_width || height > hdr_->max_height) return false;
+    if (static_cast<std::uint64_t>(stride) * height > frame_bytes_) return false;
 
     // A damage frame with no rectangles would tell the host the buffer holds
     // nothing valid, which is never what is meant: fall back to a whole frame.
@@ -103,18 +112,17 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
     }
     if (damage_count > VYPR_MAX_DAMAGE_RECTS) damage_count = VYPR_MAX_DAMAGE_RECTS;
 
-    vypr_publish& pub = slot_->pub;
+    vypr_publish& pub = hdr_->pub;
 
     // Seqlock write. Odd marks the record unstable; the release fences keep the
     // pixel writes and the field writes from being seen after the even store
-    // that publishes them.
-    // Every row of the frame lands before the record says it is there.
-    wc_fence();
+    // that publishes them. Every row of the frame lands before the record says
+    // it is there.
+    store_fence();
 
     const std::uint32_t seq = pub.seq;
     store_relaxed(pub.seq, seq + 1);
     std::atomic_thread_fence(std::memory_order_release);
-    wc_fence();
 
     pub.index            = index_;
     pub.serial           = ++serial_;
@@ -129,34 +137,21 @@ bool Publisher::publish(std::uint32_t width, std::uint32_t height, std::uint32_t
     for (std::uint32_t r = 0; r < pub.damage_count; r++) pub.damage[r] = damage[r];
 
     std::atomic_thread_fence(std::memory_order_release);
-    wc_fence();
     store_release(pub.seq, seq + 2);
-    // And push the publish itself out now, rather than whenever the fill
-    // buffer is next evicted: until it lands the host cannot see the frame.
-    wc_fence();
 
-    // First publish takes the slot live, so the host starts reading only once
-    // there is a whole frame to read.
-    if (load_acquire(slot_->state) == VYPR_SLOT_ARMED) {
-        store_release(slot_->state, VYPR_SLOT_LIVE);
-        wc_fence();
-    }
+    if (hdr_->state != VYPR_RING_LIVE) store_release(hdr_->state, VYPR_RING_LIVE);
 
     index_ = (index_ + 1) % VYPR_RING_FRAMES;
     return true;
 }
 
 void Publisher::close() {
-    if (!slot_) return;
-
-    // This store is what the host waits for before reusing the ring: the caller
-    // has already torn the capture down, so it means "nothing here is writing
-    // any more". Say it only while the slot is still ours - if the host gave up
-    // waiting and handed the slot to another window, the epoch has moved on and
-    // storing CLOSED now would kill that window instead.
-    if (load_acquire(slot_->epoch) == epoch_)
-        store_release(slot_->state, VYPR_SLOT_CLOSED);
-    slot_ = nullptr;
+    if (!hdr_) return;
+    // Informational only: the host stops reading because the daemon dropped
+    // the slot, not because of this. It makes a ring caught mid-teardown easy
+    // to recognise in a memory dump, which is worth one store.
+    store_release(hdr_->state, VYPR_RING_CLOSED);
+    hdr_ = nullptr;
 }
 
 }  // namespace vypr

@@ -1,13 +1,15 @@
 # vypr-agent
 
 The guest half. Runs on Windows, captures individual windows, and publishes them
-into the shared region the host carved.
+into rings of its own locked memory that the host reads straight out of the VM's
+RAM - see "Frames travel through guest RAM" in `docs/technical.md`.
 
 ## Requirements
 
 - **MSVC Build Tools + Windows SDK.** Not optional: C++/WinRT and the WGC interop
   headers are not usable from mingw, so this cannot be cross-compiled from Linux.
-- **The IVSHMEM driver**, which ships with Looking Glass rather than virtio-win.
+- **The "Lock pages in memory" right** for the account it runs as, which
+  `vypr-setup` grants. No driver: rings are allocated with Windows' AWE calls.
 - **Windows 10 1903 or newer** for `Windows.Graphics.Capture` per-window capture.
   1903 also removes the need for a message loop via `CreateFreeThreaded`.
 
@@ -31,12 +33,10 @@ no DWM to capture from, and `SetForegroundWindow` does not work from it.
 
 ## Two more things that will bite
 
-**Two IVSHMEM devices now exist** on this VM - Looking Glass's and vypr's - and
-the same driver binds both. The agent does not select by device index, which
-would silently stream into Looking Glass's region the first time PCI order
-changed. It maps each device and keeps the one containing the vypr magic the
-host wrote. If it reports finding devices but no vypr region, the host session
-is not running yet.
+**The lock-pages right only applies from the next sign-in.** Granting it does
+nothing for a session already running, so an agent started straight after
+`vypr-setup` says it cannot lock pages and streams nothing until Windows has been
+signed out or restarted. It says so in its log and in vyprd's.
 
 **A display must be attached to the passthrough GPU.** `<video model='none'/>`
 means the guest's only display is the 5050's physical outputs. WGC captures from
@@ -48,7 +48,7 @@ the problems.
 
 Built with MSVC 14.44 against Windows SDK 10.0.22621 and run against `vyprd`:
 Notepad from the guest presented as a native Linux window at **60 fps**, with
-WGC capture, the IVSHMEM mapping and the control channel all live.
+WGC capture, the shared-memory transport and the control channel all live.
 
 Two things that cost real time, both worth knowing:
 
@@ -86,8 +86,7 @@ of the title bar.
 Cursor shapes, reconnect, and anything that moves fast enough to expose
 latency.
 
-The IVSHMEM IOCTL numbers in `ivshmem.cpp` were checked against the installed
-driver (2025-03-06) by reading its PDB and image rather than by compiling: the
-symbol order gives function codes 0x800-0x803 and the interface GUID is present
-in the `.sys`. Re-check if the driver is updated; a changed IOCTL number fails
-as `ERROR_INVALID_FUNCTION`.
+Rings are scattered across guest RAM - a 4K ring is ~24,000 pages in ~20,000
+pieces - and the host puts them back together with one mapping per piece. That
+was measured on Linux with fake guest RAM; how scattered a real guest is after a
+long uptime is worth watching in vyprd's log ("ring: N MiB in M pieces").
