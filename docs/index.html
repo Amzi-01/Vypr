@@ -260,12 +260,14 @@
       <p>
         RDP's video path was designed for documents. It is fine for a text editor and it
         falls apart on anything that moves, because every frame is encoded on one side and
-        decoded on the other before you see it. Vypr writes frames into a region of memory
-        the host and guest both hold, and the host draws them. There is no encoder to wait
-        for and nothing to lose.
+        decoded on the other before you see it. Vypr leaves each frame in the VM's own memory
+        and the host reads it from there, so there is no encoder to wait for and nothing to
+        lose &mdash; about 7&nbsp;ms from Windows capturing a 1440p frame to Vypr having it on
+        this side, measured. Nothing has to be installed in Windows to make that work: no
+        driver, Looking Glass's or anyone else's.
       </p>
 
-      <svg class="diagram" viewBox="0 0 720 208" role="img" aria-label="Diagram comparing the RDP path, which encodes and decodes every frame, with Vypr's path through shared memory">
+      <svg class="diagram" viewBox="0 0 720 208" role="img" aria-label="Diagram comparing the RDP path, which encodes and decodes every frame, with Vypr's path straight out of the VM's memory">
         <title>How the picture travels</title>
         <defs>
           <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -300,7 +302,7 @@
         <text x="59"  y="175" class="d-ink" text-anchor="middle">guest GPU</text>
         <path d="M124 171 H150" class="d-arrow" marker-end="url(#ah)"/>
         <rect x="156" y="154" width="230" height="34" rx="2" class="d-box-win"/>
-        <text x="271" y="175" class="d-ink" text-anchor="middle">shared memory, uncompressed</text>
+        <text x="271" y="175" class="d-ink" text-anchor="middle">the VM's memory, uncompressed</text>
         <path d="M392 171 H418" class="d-arrow" marker-end="url(#ah)"/>
         <rect x="424" y="154" width="118" height="34" rx="2" class="d-box-win"/>
         <text x="483" y="175" class="d-ink" text-anchor="middle">your screen</text>
@@ -318,6 +320,7 @@
       <h2>A window, not a desktop.</h2>
       <ul class="plain">
         <li><b>Any Windows application, as its own native window.</b> Several at once, each its own. Starting a second does not disturb the first.</li>
+        <li><b>No driver in Windows for the picture.</b> Frames sit in pages of the VM's own memory that the host reads directly &mdash; nothing to install, sign, or keep in step with a Windows update.</li>
         <li><b>Games, including ones that capture the mouse</b> and read raw input, through kernel-level HID injection.</li>
         <li><b>Controllers</b>, presented to Windows as real XInput devices.</li>
         <li><b>Audio</b>, pinned to whatever the application is actually playing to &mdash; and your microphone, as an ordinary Windows device.</li>
@@ -327,6 +330,8 @@
         <li><b>A folder from this machine, mounted in Windows as a drive</b> over virtiofs. Files inside it are opened directly &mdash; no copy anywhere.</li>
         <li><b>Menus, popups and dialogs</b>, positioned against the window they belong to.</li>
         <li><b>Windows come back where you left them</b>, at the size you left them.</li>
+        <li><b>Only what changed, for mostly still apps.</b> With <code>VYPR_DAMAGE=1</code> a typed character crosses as a few kilobytes rather than a whole frame. Off by default, because it costs a game more than it saves.</li>
+        <li><b>Latency you can check.</b> <code>VYPR_STATS=1</code> prints, every second, how old each frame is from capture in Windows to the moment it is shown here.</li>
         <li><b>The guest's whole screen when something is wrong</b>, at its own size or scaled to a window that fits.</li>
       </ul>
     </div>
@@ -447,8 +452,10 @@
       <p>
         Run <code>vypr-setup.exe</code> from the
         <a href="https://github.com/Amzi-01/Vypr/releases/latest">latest release</a> inside
-        the VM. One file, nothing to unpack: it carries the agent, installs the two drivers
-        Vypr needs, and authorises the key the Linux installer printed.
+        the VM, then restart Windows. One file, nothing to unpack: it carries the agent,
+        gives it the one Windows right it needs to stream &mdash; no driver &mdash; and
+        authorises the key the Linux installer printed. It can also add Parsec's mouse
+        driver, for games that read raw mouse input.
       </p>
 
       <h3>Then let it find your apps</h3>
@@ -507,6 +514,7 @@
     <nav>
       <a href="https://github.com/Amzi-01/Vypr">Source</a>
       <a href="https://github.com/Amzi-01/Vypr/releases/latest">Releases</a>
+      <a href="https://github.com/Amzi-01/Vypr/discussions">Discussions</a>
       <a href="https://github.com/Amzi-01/Vypr/blob/master/docs/technical.md">Technical notes</a>
       <a href="https://github.com/Amzi-01/Vypr/blob/master/docs/vm-setup.md">VM setup</a>
       <a href="https://github.com/Amzi-01/Vypr/blob/master/LICENSE">Unlicense</a>

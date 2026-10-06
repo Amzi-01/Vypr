@@ -32,7 +32,10 @@ stacking order. You alt-tab to it like anything else, and it is a Windows app
 the whole time.
 
 No remote desktop, no video encoder, no streaming client to connect to. The
-picture goes from the guest's memory to your screen uncompressed.
+picture goes from the guest's memory to your screen uncompressed — about 7 ms
+from Windows capturing a 1440p frame to Vypr having it on this side, measured —
+and nothing has to be installed in Windows to get it out: no driver, Looking
+Glass's or anyone else's.
 
 ## Where it came from
 
@@ -78,7 +81,7 @@ choice is what most of this table comes down to.
 | | WinApps | WinBoat | Vypr |
 |---|:---:|:---:|:---:|
 | Windows apps as native Linux windows | ✅ | ✅ | ✅ |
-| How the picture travels | RDP codec | RDP codec | **shared memory, uncompressed** |
+| How the picture travels | RDP codec | RDP codec | **straight out of the VM's memory, uncompressed** |
 | Frame latency | encode + decode | encode + decode | **no codec in the path** |
 | Audio | ✅ | ✅ | ✅ *pinned to the app's own device* |
 | Microphone into the guest | ✅ | ✅ | ✅ *no extra software* |
@@ -226,9 +229,24 @@ any defaults.
 Close the last window and the VM shuts itself down a minute later. Launching
 something during that minute cancels it.
 
+A few settings live in `~/.config/vypr/config`:
+
+| | |
+|---|---|
+| `VYPR_DAMAGE=1` | send only the changed parts of each frame — good for desktop apps, not games |
+| `USE_PARSEC=0` | do not start Parsec; only games that read raw mouse input need it |
+| `SHUTDOWN_VM_ON_EXIT=0` | leave the VM running when the last window closes |
+
+And one for the environment: `VYPR_STATS=1 vypr run <app>` writes a line a
+second to `$XDG_RUNTIME_DIR/vyprd.log` — frames shown, upload time, and how old
+each frame was by the time it reached your screen.
+
 ## What works
 
 - Any Windows application, as its own native window
+- No driver in Windows for the picture. Each window's frames sit in pages of the
+  VM's own memory that the host reads directly, so there is nothing to install,
+  sign, or keep in step with a Windows update
 - Games, including ones that capture the mouse and read raw input
 - Audio, pinned to whatever the app is actually playing to
 - Menus, popups and dialogs, positioned against the window they belong to
@@ -251,6 +269,11 @@ something during that minute cancels it.
   A file inside it is opened by the Windows application directly — no copy, and
   saving writes to the file itself
 - Finding what is on the guest's desktop and offering to add it
+- Sending only what changed, for mostly still applications: with
+  `VYPR_DAMAGE=1` a typed character crosses as a few kilobytes rather than a
+  whole frame. Off by default, because it costs a game more than it saves
+- Latency you can check: `VYPR_STATS=1` prints, every second, how old each frame
+  is from capture in Windows to the moment it is shown here
 - Streaming the guest's whole screen, for debugging — at its own size, or
   scaled down to a window that fits, since a 4K guest otherwise fills one of
   your monitors to show you one of its
@@ -306,6 +329,14 @@ they turned out to be. Most of the design was forced by something breaking, and
 that document says which.
 
 **[docs/vm-setup.md](docs/vm-setup.md)** covers the VM itself.
+
+## Ideas, questions and bugs
+
+Ideas and questions belong in
+**[Discussions](https://github.com/Amzi-01/Vypr/discussions)** — there is an
+Ideas category for exactly that, and a Q&A one. Something that is broken goes in
+**[Issues](https://github.com/Amzi-01/Vypr/issues)**, ideally with what
+`vypr doctor` says.
 
 ## Building it yourself
 
