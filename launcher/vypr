@@ -14,7 +14,7 @@
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr --debug resolution [WxH]  what size that screen is shown at
 #   vypr --debug clear-apps  take every registered app off this desktop
-#   vypr --debug anti-detect [--status|--undo|--disable-nested-virt]  hide the hypervisor from the guest
+#   vypr --debug anti-detect [--status|--undo|--mild|--deep|--paranoid|--disable-nested-virt]  hide the hypervisor from the guest
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
