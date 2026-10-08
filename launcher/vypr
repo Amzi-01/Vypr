@@ -14,7 +14,7 @@
 #   vypr --debug desktop  stream the guest's whole screen, for debugging
 #   vypr --debug resolution [WxH]  what size that screen is shown at
 #   vypr --debug clear-apps  take every registered app off this desktop
-#   vypr --debug anti-detect [--undo]  hide the hypervisor from the guest
+#   vypr --debug anti-detect [--status|--undo|--disable-nested-virt]  hide the hypervisor from the guest
 #   vypr apps           list registered apps
 #   vypr up / down      start or stop the session on its own
 #   vypr status         what is running
@@ -1356,13 +1356,26 @@ cmd_clear_apps() {
     say "Removed ${#names[@]} app(s) and $removed file(s) from this desktop."
 }
 
-# Hide the hypervisor from the guest, or stop hiding it.
+# Hide the hypervisor from the guest, or stop hiding it, or just say which
+# measures are on right now.
 #
 # The installer does this once at setup. This is here so it can be turned off
 # and on again afterwards without re-running the installer - which matters,
 # because whether it should be on is not a technical question. Software that
 # refuses to run under a hypervisor is the reason it exists; games that forbid
 # virtual machines outright are the reason someone might want it off.
+#
+# --status exists because there was no way to ask what state the VM was in. The
+# measures are spread across features, sysinfo, cpu and devices, so "is this
+# hardened" meant diffing XML by hand, and a user who ran --undo or inherited a
+# VM from an older release had no answer at all.
+#
+# --disable-nested-virt is the one measure worth calling out. On a host where
+# nested virtualisation is available, Windows starts its own Hyper-V inside the
+# guest and that nested hypervisor sets the CPUID hypervisor bit regardless of
+# what the host hides - so this, not the host-side spoofing, is often what
+# actually makes a detector say yes. It is opt-in because it also takes WSL2,
+# Docker Desktop, Windows Sandbox and the Android emulator away inside the VM.
 cmd_anti_detect() {
     local script="$(dirname "$BIN")/share/vypr/anti-detect.py"
     [ -f "$script" ] || script="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/install/anti-detect.py"
@@ -1381,6 +1394,15 @@ cmd_anti_detect() {
     local tmp="$VYPR_AD_TMP"
     virsh dumpxml --inactive "$VM" > "$tmp/in.xml" 2>/dev/null || die "cannot read $VM"
 
+    # --status only reads. It is answered straight from the current domain and
+    # never redefines anything, which is the whole point of it: "is this VM
+    # hardened right now" should be a question you can ask without changing the
+    # answer. It does not need the DMI or the flags the mutating path builds.
+    if [ "${1:-}" = "--status" ]; then
+        python3 "$script" "$tmp/in.xml" --status || die "could not read the domain"
+        return 0
+    fi
+
     local out
     if [ "${1:-}" = "--undo" ]; then
         out=$(python3 "$script" "$tmp/in.xml" "$tmp/out.xml" --undo 2>&1) || die "$out"
@@ -1388,6 +1410,18 @@ cmd_anti_detect() {
         local dmi; dmi() { cat "/sys/class/dmi/id/$1" 2>/dev/null; }
         local oui; oui=$(cat /sys/class/net/*/address 2>/dev/null |
                          grep -vE '^(52:54:00|02:|a2:|7a:|42:)' | head -1 | cut -d: -f1-3)
+
+        # Turning off nested virtualisation breaks WSL2, Docker Desktop,
+        # Windows Sandbox and the Android emulator inside the guest. That is a
+        # consequence the user is unlikely to connect to this command later, so
+        # it is said here, before it happens, rather than only in the script's
+        # own notes.
+        if printf '%s\n' "$@" | grep -q -- "--disable-nested-virt"; then
+            echo "  ! this turns off nested virtualisation inside the VM."
+            echo "  ! WSL2, Docker Desktop, Windows Sandbox and the Android"
+            echo "  ! emulator will stop working there until --undo restores it."
+        fi
+
         out=$(python3 "$script" "$tmp/in.xml" "$tmp/out.xml" \
                  --dmi "bios_vendor=$(dmi bios_vendor)" \
                  --dmi "bios_version=$(dmi bios_version)" \
@@ -1407,6 +1441,7 @@ cmd_anti_detect() {
     printf '%s\n' "$out"
     if virsh define "$tmp/out.xml" >/dev/null 2>&1; then
         say "Done. It takes effect at the VM's next boot."
+        say "Check what is applied at any time with: vypr --debug anti-detect --status"
     else
         die "could not redefine $VM; it is unchanged"
     fi

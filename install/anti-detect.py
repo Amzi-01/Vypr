@@ -8,7 +8,35 @@ change below closes one of them. Nothing here is subtle or clever - it is the
 standard set, and anything determined to find a VM still will.
 
 Usage: anti-detect.py <in.xml> <out.xml> [--dmi KEY=VALUE ...] [--mac XX:XX:XX]
-       [--paranoid]
+       [--paranoid] [--disable-nested-virt] [--mild]
+       anti-detect.py <in.xml> --status
+       anti-detect.py <in.xml> <out.xml> --undo
+
+Options:
+  --dmi KEY=VALUE       An SMBIOS field to copy from the host, e.g.
+                        system_manufacturer=Gigabyte Technology Co., Ltd.
+  --mac XX:XX:XX        NIC prefix (first three octets) to use instead of QEMU's
+                        52:54:00.
+  --paranoid            Also clear the hypervisor-present CPU bit. Hides more,
+                        and turns off every Hyper-V enlightenment with it, so
+                        the guest gets slower.
+  --disable-nested-virt Remove the guest CPU's own virtualisation flag, so
+                        Windows cannot start its VBS/Hyper-V stack inside the
+                        guest. On an AMD host this is what stops the CPUID
+                        hypervisor bit leaking back in from the guest's own
+                        nested hypervisor. It also stops WSL2, Docker Desktop,
+                        Windows Sandbox and the Android emulator from working
+                        inside the VM - they need nested virtualisation.
+  --mild                Leave out the measures that change devices: the ACPI OEM
+                        ids, the optical drive and the disk identity.
+  --status              Print what is and is not applied, and change nothing.
+  --undo                Put the domain back to a stock one.
+
+The guest's own VBS is why --disable-nested-virt exists at all. On a host with
+nested virtualisation available, Windows 10/11 will start Hyper-V inside the
+guest, and that nested hypervisor sets the CPUID hypervisor bit no matter what
+the host does - so SMBIOS and the vendor id can both be clean and the guest
+still answers "yes" to the first question a detector asks.
 """
 import sys, re, hashlib, xml.etree.ElementTree as ET
 
@@ -32,10 +60,135 @@ def sub(parent, tag, **attrs):
             el.set(k, v); changed = True
     return el, changed
 
+# The guest CPU feature that, present, lets the guest start a hypervisor of its
+# own. AMD calls it svm, Intel calls it vmx; which one a domain has depends on
+# the host, so both are handled and neither is assumed.
+NESTED_VIRT_FEATURES = ("svm", "vmx")
+
+def disable_cpu_feature(root, name):
+    """Add <feature policy='disable' name='...'/> if it is not already there.
+
+    Returns whether anything changed, so a second run can say nothing moved."""
+    cpu = root.find("cpu")
+    if cpu is None:
+        return False
+    for f in cpu.findall("feature"):
+        if f.get("name") == name:
+            # Already present. If it said something else - unlikely, but a hand
+            # edit could have set policy='require' - fix the policy rather than
+            # adding a duplicate element the domain may reject.
+            if f.get("policy") != "disable":
+                f.set("policy", "disable")
+                return True
+            return False
+    f = ET.SubElement(cpu, "feature")
+    f.set("policy", "disable"); f.set("name", name)
+    return True
+
+def nested_virt_feature(root):
+    """The nested-virtualisation feature name this domain actually carries.
+
+    A host-passthrough domain lists whatever the host has. Prefer a feature the
+    domain already mentions, so undoing removes exactly what disabling added,
+    and fall back to svm on AMD, vmx otherwise - by reading the CPU's own
+    vendor, because the domain may not list either until one is disabled."""
+    cpu = root.find("cpu")
+    if cpu is not None:
+        for f in cpu.findall("feature"):
+            if f.get("name") in NESTED_VIRT_FEATURES:
+                return f.get("name")
+    vendor = ""
+    if cpu is not None:
+        v = cpu.find("vendor")
+        if v is not None:
+            vendor = (v.text or "").strip()
+    return "svm" if "AMD" in vendor.upper() else "vmx"
+
+def report_status(root):
+    """Say, in plain words, which measures are on this domain right now.
+
+    Reads only - it is given the domain and prints, never writing. The point is
+    that "is it hardened" is currently answerable only by diffing XML by hand,
+    and someone who has just run --undo, or whose VM was built by an older
+    release, has no way to tell what state they are in."""
+    feats = root.find("features")
+    on = []
+    off = []
+
+    def check(ok, label):
+        (on if ok else off).append(label)
+
+    kvm = feats.find("kvm") if feats is not None else None
+    check(kvm is not None and kvm.find("hidden") is not None,
+          "KVM CPUID leaf hidden")
+
+    hv = feats.find("hyperv") if feats is not None else None
+    check(hv is not None and hv.find("vendor_id") is not None,
+          "Hyper-V vendor id disguised")
+
+    si = root.find("sysinfo")
+    os_el = root.find("os")
+    check(si is not None and os_el is not None and os_el.find("smbios") is not None,
+          "SMBIOS set to the host's own board")
+
+    macs = list(root.iter("mac"))
+    check(bool(macs) and all(not (m.get("address") or "").lower().startswith("52:54:00")
+                             for m in macs),
+          "NIC off QEMU's 52:54:00 prefix")
+
+    qargs = root.find("{%s}commandline" % QEMU_NS)
+    check(qargs is not None and any("x-oem-id" in (a.get("value") or "")
+                                    for a in qargs.findall("{%s}arg" % QEMU_NS)),
+          "ACPI OEM ids off BOCHS/BXPC")
+
+    devs = root.find("devices")
+    cdroms = [d for d in devs.findall("disk") if d.get("device") == "cdrom"] if devs is not None else []
+    check(not cdroms, "no optical drive")
+
+    serials = [d.find("serial") for d in root.iter("disk")]
+    check(any(s is not None and (s.text or "").startswith("VY-") for s in serials),
+          "disk serial fabricated")
+
+    cpu = root.find("cpu")
+    check(cpu is not None and any(
+              f.get("name") == "hypervisor" and f.get("policy") == "disable"
+              for f in cpu.findall("feature")),
+          "hypervisor-present CPU bit cleared")
+
+    # Nested virt is the one worth naming the feature for: whether it is svm or
+    # vmx tells the reader which host CPU the domain was made on, and the
+    # consequence - no WSL2/Docker inside the guest - is the same either way.
+    feat = nested_virt_feature(root)
+    nested_off = cpu is not None and any(
+        f.get("name") == feat and f.get("policy") == "disable"
+        for f in cpu.findall("feature"))
+    check(nested_off, "nested virtualisation disabled (%s)" % feat)
+
+    print("  on:")
+    for label in on:
+        print("    ✓ " + label)
+    if off:
+        print("  off:")
+        for label in off:
+            print("    ✗ " + label)
+    if nested_off:
+        print()
+        print("  nested virtualisation being off means WSL2, Docker Desktop,")
+        print("  Windows Sandbox and the Android emulator will not run in the")
+        print("  guest. Turn it back with --undo, or re-run without")
+        print("  --disable-nested-virt.")
+
 def main():
-    src, dst = sys.argv[1], sys.argv[2]
+    # --status takes only an input file: it reads and reports, so naming an
+    # output would be asking the caller to lie about what happens. Every other
+    # mode writes, so it requires one. Falling back to an empty dst keeps the
+    # usage honest instead of crashing on sys.argv[2] when it is absent.
+    src = sys.argv[1] if len(sys.argv) > 1 else None
+    if src is None:
+        sys.exit("anti-detect: needs an input domain XML")
+    dst = sys.argv[2] if len(sys.argv) > 2 else None
     dmi, mac_oui = {}, None
-    args = sys.argv[3:]
+    args = sys.argv[3:] if dst and not dst.startswith("-") else sys.argv[2:]
     i = 0
     while i < len(args):
         # Both of these take a value. Reading args[i+1] unchecked turned a
@@ -54,6 +207,14 @@ def main():
 
     tree = ET.parse(src); root = tree.getroot()
     changed = []
+
+    # --status reports and stops. It is the one path that must not need an
+    # output file, so it is checked before anything writes to dst - a caller
+    # that only wants to know the state should not have to name a place to put
+    # it.
+    if "--status" in args:
+        report_status(root)
+        return
 
     if "--undo" in args:
         # Put the domain back to a stock one. The MAC goes back to QEMU's
@@ -86,8 +247,14 @@ def main():
                 changed.append("put the NIC back on QEMU's prefix")
         for cpu in root.iter("cpu"):
             for f in list(cpu.findall("feature")):
-                if f.get("name") == "hypervisor" and f.get("policy") == "disable":
+                name, pol = f.get("name"), f.get("policy")
+                # hypervisor and the nested-virt flag are both things this
+                # script turns off; undo has to put both back, or a guest is
+                # left unable to run WSL2 with nothing saying why.
+                if name == "hypervisor" and pol == "disable":
                     cpu.remove(f); changed.append("restored the hypervisor-present bit")
+                elif name in NESTED_VIRT_FEATURES and pol == "disable":
+                    cpu.remove(f); changed.append("restored nested virtualisation")
 
         # The aggressive measures, which an earlier version of this branch did
         # not touch - so --undo reported success while leaving the ACPI
@@ -160,11 +327,26 @@ def main():
         if did:
             changed.append("gave the Hyper-V leaves an unremarkable vendor id")
     if "--paranoid" in args:
-        cpu = root.find("cpu")
-        if cpu is not None and not any(f.get("name") == "hypervisor" for f in cpu.findall("feature")):
-            f = ET.SubElement(cpu, "feature")
-            f.set("policy", "disable"); f.set("name", "hypervisor")
+        if disable_cpu_feature(root, "hypervisor"):
             changed.append("cleared the hypervisor-present CPU bit (costs the enlightenments)")
+
+    # 2b. Nested virtualisation. On a host where it is available, Windows will
+    #     start its own Hyper-V/VBS stack *inside* the guest, and that nested
+    #     hypervisor sets the CPUID hypervisor bit and the "Microsoft Hv"
+    #     vendor leaf itself - so the host can hide KVM perfectly and the guest
+    #     still answers "yes". Disabling the guest CPU's own virtualisation
+    #     flag is what removes the guest's ability to run one at all.
+    #
+    #     This is the measure that costs the most, and not in performance:
+    #     WSL2, Docker Desktop, Windows Sandbox and the Android emulator all
+    #     need nested virtualisation and stop working without it. That is why
+    #     it is a flag the user asks for, and why --status and --undo name it
+    #     specifically.
+    if "--disable-nested-virt" in args:
+        if disable_cpu_feature(root, nested_virt_feature(root)):
+            changed.append("disabled nested virtualisation, so the guest cannot "
+                           "run its own hypervisor (this turns off WSL2/Docker "
+                           "Desktop/Windows Sandbox in the VM)")
 
     # 3. SMBIOS. Left alone this reads QEMU/SeaBIOS or Bochs, which is what
     #    anything looking at WMI Win32_ComputerSystem will find. Pointed at the
@@ -232,7 +414,6 @@ def main():
         qargs = root.find("{%s}commandline" % QEMU_NS)
         if qargs is None:
             qargs = ET.SubElement(root, "{%s}commandline" % QEMU_NS)
-        have = [a.get("value") for a in qargs.findall("{%s}arg" % QEMU_NS)]
         oem_id = (dmi.get("system_manufacturer") or "ASUS")[:6]
         oem_tbl = re.sub(r"[^A-Za-z0-9]", "", dmi.get("baseBoard_product") or "B550")[:8]
         want = "x-oem-id=%s,x-oem-table-id=%s" % (oem_id, oem_tbl)
