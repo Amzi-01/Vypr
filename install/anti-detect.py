@@ -32,9 +32,13 @@ Options:
   --deep                Apply maximum anti-detection hardening: PCI device ID
                         spoofing, USB controller renaming, audio device masking,
                         ACPI battery emulation, CPU topology refinement, and
-                        chipset device identity spoofing. This is the most
-                        aggressive hiding level and makes the VM appear nearly
-                        indistinguishable from bare metal hardware.
+                        chipset device identity spoofing. This mode provides
+                        maximum evasion for kernel-level anti-cheat systems.
+  --vanguard            Enable security features required by Riot Vanguard:
+                        UEFI Secure Boot, IOMMU, VBS/HVCI, and Hyper-V
+                        enlightenments. This enables Windows security features
+                        instead of hiding virtualization. Incompatible with
+                        --paranoid and --disable-nested-virt.
   --status              Print what is and is not applied, and change nothing.
   --undo                Put the domain back to a stock one.
 
@@ -44,7 +48,7 @@ guest, and that nested hypervisor sets the CPUID hypervisor bit no matter what
 the host does - so SMBIOS and the vendor id can both be clean and the guest
 still answers "yes" to the first question a detector asks.
 """
-import sys, re, hashlib, xml.etree.ElementTree as ET
+import os, sys, re, hashlib, xml.etree.ElementTree as ET
 
 QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
 ET.register_namespace("qemu", QEMU_NS)
@@ -393,6 +397,268 @@ def spoof_chipset_devices(root, changes):
 
 
 
+
+def hide_cpu_cache_topology(root, changes):
+    """Normalize CPU cache topology to match real hardware patterns."""
+    changed = []
+    cpu = root.find("cpu")
+    if cpu is None:
+        return
+    
+    cache = cpu.find("cache")
+    if cache is None:
+        cache = ET.SubElement(cpu, "cache")
+        cache.set("mode", "passthrough")
+        changed.append("set CPU cache to passthrough mode (exposes host cache topology)")
+        changes.extend(changed)
+
+
+def hide_virtio_devices(root, changes):
+    """Remove or disable VirtIO devices that reveal VM presence."""
+    changed = []
+    devices = root.find("devices")
+    if devices is None:
+        return
+    
+    # Remove VirtIO RNG
+    for rng in list(devices.findall("rng")):
+        model = rng.get("model", "")
+        if "virtio" in model:
+            devices.remove(rng)
+            changed.append("removed VirtIO RNG device (use CPU RDRAND instead)")
+    
+    # Disable VirtIO memory balloon
+    for balloon in list(devices.findall("memballoon")):
+        model = balloon.get("model", "")
+        if "virtio" in model:
+            balloon.set("model", "none")
+            changed.append("disabled VirtIO memory balloon (VM-specific device)")
+    
+    # Check for VirtIO network (warn only - can't change without breaking connectivity)
+    for interface in devices.findall("interface"):
+        model = interface.find("model")
+        if model is not None:
+            model_type = model.get("type", "")
+            if "virtio" in model_type:
+                changed.append("WARNING: VirtIO network detected - consider switching to e1000e or SR-IOV NIC")
+    
+    # Check for VirtIO serial (warn only - used by guest agent)
+    for controller in devices.findall("controller"):
+        if controller.get("type") == "virtio-serial":
+            changed.append("WARNING: VirtIO serial controller detected - used by guest agent and virtiofs")
+    
+    if changed:
+        changes.extend(changed)
+
+
+def minimize_hyperv_enlightenments(root, changes):
+    """Remove non-essential Hyper-V enlightenments that reveal hypervisor presence."""
+    changed = []
+    feats = root.find("features")
+    if feats is None:
+        return
+    
+    hv = feats.find("hyperv")
+    if hv is None:
+        return
+    
+    # Remove telltale features (keep performance-critical ones only)
+    removable = ["frequencies", "reenlightenment", "tlbflush", "ipi", "evmcs"]
+    for feature_name in removable:
+        feature = hv.find(feature_name)
+        if feature is not None:
+            hv.remove(feature)
+            changed.append(f"removed Hyper-V {feature_name} enlightenment")
+    
+    if changed:
+        changes.extend(changed)
+
+
+def enable_tsc_features(root, changes):
+    """Enable TSC features to reduce timing discrepancies."""
+    changed = []
+    cpu = root.find("cpu")
+    if cpu is None:
+        return
+    
+    # Enable TSC deadline timer
+    has_tsc_deadline = False
+    for feature in cpu.findall("feature"):
+        if feature.get("name") == "tsc-deadline" and feature.get("policy") == "require":
+            has_tsc_deadline = True
+            break
+    
+    if not has_tsc_deadline:
+        feature = ET.SubElement(cpu, "feature")
+        feature.set("name", "tsc-deadline")
+        feature.set("policy", "require")
+        changed.append("enabled TSC deadline timer (reduces timing discrepancies)")
+    
+    # Enable invtsc (invariant TSC)
+    has_invtsc = False
+    for feature in cpu.findall("feature"):
+        if feature.get("name") == "invtsc" and feature.get("policy") == "require":
+            has_invtsc = True
+            break
+    
+    if not has_invtsc:
+        feature = ET.SubElement(cpu, "feature")
+        feature.set("name", "invtsc")
+        feature.set("policy", "require")
+        changed.append("enabled invariant TSC (consistent timing across power states)")
+    
+    if changed:
+        changes.extend(changed)
+
+
+def enable_vanguard_security(root, changes):
+    """Turn on the Windows security features some software checks for.
+
+    Secure Boot firmware, nested virtualisation (which VBS and HVCI need), the
+    Hyper-V enlightenments, and TPM 2.0 (ensure_tpm_for_vanguard). The virtual
+    IOMMU, which Windows reports as DMA protection, is added by
+    apply-vanguard.sh rather than here, because libvirt cannot set the option
+    it needs.
+
+    Measured on the VM this was written against: VBS, HVCI and DMA protection
+    all run with the hiding measures in place (the KVM leaf hidden, the Hyper-V
+    vendor id masked, the hypervisor CPU bit cleared). An earlier version of
+    this function removed those on the belief VBS needed them gone; it does
+    not, so they are left alone now. Only --disable-nested-virt genuinely
+    conflicts, since VBS cannot start without svm/vmx; --paranoid does not.
+    """
+    changed = []
+
+    # 1. The Secure Boot firmware image.
+    #
+    # Only the loader is changed here, and only when it is not already the
+    # secboot image. The NVRAM is left alone on purpose: a domain that has
+    # been through fix-secureboot.sh carries Microsoft's keys and the Windows
+    # boot entry in its NVRAM file, and pointing it at a template - or at a
+    # file that does not exist, as an earlier version did - would lose both.
+    # Swapping the loader does not need a new NVRAM; enrolling the keys is
+    # fix-secureboot.sh's job, done in place.
+    os_el = root.find("os")
+    if os_el is not None:
+        loader = os_el.find("loader")
+        secboot_code = "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd"
+        already = (loader is not None and loader.get("secure") == "yes"
+                   and (loader.text or "").strip() == secboot_code)
+        if not already:
+            if not os.path.exists(secboot_code):
+                sys.exit("anti-detect: %s is missing; install the edk2-ovmf package" % secboot_code)
+            if loader is None:
+                loader = ET.SubElement(os_el, "loader")
+            loader.set("readonly", "yes")
+            loader.set("type", "pflash")
+            loader.set("secure", "yes")
+            loader.text = secboot_code
+            nvram = os_el.find("nvram")
+            if nvram is not None and nvram.get("template"):
+                tmpl = nvram.get("template")
+                if not os.path.exists(tmpl):
+                    nvram.set("template", "/usr/share/edk2/x64/OVMF_VARS.4m.fd")
+                    changed.append("nvram template %s does not exist; using OVMF_VARS.4m.fd" % tmpl)
+            changed.append("set the Secure Boot firmware image (enrol keys with fix-secureboot.sh)")
+
+    # 2. IOMMU for Vanguard
+    # NOTE: We do NOT add the intel-iommu QEMU device here because it conflicts
+    # with VFIO GPU passthrough (causes "Cannot allocate memory" errors).
+    # Instead, IOMMU is reported at the firmware level via DMAR ACPI table
+    # (see fake-iommu-in-firmware.py), which satisfies Vanguard's check without
+    # breaking VFIO.
+
+    feats = root.find("features")
+    if feats is None:
+        feats = ET.SubElement(root, "features")
+
+    # 3. Ensure nested virtualization is ENABLED (required for VBS/HVCI)
+    cpu = root.find("cpu")
+    if cpu is not None:
+        removed_disable = False
+        # Only the flag this host actually has matters: on AMD, vmx=disable is
+        # inert (the CPU has no vmx) and removing it changes nothing but the
+        # file. svm is the one VBS needs. Decided by the host CPU, not by what
+        # the domain happens to list, for the same reason.
+        host_vendor = ""
+        try:
+            with open("/proc/cpuinfo") as f_:
+                for line in f_:
+                    if line.startswith("vendor_id"):
+                        host_vendor = line.split(":", 1)[1].strip(); break
+        except OSError:
+            pass
+        real = "svm" if "AMD" in host_vendor.upper() else "vmx"
+        for f in list(cpu.findall("feature")):
+            fname = f.get("name", "")
+            if fname == real and f.get("policy") == "disable":
+                cpu.remove(f)
+                removed_disable = True
+        if removed_disable:
+            changed.append("enabled nested virtualization for VBS/HVCI")
+
+    # 4. Configure Hyper-V enlightenments for VBS
+    hv = feats.find("hyperv")
+    if hv is None:
+        hv = ET.SubElement(feats, "hyperv")
+        hv.set("mode", "custom")
+
+    # Essential features for VBS/HVCI
+    vbs_features = {
+        "relaxed": {"state": "on"},
+        "vapic": {"state": "on"},
+        "spinlocks": {"state": "on", "retries": "8191"},
+        "vpindex": {"state": "on"},
+        "runtime": {"state": "on"},
+        "synic": {"state": "on"},
+        "stimer": {"state": "on"},
+        "reset": {"state": "on"},
+        "frequencies": {"state": "on"}
+    }
+
+    added_hv = False
+    for feat_name, attrs in vbs_features.items():
+        feat = hv.find(feat_name)
+        if feat is None:
+            feat = ET.SubElement(hv, feat_name)
+            for k, v in attrs.items():
+                feat.set(k, v)
+            added_hv = True
+
+    if added_hv:
+        changed.append("configured Hyper-V enlightenments for VBS/HVCI")
+
+    # The vendor-id mask and the hidden KVM leaf are deliberately not touched:
+    # VBS runs fine with both in place (measured), and removing them would
+    # silently undo the user's other settings.
+
+    if changed:
+        changes.extend(changed)
+
+
+def ensure_tpm_for_vanguard(root, changes):
+    """Ensure TPM 2.0 is present (Vanguard checks for it)."""
+    changed = []
+
+    devices = root.find("devices")
+    if devices is None:
+        devices = ET.SubElement(root, "devices")
+
+    tpm = devices.find("tpm")
+    if tpm is None:
+        tpm = ET.SubElement(devices, "tpm")
+        tpm.set("model", "tpm-crb")
+
+        backend = ET.SubElement(tpm, "backend")
+        backend.set("type", "emulator")
+        backend.set("version", "2.0")
+
+        changed.append("added TPM 2.0 emulation")
+
+    if changed:
+        changes.extend(changed)
+
+
 def main():
     # --status takes only an input file: it reads and reports, so naming an
     # output would be asking the caller to lie about what happens. Every other
@@ -508,6 +774,21 @@ def main():
             if ser is not None and (ser.text or "")[:3] in ("VY-", "WD-"):
                 disk.remove(ser); changed.append("removed the fabricated disk serial")
 
+        ET.indent(tree, space="  ")
+        tree.write(dst, encoding="unicode")
+        for c in changed:
+            print("  " + c)
+        return
+
+    # Vanguard mode: enable Windows security features instead of hiding virtualization
+    if "--vanguard" in args:
+        if "--disable-nested-virt" in args:
+            sys.exit("anti-detect: --vanguard needs nested virtualisation (VBS runs on it); drop --disable-nested-virt")
+
+        enable_vanguard_security(root, changed)
+        ensure_tpm_for_vanguard(root, changed)
+
+        # Skip the normal anti-detection measures - they conflict with Vanguard requirements
         ET.indent(tree, space="  ")
         tree.write(dst, encoding="unicode")
         for c in changed:
@@ -730,6 +1011,10 @@ def main():
         spoof_audio_device_names(root, changed)
         # emulate_acpi_battery(root, changed)  # Disabled: acpi-battery not supported in this QEMU
         refine_cpu_topology(root, changed)
+        hide_cpu_cache_topology(root, changed)
+        hide_virtio_devices(root, changed)
+        minimize_hyperv_enlightenments(root, changed)
+        enable_tsc_features(root, changed)
         spoof_chipset_devices(root, changed)
 
     # Note on what is deliberately NOT done here: the BIOS strings are left to
