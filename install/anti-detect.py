@@ -728,7 +728,7 @@ def main():
         spoof_pci_vendor_ids(root, changed)
         mask_usb_controller_identity(root, changed)
         spoof_audio_device_names(root, changed)
-        emulate_acpi_battery(root, changed)
+        # emulate_acpi_battery(root, changed)  # Disabled: acpi-battery not supported in this QEMU
         refine_cpu_topology(root, changed)
         spoof_chipset_devices(root, changed)
 
