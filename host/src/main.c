@@ -1215,10 +1215,13 @@ static int list_pads(void)
 /*
  * The host's outputs, one line each: "X,Y WxH  NAME".
  *
- * Printed from SDL itself, so the coordinates are exactly the ones --at and the
- * fullscreen placement use - the launcher pairs these with guest monitors and
- * passes each output's X,Y straight back. Sorted left to right, top to bottom,
- * the same order the guest sorts its monitors, so output k meets monitor k.
+ * X,Y is the output's position in SDL's layout - logical points, exactly what
+ * --at and the fullscreen placement use, so the launcher passes it straight
+ * back. WxH is the output's *physical* pixel size, which is what the guest
+ * monitor must be to map 1:1: a 4K output at 125% scale is 3072x1728 logical
+ * but 3840x2160 real, and the virtual display only has real modes. Sorted left
+ * to right, top to bottom, the order the guest sorts its monitors, so output k
+ * meets monitor k.
  */
 static int list_outputs(void)
 {
@@ -1234,7 +1237,17 @@ static int list_outputs(void)
     for (int i = 0; i < n && count < 64; i++) {
         SDL_Rect r;
         if (!SDL_GetDisplayBounds(ids[i], &r)) continue;
-        o[count].x = r.x; o[count].y = r.y; o[count].w = r.w; o[count].h = r.h;
+        o[count].x = r.x; o[count].y = r.y;
+        /* Physical pixels, which is what the virtual display has modes for and
+         * what maps 1:1. On Wayland the bounds and the mode are both logical
+         * points; the display's content scale (1.25 at 125%) and the mode's
+         * pixel density both recover the real size, so take the larger. */
+        float s = SDL_GetDisplayContentScale(ids[i]);
+        const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(ids[i]);
+        if (mode && mode->pixel_density > s) s = mode->pixel_density;
+        if (s <= 0.0f) s = 1.0f;
+        o[count].w = (int)(r.w * s + 0.5f);
+        o[count].h = (int)(r.h * s + 0.5f);
         o[count].name = SDL_GetDisplayName(ids[i]);
         count++;
     }
