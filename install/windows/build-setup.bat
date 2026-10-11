@@ -9,6 +9,19 @@ if not exist vypr-agent.exe (
     exit /b 1
 )
 
+REM vypr-vdd.exe is built beside the agent (guest/src/vdd.cpp) and embedded too,
+REM so immersive mode's display helper ships inside the installer.
+if not exist vypr-vdd.exe (
+    echo MISSING: vypr-vdd.exe - build it with the agent and copy it here.
+    exit /b 1
+)
+
+REM The Virtual Display Driver's files are committed in vdd\ next to this.
+if not exist vdd\MttVDD.inf (
+    echo MISSING: vdd\MttVDD.inf - the Virtual Display Driver files are absent.
+    exit /b 1
+)
+
 rc /nologo /fo vypr-setup.res vypr-setup.rc
 if errorlevel 1 exit /b 1
 

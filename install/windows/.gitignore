@@ -3,3 +3,6 @@ vypr-agent.exe
 vypr-setup.exe
 vypr-setup.res
 *.obj
+
+# Built in the VM beside the agent, copied in, then embedded.
+vypr-vdd.exe

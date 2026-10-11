@@ -1,8 +1,16 @@
 #include <windows.h>
 
-#define IDR_AGENT  101
-#define IDI_VYPR   102
-#define IDR_UI     103
+#define IDR_AGENT    101
+#define IDI_VYPR     102
+#define IDR_UI       103
+// The Virtual Display Driver and what installs it, for immersive mode: one
+// virtual monitor per host output. All carried inside the exe.
+#define IDR_VDD_INF  110
+#define IDR_VDD_DLL  111
+#define IDR_VDD_CAT  112
+#define IDR_VDD_CER  113
+#define IDR_NEFCON   114
+#define IDR_VDD_EXE  115
 
 // The agent is carried inside this executable rather than downloaded, so the
 // installer is the single file it is meant to be.
@@ -12,6 +20,13 @@ IDI_VYPR  ICON   "vypr.ico"
 
 // The installer's interface, shown through WebView2.
 IDR_UI    RCDATA "ui.html"
+
+IDR_VDD_INF RCDATA "vdd\\MttVDD.inf"
+IDR_VDD_DLL RCDATA "vdd\\MttVDD.dll"
+IDR_VDD_CAT RCDATA "vdd\\mttvdd.cat"
+IDR_VDD_CER RCDATA "vdd\\signpath.cer"
+IDR_NEFCON  RCDATA "vdd\\nefconw.exe"
+IDR_VDD_EXE RCDATA "vypr-vdd.exe"
 
 1 24 "vypr-setup.manifest"
 

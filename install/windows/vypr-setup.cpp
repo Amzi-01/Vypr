@@ -35,6 +35,12 @@
 #define IDR_AGENT        101
 #define IDI_VYPR         102
 #define IDR_UI           103
+#define IDR_VDD_INF      110
+#define IDR_VDD_DLL      111
+#define IDR_VDD_CAT      112
+#define IDR_VDD_CER      113
+#define IDR_NEFCON       114
+#define IDR_VDD_EXE      115
 #define ID_LOG           1001
 #define ID_INSTALL       1002
 #define ID_KEY           1003
@@ -419,6 +425,66 @@ static void open_elevation()
     if (ok) logf(L"  [--] 'vypr open-elevation --remove' on Linux puts the prompt back");
 }
 
+static void install_vdd()
+{
+    // The Virtual Display Driver gives the VM one virtual monitor per host
+    // output, which is what immersive mode (`vypr immersive`) fills. Installed
+    // unconditionally: it costs nothing until immersive mode asks for monitors,
+    // and doing it here means the feature just works rather than needing a
+    // separate driver install later. The driver is a signed MIT IddCx driver
+    // (MttVDD) plus a tiny helper, vypr-vdd.exe, that the launcher drives.
+    logf(L"Virtual Display Driver (for immersive mode - a screen per monitor)");
+
+    std::wstring dir = program_dir();
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring vdd = dir + L"\\vdd";
+    CreateDirectoryW(vdd.c_str(), nullptr);
+
+    // The settings file the driver reads its monitor count from. The launcher
+    // rewrites the count per session; one is enough to start with.
+    CreateDirectoryW(L"C:\\VirtualDisplayDriver", nullptr);
+
+    const std::wstring inf = vdd + L"\\MttVDD.inf";
+    const std::wstring cer = vdd + L"\\signpath.cer";
+    const bool unpacked =
+        write_resource(IDR_VDD_INF, inf) &&
+        write_resource(IDR_VDD_DLL, vdd + L"\\MttVDD.dll") &&
+        write_resource(IDR_VDD_CAT, vdd + L"\\mttvdd.cat") &&
+        write_resource(IDR_VDD_CER, cer) &&
+        write_resource(IDR_NEFCON,  vdd + L"\\nefconw.exe") &&
+        write_resource(IDR_VDD_EXE, dir + L"\\vypr-vdd.exe");
+    if (!step_ok(unpacked, L"driver files unpacked")) return;
+
+    // Already present? Then leave it - reinstalling a root device makes a second
+    // one. (The installer is expected to be run more than once.)
+    if (powershell(L"if ((pnputil /enum-devices) -match 'Root\\\\MttVDD' -or "
+                   L"(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | "
+                   L"Where-Object { $_.FriendlyName -match 'Virtual Display' })) "
+                   L"{ exit 0 } else { exit 1 }", true) == 0) {
+        logf(L"  [ok] already installed");
+        return;
+    }
+
+    // Trust the driver's signer so Windows installs it without a prompt Vypr
+    // could not answer. The leaf chains to a public CA, so TrustedPublisher is
+    // what matters; Root is added too so the chain is self-sufficient.
+    run(L"certutil -addstore -f TrustedPublisher \"" + cer + L"\"", true);
+    run(L"certutil -addstore -f Root \"" + cer + L"\"", true);
+
+    // IddCx drivers are root-enumerated; nefconw creates the device node and
+    // then installs the driver onto it. pnputil alone cannot create a root node.
+    const std::wstring nef = L"\"" + vdd + L"\\nefconw.exe\"";
+    run(nef + L" --create-device-node --hardware-id \"Root\\MttVDD\" "
+              L"--class-name Display "
+              L"--class-guid 4D36E968-E325-11CE-BFC1-08002BE10318", true);
+    run(nef + L" --install-driver --inf-path \"" + inf + L"\"", true);
+
+    step_ok(powershell(L"if (Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | "
+                       L"Where-Object { $_.FriendlyName -match 'Virtual Display' }) "
+                       L"{ exit 0 } else { exit 1 }", true) == 0,
+            L"Virtual Display Driver installed");
+}
+
 static void install_parsec_vud()
 {
     logf(L"Parsec virtual USB driver (this is what fixes the mouse in games)");
@@ -796,6 +862,7 @@ static DWORD WINAPI worker(LPVOID)
 
     install_agent();
     grant_lock_pages();
+    install_vdd();
     if (o.elevation) open_elevation();
     if (o.parsec)    { install_parsec_app(); install_parsec_vud(); install_gamepads(); }
     if (o.ssh)       setup_ssh(o.pubkey);
