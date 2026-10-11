@@ -3,6 +3,8 @@
 # Vypr - run a Windows application as a window on this desktop.
 #
 #   vypr run <app>      bring everything up and start the app
+#   vypr immersive [on|off]  one fullscreen window per monitor, each a guest
+#                       monitor - the VM filling every screen as if native
 #   vypr add <app>      register a Windows application as a launchable app
 #   vypr remove <app>   undo that - task, profile, menu entry and icons
 #   vypr detect         find apps on the guest desktop and offer to add them
@@ -45,6 +47,10 @@ export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 : "${GUEST_USER:=Lucy}"
 
 APP_NAME="Vypr"; APP_ICON="vypr"
+
+# Extra vyprd flags, set only by immersive mode. Declared here so start_daemon
+# can reference it unconditionally under 'set -u'.
+VYPRD_EXTRA=()
 
 say() {
     echo "vypr: $*"
@@ -102,6 +108,44 @@ guest_put() {
 guest_get() {
     scp -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR \
         -q "$GUEST_USER@$GUEST:$1" "$2"
+}
+
+# Run a command in the *interactive* Windows session and return its output.
+#
+# SSH lands in session 0, which has no desktop: display enumeration comes back
+# empty and anything that touches the screen fails. vypr-vdd has to run where
+# the desktop is, so it goes through a one-shot interactive scheduled task - the
+# same trick the agent uses - writing to a file this reads back. The command is
+# written into a .cmd rather than passed inline, so quoting survives the trip
+# through SSH, schtasks and cmd intact.
+guest_session_run() {
+    local cmd="$1"
+    local bat='C:\Vypr\vypr-run.cmd' out='C:\Vypr\vypr-run.out'
+    local tmp; tmp=$(mktemp)
+    printf '@echo off\r\n%s > "%s" 2>&1\r\n' "$cmd" "$out" > "$tmp"
+    guest 'if not exist C:\Vypr mkdir C:\Vypr' >/dev/null 2>&1
+    guest_put "$tmp" "$bat"; rm -f "$tmp"
+    guest "schtasks /delete /tn vypr-run /f >nul 2>&1 & schtasks /create /tn vypr-run /tr \"$bat\" /sc once /st 00:00 /it /rl limited /f" >/dev/null 2>&1
+    guest "schtasks /run /tn vypr-run" >/dev/null 2>&1
+    local i
+    for i in $(seq 1 20); do
+        guest 'schtasks /query /tn vypr-run /fo list 2>nul' 2>/dev/null \
+            | grep -i "status" | grep -qi "ready" && break
+        sleep 1
+    done
+    guest "type $out" 2>/dev/null | tr -d '\r'
+    guest 'schtasks /delete /tn vypr-run /f >nul 2>&1' >/dev/null 2>&1
+}
+
+# Where vypr-vdd lives in the guest: the installed path, or the staging dir a
+# developer copied it to. Echoed as a Windows path for use in a .cmd.
+guest_vdd_exe() {
+    local installed='C:\Program Files\Vypr\vypr-vdd.exe' staged='C:\Vypr\vypr-vdd.exe'
+    if guest "if exist \"$installed\" (echo yes)" 2>/dev/null | grep -qi yes; then
+        printf '%s' "$installed"
+    else
+        printf '%s' "$staged"
+    fi
 }
 
 # Pull the application's own icon out of the guest executable, so a registered
@@ -388,6 +432,9 @@ start_daemon() {
         # win for a mostly-still desktop app, a cost for full-screen motion like
         # a game. The user opts in per their workload, so it is never forced on.
         [ "${VYPR_DAMAGE:-0}" = "1" ] && args+=(--damage)
+        # Immersive mode fills this in with --immersive and the per-output
+        # mapping; empty for every ordinary session.
+        [ "${#VYPRD_EXTRA[@]}" -gt 0 ] && args+=("${VYPRD_EXTRA[@]}")
         nohup "$BIN/vyprd" --shm "$SHM" --vm "$VM" "${args[@]}" \
             >"${XDG_RUNTIME_DIR:-/tmp}/vyprd.log" 2>&1 &
         sleep 2
@@ -1276,6 +1323,98 @@ cmd_desktop() {
     die "the desktop did not appear - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
 }
 
+# Immersive desktop: one fullscreen window per host monitor, each showing a
+# different guest monitor at that monitor's resolution. The VM is given one
+# virtual display per host output (the Virtual Display Driver), so Windows
+# composites across them natively and the result looks like Windows running
+# straight on the hardware.
+#
+#   vypr immersive         turn it on
+#   vypr immersive off     put the guest's displays back and end the session
+cmd_immersive() {
+    case "${1:-on}" in
+        off|--off)
+            local vdd; vdd=$(guest_vdd_exe)
+            say "Putting the guest's displays back..."
+            pkill -x vypr-window 2>/dev/null || true
+            pkill -x vyprd 2>/dev/null || true
+            guest_session_run "\"$vdd\" restore" >/dev/null 2>&1 || true
+            say "Immersive mode off."
+            return 0
+            ;;
+        on)
+            ;;
+        *)
+            echo "usage: vypr immersive [on|off]" >&2
+            return 2
+            ;;
+    esac
+
+    APP_NAME="Vypr Immersive"; APP_ICON="vypr"
+
+    ensure_guest_ram
+    start_vm
+
+    # The host's outputs, from SDL itself so the coordinates match what the
+    # windows will use. Each line: "X,Y WxH  NAME", sorted left to right.
+    [ -x "$BIN/vypr-window" ] || die "$BIN/vypr-window is missing - reinstall"
+    local outs=()
+    while IFS= read -r line; do [ -n "$line" ] && outs+=("$line"); done \
+        < <("$BIN/vypr-window" --list-outputs 2>/dev/null)
+    local n=${#outs[@]}
+    [ "$n" -ge 1 ] || die "no host outputs found"
+    say "Found $n host monitor(s)."
+
+    # One WxH per output, in order, for the VDD.
+    local whs=() xy res
+    for line in "${outs[@]}"; do
+        res=${line#* }; res=${res%% *}   # the WxH field
+        whs+=("$res")
+    done
+
+    local vdd; vdd=$(guest_vdd_exe)
+    if ! guest "if exist \"$vdd\" (echo yes)" 2>/dev/null | grep -qi yes; then
+        die "vypr-vdd is not in the guest - reinstall with the Virtual Display Driver, or copy vypr-vdd.exe to C:\\Vypr"
+    fi
+
+    # Enough virtual monitors to cover every output. Harmless when already set.
+    say "Setting up $n virtual display(s) in the VM..."
+    guest_session_run "\"$vdd\" count $n" >/dev/null 2>&1 || true
+
+    # Lay them out to match the host, and learn which guest monitor index each
+    # output ended up on. Output: lines "map <k> <agentIndex> <WxH@X,Y>".
+    local map; map=$(guest_session_run "\"$vdd\" immersive ${whs[*]}")
+    grep -q '^map ' <<<"$map" || die "the virtual displays did not come up - is the driver installed? (got: $(tr '\n' ' ' <<<"$map"))"
+
+    # Pair each host output with its guest monitor: --match the monitor's title
+    # and --output its agent index to the output's top-left.
+    local matches=() k=0 hostx hosty ai
+    VYPRD_EXTRA=(--immersive)
+    for line in "${outs[@]}"; do
+        xy=${line%% *}; hostx=${xy%,*}; hosty=${xy#*,}
+        ai=$(awk -v k="$k" '$1=="map" && $2==k {print $3}' <<<"$map")
+        [ -n "$ai" ] || die "no guest monitor mapped for output $k"
+        matches+=("Vypr Monitor $((ai + 1))")
+        VYPRD_EXTRA+=(--output "$ai=$hostx,$hosty")
+        k=$((k + 1))
+    done
+
+    start_daemon matches
+    start_agent
+    ensure_open_elevation
+    start_parsec
+    start_watcher
+
+    local i count
+    for i in $(seq 1 24); do
+        count=$(pgrep -xc vypr-window 2>/dev/null || echo 0)
+        [ "$count" -ge "$n" ] && { say "Immersive desktop is on screen across $n monitor(s)."; return 0; }
+        sleep 5
+    done
+    say "Only $(pgrep -xc vypr-window 2>/dev/null || echo 0) of $n windows came up - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+    return 0
+}
+
 # Take every registered app off this desktop.
 #
 # The counterpart to a long session with `vypr detect`, and deliberately not
@@ -1925,6 +2064,7 @@ cmd_down() {
 
 case "${1:-}" in
     run)    shift; cmd_run "$@" ;;
+    immersive) shift; cmd_immersive "$@" ;;
     add)    shift; cmd_add "$@" ;;
     remove) shift; cmd_remove "$@" ;;
     apps)   cmd_apps ;;

@@ -167,6 +167,20 @@ struct daemon {
     /* A size for spawned windows, instead of the guest's own. Used by the
      * whole-screen view, where the guest's size is a whole monitor. */
     const char *window_size;
+
+    /*
+     * Immersive mode: each guest monitor shown fullscreen on one host output.
+     *
+     * out_x/out_y[i] is the top-left of the host output that guest monitor i
+     * (the id VYPR_DESKTOP_MONITOR_0 + i) should fill. When a monitor stream is
+     * spawned, its window is given --fullscreen --at that point, so it lands on
+     * the right screen and covers it. out_set[i] says the mapping was given;
+     * unmapped monitors stream as ordinary windows.
+     */
+    int         immersive;
+    int         out_set[VYPR_DESKTOP_MONITOR_MAX];
+    int         out_x[VYPR_DESKTOP_MONITOR_MAX];
+    int         out_y[VYPR_DESKTOP_MONITOR_MAX];
     /* "Z:=/home/you" - where the guest's view of the shared folder lands on
      * this side. Only the launcher knows it, and only a client needs it, so it
      * passes straight through. */
@@ -399,7 +413,20 @@ static int spawn_client(struct daemon *d, struct window *w)
          * and quietly swallows the second, so the list is assembled instead
          * and the order stops mattering.
          */
-        char *argv[26];
+        /*
+         * Immersive: a monitor stream with a host output mapped to it is shown
+         * fullscreen on that output. Built here, child-side, so the string
+         * lives until execv. Only monitor ids can be mapped; everything else
+         * stays a normal window.
+         */
+        char at[32] = {0};
+        const int mon_idx = vypr_desktop_monitor_index(w->id);
+        const int immersive_win =
+            d->immersive && mon_idx >= 0 && d->out_set[mon_idx];
+        if (immersive_win)
+            snprintf(at, sizeof at, "%d,%d", d->out_x[mon_idx], d->out_y[mon_idx]);
+
+        char *argv[30];
         int n = 0;
         argv[n++] = exe;
         argv[n++] = "--shm";        argv[n++] = (char *)d->shm_path;
@@ -415,6 +442,7 @@ static int spawn_client(struct daemon *d, struct window *w)
          * is held the window cannot be dragged and the cursor is hidden. That
          * is right for a game and wrong for everything before one. */
         argv[n++] = (char *)cap_flag;
+        if (immersive_win) { argv[n++] = "--fullscreen"; argv[n++] = "--at"; argv[n++] = at; }
         if (size_flag) { argv[n++] = "--size";  argv[n++] = (char *)size_flag; }
         if (d->share)  { argv[n++] = "--share"; argv[n++] = (char *)d->share; }
         /* Per-second frame timings from every window, into this daemon's log.
@@ -1388,6 +1416,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--all"))  d.match_all = 1;
         else if (!strcmp(argv[i], "--capture") && i + 1 < argc) d.capture = argv[++i];
         else if (!strcmp(argv[i], "--window-size") && i + 1 < argc) d.window_size = argv[++i];
+        else if (!strcmp(argv[i], "--immersive")) d.immersive = 1;
+        else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+            /* I=X,Y : guest monitor index I fills the host output at X,Y. */
+            int idx, x, y;
+            if (sscanf(argv[++i], "%d=%d,%d", &idx, &x, &y) != 3 ||
+                idx < 0 || idx >= VYPR_DESKTOP_MONITOR_MAX) {
+                fprintf(stderr, "vyprd: --output wants I=X,Y with I in 0..%d\n",
+                        VYPR_DESKTOP_MONITOR_MAX - 1);
+                return 2;
+            }
+            d.out_set[idx] = 1; d.out_x[idx] = x; d.out_y[idx] = y;
+            d.immersive = 1;
+        }
         else if (!strcmp(argv[i], "--share") && i + 1 < argc) d.share = argv[++i];
         else if (!strcmp(argv[i], "--launch") && i + 1 < argc) d.launch = argv[++i];
         else if (!strcmp(argv[i], "--damage")) d.damage = 1;

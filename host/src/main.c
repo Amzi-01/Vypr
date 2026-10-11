@@ -1195,10 +1195,51 @@ static int list_pads(void)
     return 0;
 }
 
+/*
+ * The host's outputs, one line each: "X,Y WxH  NAME".
+ *
+ * Printed from SDL itself, so the coordinates are exactly the ones --at and the
+ * fullscreen placement use - the launcher pairs these with guest monitors and
+ * passes each output's X,Y straight back. Sorted left to right, top to bottom,
+ * the same order the guest sorts its monitors, so output k meets monitor k.
+ */
+static int list_outputs(void)
+{
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fprintf(stderr, "vypr: SDL video init: %s\n", SDL_GetError());
+        return 1;
+    }
+    int n = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&n);
+    /* Collect then sort: SDL's enumeration order is not left-to-right. */
+    struct { int x, y, w, h; const char *name; } o[64];
+    int count = 0;
+    for (int i = 0; i < n && count < 64; i++) {
+        SDL_Rect r;
+        if (!SDL_GetDisplayBounds(ids[i], &r)) continue;
+        o[count].x = r.x; o[count].y = r.y; o[count].w = r.w; o[count].h = r.h;
+        o[count].name = SDL_GetDisplayName(ids[i]);
+        count++;
+    }
+    for (int i = 0; i < count; i++)
+        for (int j = i + 1; j < count; j++)
+            if (o[j].x < o[i].x || (o[j].x == o[i].x && o[j].y < o[i].y)) {
+                __typeof__(o[0]) t = o[i]; o[i] = o[j]; o[j] = t;
+            }
+    for (int i = 0; i < count; i++)
+        printf("%d,%d %dx%d  %s\n", o[i].x, o[i].y, o[i].w, o[i].h,
+               o[i].name ? o[i].name : "(unnamed)");
+    SDL_free(ids);
+    SDL_Quit();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--list-pads")) return list_pads();
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--list-pads"))    return list_pads();
+        if (!strcmp(argv[i], "--list-outputs")) return list_outputs();
+    }
 
     struct options opt;
     if (parse_args(argc, argv, &opt) < 0) return 2;
