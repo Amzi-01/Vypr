@@ -29,6 +29,7 @@
 #include <cstring>
 #include <execution>
 #include <mutex>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -248,8 +249,12 @@ struct WindowCapture::Impl {
     bool                          is_monitor = false;
     std::uint64_t                 desktop_id = 0;
     std::atomic<unsigned long long> last_publish_ms{0};
-    std::thread                   keyframe_thread;
-    std::atomic<bool>             keyframe_stop{false};
+    // GDI scratch for keyframes, used only by the reader thread.
+    HDC     kf_screen = nullptr;
+    HDC     kf_mem = nullptr;
+    HBITMAP kf_dib = nullptr;
+    void*   kf_bits = nullptr;
+    int     kf_w = 0, kf_h = 0;
 
     bool ensure_staging(std::uint32_t w, std::uint32_t h);
     void on_frame(const Direct3D11CaptureFramePool& sender);
@@ -259,7 +264,7 @@ struct WindowCapture::Impl {
     bool write_out_banded(Stage& st);
     void stop_reader();
     void gdi_loop();
-    void keyframe_loop();
+    void maybe_keyframe();
     void note_published() { last_publish_ms.store(GetTickCount64()); }
 };
 
@@ -341,75 +346,65 @@ void WindowCapture::Impl::gdi_loop() {
 /*
  * A full frame of an idle monitor, grabbed with GDI.
  *
- * Fires only when no WGC frame has arrived for a short while, so during any
- * activity - a game, a video, moving windows - it never runs. GDI does not
- * capture the cursor, which is what we want: the host draws its own. Skipped
- * while an app has the pointer locked, where the cursor belongs in the frame
- * and WGC is busy anyway.
+ * Called from the reader thread when it has waited out its timeout with no WGC
+ * frame to process - so it is the only thing publishing, never racing the WGC
+ * path. WGC stops delivering on a still screen, and with the cursor no longer
+ * baked in to keep frames coming, a frame captured mid-transition could sit on
+ * screen until something repainted; this repaints it. GDI does not capture the
+ * cursor, which is what we want (the host draws its own). Skipped while the
+ * pointer is locked, where the cursor belongs in the frame.
  */
-void WindowCapture::Impl::keyframe_loop() {
-    HDC screen = GetDC(nullptr);
-    HDC mem    = CreateCompatibleDC(screen);
-    HBITMAP dib = nullptr;
-    void*   bits = nullptr;
-    int     dib_w = 0, dib_h = 0;
+void WindowCapture::Impl::maybe_keyframe() {
+    if (!is_monitor) return;
+    if (GetTickCount64() - last_publish_ms.load() < 400) return;  // WGC keeping up
+    if (cursor_in_frame) return;                                   // locked: leave to WGC
 
-    while (!keyframe_stop.load()) {
-        Sleep(100);
-        const ULONGLONG now = GetTickCount64();
-        if (now - last_publish_ms.load() < 400) continue;   // WGC is keeping up
-        if (cursor_in_frame) continue;                       // locked: leave it to WGC
+    const RECT r = vypr_desktop_monitor_rect(desktop_id);
+    const int w = r.right - r.left;
+    const int h = r.bottom - r.top;
+    if (w <= 0 || h <= 0) return;
 
-        const RECT r = vypr_desktop_monitor_rect(desktop_id);
-        const int w = r.right - r.left;
-        const int h = r.bottom - r.top;
-        if (w <= 0 || h <= 0) continue;
-
-        if (!dib || w != dib_w || h != dib_h) {
-            if (dib) DeleteObject(dib);
-            BITMAPINFO bi{};
-            bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-            bi.bmiHeader.biWidth       = w;
-            bi.bmiHeader.biHeight      = -h;   // top-down, like everything else here
-            bi.bmiHeader.biPlanes      = 1;
-            bi.bmiHeader.biBitCount    = 32;
-            bi.bmiHeader.biCompression = BI_RGB;
-            dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-            if (!dib) break;
-            SelectObject(mem, dib);
-            dib_w = w;
-            dib_h = h;
-        }
-
-        if (!BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT))
-            continue;
-
-        std::lock_guard<std::mutex> guard(lock);
-        if (!pub || !pub->bound()) continue;
-        if (static_cast<std::uint32_t>(w) > pub->max_width() ||
-            static_cast<std::uint32_t>(h) > pub->max_height())
-            continue;
-        std::uint32_t stride = 0;
-        std::uint8_t* dst = pub->begin_frame(&stride);
-        if (!dst) continue;
-        const auto* srcp = static_cast<const std::uint8_t*>(bits);
-        const std::size_t row = static_cast<std::size_t>(w) * 4;
-        for (int y = 0; y < h; y++)
-            std::memcpy(dst + static_cast<std::size_t>(y) * stride,
-                        srcp + static_cast<std::size_t>(y) * row, row);
-        LARGE_INTEGER qpc{};
-        QueryPerformanceCounter(&qpc);
-        if (pub->publish(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h),
-                         stride, static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
-                         VYPR_PUB_DAMAGE_FULL)) {
-            captured++;
-            note_published();
-        }
+    if (!kf_screen) { kf_screen = GetDC(nullptr); kf_mem = CreateCompatibleDC(kf_screen); }
+    if (!kf_mem) return;
+    if (!kf_dib || w != kf_w || h != kf_h) {
+        if (kf_dib) DeleteObject(kf_dib);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth       = w;
+        bi.bmiHeader.biHeight      = -h;   // top-down, like everything else here
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        kf_dib = CreateDIBSection(kf_mem, &bi, DIB_RGB_COLORS, &kf_bits, nullptr, 0);
+        if (!kf_dib) return;
+        SelectObject(kf_mem, kf_dib);
+        kf_w = w; kf_h = h;
     }
 
-    if (dib) DeleteObject(dib);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
+    if (!BitBlt(kf_mem, 0, 0, w, h, kf_screen, r.left, r.top, SRCCOPY | CAPTUREBLT))
+        return;
+
+    std::lock_guard<std::mutex> guard(lock);
+    if (!pub || !pub->bound()) return;
+    if (static_cast<std::uint32_t>(w) > pub->max_width() ||
+        static_cast<std::uint32_t>(h) > pub->max_height())
+        return;
+    std::uint32_t stride = 0;
+    std::uint8_t* dst = pub->begin_frame(&stride);
+    if (!dst) return;
+    const auto* srcp = static_cast<const std::uint8_t*>(kf_bits);
+    const std::size_t row = static_cast<std::size_t>(w) * 4;
+    for (int y = 0; y < h; y++)
+        std::memcpy(dst + static_cast<std::size_t>(y) * stride,
+                    srcp + static_cast<std::size_t>(y) * row, row);
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    if (pub->publish(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h),
+                     stride, static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
+                     VYPR_PUB_DAMAGE_FULL)) {
+        captured++;
+        note_published();
+    }
 }
 
 /*
@@ -614,15 +609,20 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
 void WindowCapture::Impl::reader_loop() {
     join_mmcss();
     for (;;) {
-        int i;
+        int i = -1;
         {
             std::unique_lock<std::mutex> lk(job_lock);
-            job_cv.wait(lk, [this] { return reader_stop || queued >= 0; });
-            if (reader_stop) return;
-            i = queued;
-            queued = -1;
-            stages[i].state = StageState::Reading;
+            // Wake on a queued frame, or time out to keyframe an idle monitor.
+            job_cv.wait_for(lk, std::chrono::milliseconds(200),
+                            [this] { return reader_stop || queued >= 0; });
+            if (reader_stop) break;
+            if (queued >= 0) {
+                i = queued;
+                queued = -1;
+                stages[i].state = StageState::Reading;
+            }
         }
+        if (i < 0) { maybe_keyframe(); continue; }   // timed out: still screen
         write_out(stages[i]);
         {
             std::lock_guard<std::mutex> lk(job_lock);
@@ -630,6 +630,10 @@ void WindowCapture::Impl::reader_loop() {
         }
         job_cv.notify_all();
     }
+
+    if (kf_dib)    { DeleteObject(kf_dib);     kf_dib = nullptr; }
+    if (kf_mem)    { DeleteDC(kf_mem);         kf_mem = nullptr; }
+    if (kf_screen) { ReleaseDC(nullptr, kf_screen); kf_screen = nullptr; }
 }
 
 /*
@@ -1105,21 +1109,12 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage,
 
     impl_->reader = std::thread([this] { impl_->reader_loop(); });
 
-    if (impl_->is_monitor) {
-        impl_->keyframe_stop.store(false);
-        impl_->keyframe_thread = std::thread([this] { impl_->keyframe_loop(); });
-    }
-
     TRACE("session created; starting");
     impl_->session.StartCapture();
     return true;
 }
 
 void WindowCapture::stop() {
-    if (impl_->keyframe_thread.joinable()) {
-        impl_->keyframe_stop = true;
-        impl_->keyframe_thread.join();
-    }
     impl_->is_monitor = false;
     if (impl_->gdi_thread.joinable()) {
         impl_->gdi_stop = true;
