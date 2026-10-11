@@ -776,6 +776,23 @@ bool Agent::run(const char* host, std::uint16_t port) {
     if (!control_.connect(host, port)) return false;
     std::fprintf(stderr, "vypr: control channel up to %s:%u\n", host, port);
 
+    /*
+     * The hello goes first, before any watcher that might send on this channel.
+     * vyprd identifies the control connection by the hello being the first
+     * thing it reads; anything in front of it - a cursor shape, a toast - and
+     * the agent is never registered and nothing streams.
+     */
+    {
+        LARGE_INTEGER freq{};
+        QueryPerformanceFrequency(&freq);
+        vypr_msg_hello hello{};
+        hello.version      = VYPR_PROTO_VERSION;
+        hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
+        hello.agent_pid    = GetCurrentProcessId();
+        hello.capabilities = VYPR_CAP_RESIZE | VYPR_CAP_CURSOR_SHAPES;
+        control_.send(VYPR_MSG_HELLO, &hello, sizeof(hello));
+    }
+
     /* A second connection for audio, so a queued input event cannot sit in
      * front of a sound, and so the audio thread has a socket to itself. */
     /* Not fatal when it fails: ViGEmBus may not be installed, and everything
@@ -813,35 +830,6 @@ bool Agent::run(const char* host, std::uint16_t port) {
             control_.send(VYPR_MSG_NOTIFY, msg.data(),
                           static_cast<std::uint32_t>(msg.size()));
     });
-
-    /*
-     * The guest's pointer shape, for the host to draw as its own cursor.
-     *
-     * This is what lets the cursor be left out of the frames: the host moves a
-     * real pointer at the compositor's rate and only needs to be told the shape
-     * when it changes. Capped to a message, with the image downscaled to fit if
-     * some accessibility cursor is enormous.
-     */
-    cursor_.start([this](const vypr::CursorShape& c) {
-        const std::uint32_t max_img =
-            VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor);
-        std::uint32_t img = (std::uint32_t)c.bgra.size();
-        if (img > max_img) img = 0;   // should not happen; watcher pre-shrinks
-
-        std::vector<std::uint8_t> msg(sizeof(vypr_msg_cursor) + img);
-        auto* h = reinterpret_cast<vypr_msg_cursor*>(msg.data());
-        *h = {};
-        h->window_id    = 0;   // one pointer for the whole guest
-        h->hotspot_x    = c.hotspot_x;
-        h->hotspot_y    = c.hotspot_y;
-        h->width        = img ? c.width  : 0;
-        h->height       = img ? c.height : 0;
-        h->visible      = c.visible ? 1u : 0u;
-        h->bitmap_bytes = img;
-        if (img) std::memcpy(msg.data() + sizeof(*h), c.bgra.data(), img);
-        control_.send(VYPR_MSG_CURSOR, msg.data(),
-                      static_cast<std::uint32_t>(msg.size()));
-    }, VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor));
 
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */
@@ -892,16 +880,38 @@ bool Agent::run(const char* host, std::uint16_t port) {
     if (!locked_pages_)
         std::fprintf(stderr, "vypr: no windows can be streamed: %s\n", lock_problem_.c_str());
 
-    LARGE_INTEGER freq{};
-    QueryPerformanceFrequency(&freq);
+    /*
+     * The guest's pointer shape, for the host to draw as its own cursor.
+     *
+     * Started only after the hello: the watcher fires its first shape
+     * immediately, and on the control channel that message must not get in
+     * front of the hello - vyprd keys its whole session off the hello being the
+     * first thing it reads, and a cursor message arriving first left it never
+     * seeing the agent at all. Lets the cursor be left out of the frames: the
+     * host moves a real pointer at the compositor's rate and is only told the
+     * shape when it changes. Downscaled to fit a message if some accessibility
+     * cursor is enormous.
+     */
+    cursor_.start([this](const vypr::CursorShape& c) {
+        const std::uint32_t max_img =
+            VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor);
+        std::uint32_t img = (std::uint32_t)c.bgra.size();
+        if (img > max_img) img = 0;   // should not happen; watcher pre-shrinks
 
-    vypr_msg_hello hello{};
-    hello.version      = VYPR_PROTO_VERSION;
-    hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
-    hello.agent_pid    = GetCurrentProcessId();
-    hello.capabilities = VYPR_CAP_RESIZE | VYPR_CAP_CURSOR_SHAPES;
-    control_.send(VYPR_MSG_HELLO, &hello, sizeof(hello));
-
+        std::vector<std::uint8_t> msg(sizeof(vypr_msg_cursor) + img);
+        auto* h = reinterpret_cast<vypr_msg_cursor*>(msg.data());
+        *h = {};
+        h->window_id    = 0;   // one pointer for the whole guest
+        h->hotspot_x    = c.hotspot_x;
+        h->hotspot_y    = c.hotspot_y;
+        h->width        = img ? c.width  : 0;
+        h->height       = img ? c.height : 0;
+        h->visible      = c.visible ? 1u : 0u;
+        h->bitmap_bytes = img;
+        if (img) std::memcpy(msg.data() + sizeof(*h), c.bgra.data(), img);
+        control_.send(VYPR_MSG_CURSOR, msg.data(),
+                      static_cast<std::uint32_t>(msg.size()));
+    }, VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor));
 
     std::thread watcher([this] { watch_windows(); });
 

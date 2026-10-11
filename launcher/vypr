@@ -1405,13 +1405,16 @@ cmd_immersive() {
     start_parsec
     start_watcher
 
+    # pgrep -c prints 0 AND exits non-zero when nothing matches, so a `|| echo 0`
+    # appends a second 0 - count the lines instead, which is always one integer.
     local i count
     for i in $(seq 1 24); do
-        count=$(pgrep -xc vypr-window 2>/dev/null || echo 0)
+        count=$(pgrep -x vypr-window 2>/dev/null | grep -c .)
         [ "$count" -ge "$n" ] && { say "Immersive desktop is on screen across $n monitor(s)."; return 0; }
         sleep 5
     done
-    say "Only $(pgrep -xc vypr-window 2>/dev/null || echo 0) of $n windows came up - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
+    count=$(pgrep -x vypr-window 2>/dev/null | grep -c .)
+    say "Only $count of $n windows came up - check ${XDG_RUNTIME_DIR:-/tmp}/vyprd.log"
     return 0
 }
 
