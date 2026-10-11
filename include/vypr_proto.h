@@ -317,14 +317,35 @@ struct vypr_msg_window_id {
  * needs to know which window to position it against. Zero means top level.
  */
 /*
- * The primary monitor, offered as though it were a window.
+ * A whole monitor, offered as though it were a window.
  *
  * Chosen well outside the range Windows hands out for real HWNDs, so it cannot
  * collide with one. Everything downstream - matching, attaching, slots, input -
  * treats it exactly like any other window; only the agent's capture knows the
  * difference.
+ *
+ * Two forms. VYPR_DESKTOP_WINDOW_ID is the primary monitor, used by
+ * `vypr --debug desktop` and kept unchanged. The MONITOR range is immersive
+ * mode: one id per monitor, index 0..N-1 in the agent's sorted monitor order,
+ * so the host can show every monitor at once as a separate fullscreen window.
+ * The two never collide: the MONITOR range tops out well below the primary id.
  */
-#define VYPR_DESKTOP_WINDOW_ID  0xD35C709Full
+#define VYPR_DESKTOP_WINDOW_ID   0xD35C709Full
+#define VYPR_DESKTOP_MONITOR_0   0xD35C7000ull
+#define VYPR_DESKTOP_MONITOR_MAX 16   /* ids 0xD35C7000 .. 0xD35C700F */
+
+static inline int vypr_desktop_monitor_index(uint64_t id)
+{
+    if (id >= VYPR_DESKTOP_MONITOR_0 &&
+        id <  VYPR_DESKTOP_MONITOR_0 + VYPR_DESKTOP_MONITOR_MAX)
+        return (int)(id - VYPR_DESKTOP_MONITOR_0);
+    return -1;   /* not a per-monitor id (may still be the primary below) */
+}
+
+static inline int vypr_is_desktop_id(uint64_t id)
+{
+    return id == VYPR_DESKTOP_WINDOW_ID || vypr_desktop_monitor_index(id) >= 0;
+}
 
 struct vypr_msg_window {
     uint64_t window_id;

@@ -21,6 +21,72 @@
 #include <windows.h>
 #include <dwmapi.h>
 
+#include <algorithm>
+#include <vector>
+
+#include "vypr_proto.h"
+
+/*
+ * The guest's monitors, in a stable order.
+ *
+ * Immersive mode pairs host output k with guest monitor k, so both ends have to
+ * agree on what "monitor k" is. Sorting by (left, top) gives an order that does
+ * not depend on the order Windows happens to enumerate adapters in, and matches
+ * the left-to-right way the launcher sorts the host's outputs.
+ */
+struct vypr_monitor { HMONITOR handle; RECT rect; };
+
+inline std::vector<vypr_monitor> vypr_list_monitors() {
+    std::vector<vypr_monitor> out;
+    EnumDisplayMonitors(nullptr, nullptr,
+        [](HMONITOR h, HDC, LPRECT, LPARAM lp) -> BOOL {
+            MONITORINFO mi{}; mi.cbSize = sizeof mi;
+            if (GetMonitorInfoW(h, &mi))
+                reinterpret_cast<std::vector<vypr_monitor>*>(lp)
+                    ->push_back({ h, mi.rcMonitor });
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&out));
+    std::sort(out.begin(), out.end(), [](const vypr_monitor& a, const vypr_monitor& b) {
+        if (a.rect.left != b.rect.left) return a.rect.left < b.rect.left;
+        return a.rect.top < b.rect.top;
+    });
+    return out;
+}
+
+inline RECT vypr_primary_monitor_rect() {
+    if (HMONITOR m = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)) {
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(m, &mi)) return mi.rcMonitor;
+    }
+    return RECT{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+}
+
+/* The HMONITOR a desktop window id names, or null if it names none. A
+ * per-monitor id past the end of the current monitor list (a monitor was
+ * unplugged) also returns null; the primary id always resolves. */
+inline HMONITOR vypr_desktop_monitor_handle(uint64_t id) {
+    const int idx = vypr_desktop_monitor_index(id);
+    if (idx >= 0) {
+        const auto mons = vypr_list_monitors();
+        if (idx < (int)mons.size()) return mons[idx].handle;
+        return nullptr;
+    }
+    if (id == VYPR_DESKTOP_WINDOW_ID)
+        return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    return nullptr;
+}
+
+/* The screen rect a desktop window id covers. Pointer offsets for a monitor
+ * stream are relative to this. Falls back to the primary for the legacy id. */
+inline RECT vypr_desktop_monitor_rect(uint64_t id) {
+    const int idx = vypr_desktop_monitor_index(id);
+    if (idx >= 0) {
+        const auto mons = vypr_list_monitors();
+        if (idx < (int)mons.size()) return mons[idx].rect;
+    }
+    return vypr_primary_monitor_rect();
+}
+
 inline RECT vypr_capture_rect(HWND hwnd) {
     RECT r{};
     if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r))) ||

@@ -56,6 +56,14 @@ struct options {
     uint64_t    window_id;
     uint32_t    slot;
     int         stats;
+    /*
+     * Immersive mode: fullscreen this window on the host output that contains
+     * the point (fs_x, fs_y). The launcher runs one window per output and
+     * passes each output's top-left, so each lands on its own screen and goes
+     * fullscreen there. fullscreen is 0 when not asked for.
+     */
+    int         fullscreen;
+    int         fs_x, fs_y;
     /* "Z:=/home/you": where the guest's shared folder lands on this side.
      * The launcher is the only thing that knows it. */
     const char *share;
@@ -818,6 +826,14 @@ static int parse_args(int argc, char **argv, struct options *o)
         else if (!strcmp(argv[i], "--window-id") && i + 1 < argc)
             o->window_id = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stats"))                 o->stats = 1;
+        else if (!strcmp(argv[i], "--fullscreen"))            o->fullscreen = 1;
+        else if (!strcmp(argv[i], "--at") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%d,%d", &o->fs_x, &o->fs_y) != 2) {
+                fprintf(stderr, "vypr: --at wants X,Y\n");
+                return -1;
+            }
+            o->fullscreen = 1;
+        }
         else { usage(); return -1; }
     }
     return 0;
@@ -1310,7 +1326,7 @@ int main(int argc, char **argv)
      * clicks. Given real decorations it is dragged by them instead, and every
      * pixel of the picture stays the guest's.
      */
-    const bool decorated = opt.window_id == VYPR_DESKTOP_WINDOW_ID;
+    const bool decorated = opt.window_id == VYPR_DESKTOP_WINDOW_ID && !opt.fullscreen;
 
     views[0].dirty = true;
     views[0].win = SDL_CreateWindow(opt.title, win_w, win_h,
@@ -1355,6 +1371,24 @@ int main(int argc, char **argv)
             SDL_PumpEvents();
             SDL_FlushEvent(SDL_EVENT_WINDOW_RESIZED);
         }
+    }
+
+    /*
+     * Immersive mode: put this window on one host output and fill it.
+     *
+     * The launcher runs one window per output and passes each output's top-left
+     * in --at, so moving the window there lands it on the intended screen; then
+     * fullscreen-desktop covers that screen with no decorations. A saved size
+     * from a past windowed session does not apply here - this is a screen, not
+     * a window someone sized - so the restore above is harmless (the fullscreen
+     * replaces it) and the geometry is never saved back while fullscreen.
+     */
+    if (opt.fullscreen) {
+        SDL_SetWindowPosition(views[0].win, opt.fs_x, opt.fs_y);
+        if (!SDL_SetWindowFullscreen(views[0].win, true))
+            fprintf(stderr, "vypr: could not go fullscreen at %d,%d: %s\n",
+                    opt.fs_x, opt.fs_y, SDL_GetError());
+        SDL_SyncWindow(views[0].win);
     }
 
     views[0].pres = presenter_create(views[0].win, opt.backend, NULL);
@@ -1811,6 +1845,10 @@ int main(int argc, char **argv)
                  * guest to become the size it already is achieves nothing and
                  * oscillates against a guest that rounds differently. */
                 if (v->is_popup) break;   /* the guest owns a popup's size */
+                /* A screen cannot be resized to fit a window, and immersive mode
+                 * makes the window match the screen anyway - never push a resize
+                 * back to a monitor stream. */
+                if (opt.fullscreen || vypr_is_desktop_id(views[0].window_id)) break;
                 if ((uint32_t)ev.window.data1 == v->src_w &&
                     (uint32_t)ev.window.data2 == v->src_h)
                     break;
@@ -2148,7 +2186,7 @@ drop_pump(&drop);
      * ended up containing the first time this was written. Saved on the way out
      * rather than on every move, because a resize drag produces a stream of
      * events and the file would be rewritten for each pixel. */
-    if (views[0].win && !views[0].is_popup) {
+    if (views[0].win && !views[0].is_popup && !opt.fullscreen) {
         int gx = 0, gy = 0, gw = 0, gh = 0;
         SDL_GetWindowPosition(views[0].win, &gx, &gy);
         SDL_GetWindowSize(views[0].win, &gw, &gh);

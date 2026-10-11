@@ -41,3 +41,10 @@ target_compile_options(vypr-agent PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus
 target_link_libraries(vypr-agent PRIVATE
     d3d11 dxgi windowsapp setupapi ws2_32 dwmapi user32 gdi32 ole32 shell32
 )
+
+# vypr-vdd: configures the Virtual Display Driver's monitors for immersive mode.
+# Tiny and self-contained - the launcher calls it inside the guest.
+add_executable(vypr-vdd src/vdd.cpp)
+target_compile_definitions(vypr-vdd PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(vypr-vdd PRIVATE /W4 /permissive- /EHsc)
+target_link_libraries(vypr-vdd PRIVATE user32)

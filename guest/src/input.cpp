@@ -27,30 +27,22 @@ HWND          g_cap_hwnd = nullptr;
 ULONGLONG     g_cap_at = 0;
 
 /*
- * The whole screen is offered under a handle that is not a window - see
+ * A monitor is offered under a handle that is not a window - see
  * VYPR_DESKTOP_WINDOW_ID - so every window call in this file has to be skipped
- * for it. Its captured rectangle is the monitor's, which is what pointer
- * offsets are relative to.
+ * for it. Its captured rectangle is that monitor's, which is what pointer
+ * offsets are relative to. In immersive mode the id also says *which* monitor,
+ * so a click on one screen cannot land on another.
  */
 bool whole_desktop(std::uint64_t window_id) {
-    return window_id == VYPR_DESKTOP_WINDOW_ID;
-}
-
-RECT primary_monitor_rect() {
-    if (HMONITOR mon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY)) {
-        MONITORINFO mi{};
-        mi.cbSize = sizeof mi;
-        if (GetMonitorInfoW(mon, &mi)) return mi.rcMonitor;
-    }
-    return RECT{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    return vypr_is_desktop_id(window_id);
 }
 
 RECT cached_capture_rect(HWND hwnd) {
     const ULONGLONG now = GetTickCount64();
     if (hwnd != g_cap_hwnd || now - g_cap_at > 100) {
-        g_cap_cache = whole_desktop(reinterpret_cast<std::uintptr_t>(hwnd))
-                          ? primary_monitor_rect()
-                          : vypr_capture_rect(hwnd);
+        const std::uint64_t id = reinterpret_cast<std::uintptr_t>(hwnd);
+        g_cap_cache = whole_desktop(id) ? vypr_desktop_monitor_rect(id)
+                                        : vypr_capture_rect(hwnd);
         g_cap_hwnd  = hwnd;
         g_cap_at    = now;
     }

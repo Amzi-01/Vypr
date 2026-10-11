@@ -281,8 +281,10 @@ void Agent::handle_attach(const vypr_msg_attach& msg) {
     result.slot      = msg.slot;
 
     /* The whole screen is offered under a handle that is deliberately not a
-     * window, so it cannot be checked like one - see VYPR_DESKTOP_WINDOW_ID. */
-    const bool whole_desktop = msg.window_id == VYPR_DESKTOP_WINDOW_ID;
+     * window, so it cannot be checked like one - see VYPR_DESKTOP_WINDOW_ID.
+     * Any monitor id counts, not just the primary: immersive mode attaches one
+     * per monitor. */
+    const bool whole_desktop = vypr_is_desktop_id(msg.window_id);
 
     if (!whole_desktop && !IsWindow(hwnd)) {
         result.status = -1;

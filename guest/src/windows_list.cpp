@@ -239,33 +239,43 @@ std::vector<WindowInfo> list_windows() {
     EnumWindows(collect, reinterpret_cast<LPARAM>(&out));
 
     /*
-     * One entry that is not a window: the primary monitor, offered under a
-     * fixed handle so it can be matched and attached like anything else.
+     * Entries that are not windows: the monitors, offered under fixed handles
+     * so each can be matched and attached like anything else.
      *
      * Streaming a window shows that window. Seeing what the VM is actually
      * doing - a dialog nobody matched, an installer waiting on a click, a
      * desktop with nothing on it - needs the whole screen, and WGC will
      * capture a monitor as readily as a window. Nothing else in the protocol
-     * has to know that this one is different.
+     * has to know these are different.
+     *
+     * The primary comes first under the legacy id, so `vypr --debug desktop`,
+     * which matches on "Vypr Desktop", still finds exactly one thing. Then every
+     * monitor in sorted order under a per-monitor id, which is what immersive
+     * mode attaches to - one host output per guest monitor.
      */
-    if (HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)) {
-        MONITORINFO mi{};
-        mi.cbSize = sizeof mi;
-        if (GetMonitorInfoW(mon, &mi)) {
-            WindowInfo desk{};
-            desk.title              = "Vypr Desktop";
-            desk.desc.window_id     = VYPR_DESKTOP_WINDOW_ID;
-            desk.desc.owner_id      = 0;
-            desk.desc.x             = mi.rcMonitor.left;
-            desk.desc.y             = mi.rcMonitor.top;
-            desk.desc.width         = static_cast<std::uint32_t>(mi.rcMonitor.right - mi.rcMonitor.left);
-            desk.desc.height        = static_cast<std::uint32_t>(mi.rcMonitor.bottom - mi.rcMonitor.top);
-            desk.desc.dpi           = 96;
-            desk.desc.pid           = 0;
-            desk.desc.flags         = 0;
-            desk.desc.chrome_top    = 0;   /* no title bar to drag; it is a screen */
-            out.push_back(std::move(desk));
-        }
+    auto push_monitor = [&out](const char* title, std::uint64_t id, const RECT& r) {
+        WindowInfo desk{};
+        desk.title           = title;
+        desk.desc.window_id  = id;
+        desk.desc.owner_id   = 0;
+        desk.desc.x          = r.left;
+        desk.desc.y          = r.top;
+        desk.desc.width      = static_cast<std::uint32_t>(r.right - r.left);
+        desk.desc.height     = static_cast<std::uint32_t>(r.bottom - r.top);
+        desk.desc.dpi        = 96;
+        desk.desc.pid        = 0;
+        desk.desc.flags      = 0;
+        desk.desc.chrome_top = 0;   /* no title bar to drag; it is a screen */
+        out.push_back(std::move(desk));
+    };
+
+    push_monitor("Vypr Desktop", VYPR_DESKTOP_WINDOW_ID, vypr_primary_monitor_rect());
+
+    const auto mons = vypr_list_monitors();
+    for (std::size_t i = 0; i < mons.size() && i < VYPR_DESKTOP_MONITOR_MAX; ++i) {
+        char title[32];
+        std::snprintf(title, sizeof title, "Vypr Monitor %zu", i + 1);
+        push_monitor(title, VYPR_DESKTOP_MONITOR_0 + i, mons[i].rect);
     }
     return out;
 }

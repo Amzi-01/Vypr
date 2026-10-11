@@ -867,9 +867,10 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage) {
     impl_->prev_w = impl_->prev_h = impl_->prev_stride = 0;
     HWND hwnd = static_cast<HWND>(hwnd_raw);
 
-    /* The whole screen rather than one window - see VYPR_DESKTOP_WINDOW_ID. */
-    const bool whole_desktop =
-        reinterpret_cast<std::uintptr_t>(hwnd_raw) == VYPR_DESKTOP_WINDOW_ID;
+    /* A monitor rather than one window - see VYPR_DESKTOP_WINDOW_ID. The id
+     * names which monitor; immersive mode streams several at once. */
+    const std::uint64_t id = reinterpret_cast<std::uintptr_t>(hwnd_raw);
+    const bool whole_desktop = vypr_is_desktop_id(id);
 
     if (!whole_desktop && !IsWindow(hwnd)) return false;
 
@@ -919,7 +920,12 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage) {
     auto interop = get_activation_factory<GraphicsCaptureItem, ::IGraphicsCaptureItemInterop>();
     HRESULT hr;
     if (whole_desktop) {
-        HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        HMONITOR mon = vypr_desktop_monitor_handle(id);
+        if (!mon) {
+            std::fprintf(stderr, "vypr: no monitor for desktop id 0x%llX "
+                                 "(unplugged?)\n", (unsigned long long)id);
+            return false;
+        }
         hr = interop->CreateForMonitor(mon, guid_of<GraphicsCaptureItem>(),
                                        put_abi(impl_->item));
         if (FAILED(hr))
