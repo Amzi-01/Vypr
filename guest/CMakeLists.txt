@@ -17,6 +17,7 @@ add_executable(vypr-agent
     src/main.cpp
     src/audio.cpp
     src/capture.cpp
+    src/cursor.cpp
     src/control.cpp
     src/input.cpp
     src/awe.cpp

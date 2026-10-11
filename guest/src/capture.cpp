@@ -216,6 +216,9 @@ struct WindowCapture::Impl {
     std::atomic<std::uint64_t>    arrived{0};
     std::atomic<bool>             too_big{false};
     std::atomic<std::uint32_t>    content_w{0}, content_h{0};
+    /* Whether the guest cursor is drawn into the frames. Set before the session
+     * starts and flipped live when the pointer locks or unlocks. */
+    bool                          cursor_in_frame = false;
 
     std::uint64_t                 qpc_freq = 0;
 
@@ -853,7 +856,8 @@ WindowCapture::~WindowCapture() {
     if (impl_->fence_event) CloseHandle(impl_->fence_event);
 }
 
-bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage) {
+bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage,
+                          bool cursor_in_frame) {
     if (!capture_supported()) {
         std::fprintf(stderr, "vypr: Windows.Graphics.Capture unavailable "
                              "(needs Windows 10 1903+, and a display attached)\n");
@@ -863,6 +867,7 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage) {
 
     TRACE("entered start");
     impl_->want_damage = damage;
+    impl_->cursor_in_frame = cursor_in_frame;
     impl_->prev.clear();
     impl_->prev_w = impl_->prev_h = impl_->prev_stride = 0;
     HWND hwnd = static_cast<HWND>(hwnd_raw);
@@ -984,13 +989,15 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage) {
     //
     // IsCursorCaptureEnabled is IGraphicsCaptureSession2 (Windows 10 2004+).
     //
-    // Keep the guest cursor in the image. Excluding it assumed the host would
-    // draw a cursor of its own in the right place, and the result was a window
-    // with no pointer in it at all. Including it means what the user sees is
-    // where the guest actually thinks the pointer is, which is the only version
-    // that can be trusted for clicking on things.
+    // Off by default: the host draws the pointer as its own cursor, from the
+    // shape CursorWatcher sends, so it moves at the compositor's rate with no
+    // round trip. Baking it into the frames (the old behaviour) tied the
+    // pointer to the capture rate and the whole readback pipeline, which is
+    // what made the mouse feel floaty. It is turned back on only while an app
+    // has the pointer locked - a game confining or warping the cursor - where
+    // the host has no absolute position to draw one at.
     if (auto s2 = impl_->session.try_as<IGraphicsCaptureSession2>())
-        s2.IsCursorCaptureEnabled(true);
+        s2.IsCursorCaptureEnabled(impl_->cursor_in_frame);
 
     // IsBorderRequired is IGraphicsCaptureSession3 - Windows 11 22000+ only.
     // On Windows 10 the yellow capture border stays; cosmetic, not fatal.
@@ -1042,6 +1049,16 @@ void WindowCapture::stop() {
 }
 
 bool WindowCapture::needs_bigger_ring() const { return impl_->too_big.load(); }
+
+void WindowCapture::set_cursor_in_frame(bool on) {
+    if (impl_->cursor_in_frame == on) return;
+    impl_->cursor_in_frame = on;
+    // The session can take this live; no need to restart the capture.
+    if (impl_->session) {
+        if (auto s2 = impl_->session.try_as<IGraphicsCaptureSession2>())
+            s2.IsCursorCaptureEnabled(on);
+    }
+}
 
 void WindowCapture::content_size(std::uint32_t* w, std::uint32_t* h) const {
     if (w) *w = impl_->content_w.load();

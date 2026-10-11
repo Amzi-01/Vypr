@@ -223,6 +223,18 @@ enum vypr_msg_type {
 
     /* 138 was VYPR_MSG_CLIENT_DRAG_FILES, removed with the drag-out work.
      * Left reserved: a client built before that release still knows it. */
+
+    /*
+     * The guest's pointer shape, for the client to show as its own cursor.
+     *
+     * The guest sends VYPR_MSG_CURSOR whenever its cursor changes shape or
+     * visibility; the daemon passes it to every client unchanged, because
+     * there is one pointer and any window may be the one under it. Drawing it
+     * on the host is what makes the mouse feel native: the pointer moves at the
+     * compositor's rate with no round trip, instead of waiting for the guest
+     * to capture, read back and publish a frame with the cursor in it.
+     */
+    VYPR_MSG_CLIENT_CURSOR    = 139, /* vypr_msg_cursor + BGRA bitmap */
 };
 
 /*
@@ -623,6 +635,13 @@ struct vypr_msg_pong {
     uint64_t guest_qpc_freq;
 };
 
+/*
+ * The guest's pointer: shape and visibility. One pointer for the whole guest,
+ * so window_id is 0. The BGRA image (straight alpha, top-down rows, width*4
+ * bytes each) follows the header; bitmap_bytes is width*height*4, or zero when
+ * the pointer is hidden. Images larger than a message are downscaled by the
+ * guest before sending, hotspot included.
+ */
 struct vypr_msg_cursor {
     uint64_t window_id;
     int32_t  hotspot_x, hotspot_y;

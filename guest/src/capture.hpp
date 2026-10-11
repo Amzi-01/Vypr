@@ -31,8 +31,16 @@ public:
     // publishes only the rectangles that changed, which is far less to move
     // across the VM boundary for a mostly-still window. Off by default; the
     // host turns it on per attach only when the user asked for it.
-    bool start(void* hwnd, Publisher* pub, bool damage = false);
+    bool start(void* hwnd, Publisher* pub, bool damage = false,
+               bool cursor_in_frame = false);
     void stop();
+
+    // Whether the guest cursor is baked into the captured frames. Off by
+    // default - the host draws it as its own pointer, which moves without a
+    // round trip - and turned on only while an app has the pointer locked, so a
+    // game that confines or warps the cursor still shows one. Safe to call on a
+    // running capture.
+    void set_cursor_in_frame(bool on);
 
     // Set when the window's content grows past the slot the host gave us. The
     // session keeps running at the old size; the agent reports it and waits for

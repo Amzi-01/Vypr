@@ -214,6 +214,12 @@ struct daemon {
     uint64_t clock_best_rtt;
 
     char self_dir[512];
+
+    /* The latest guest cursor, kept so a window that opens later is told the
+     * current shape at once rather than showing nothing until it next changes.
+     * The whole VYPR_MSG_CURSOR payload, verbatim, ready to forward. */
+    uint8_t  cursor_msg[VYPR_MAX_MSG_BYTES];
+    uint32_t cursor_len;
 };
 
 static uint64_t now_ns(void)
@@ -974,6 +980,22 @@ static void on_agent_message(struct daemon *d, uint16_t type,
         break;
     }
 
+    case VYPR_MSG_CURSOR: {
+        /* One pointer for the whole guest, so every window hears about it - any
+         * of them may be the one under the cursor. Kept, too, for a window that
+         * connects after this. */
+        if (bytes < sizeof(struct vypr_msg_cursor) || bytes > sizeof(d->cursor_msg))
+            break;
+        memcpy(d->cursor_msg, payload, bytes);
+        d->cursor_len = bytes;
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window *w = &d->windows[i];
+            if (w->id && w->client_fd >= 0)
+                client_send(d, w->client_fd, VYPR_MSG_CLIENT_CURSOR, payload, bytes);
+        }
+        break;
+    }
+
     case VYPR_MSG_AUDIO: {
         /* One endpoint's worth of audio, so it goes to one window - the first
          * top-level with a client. Handing it to every client would play the
@@ -1154,6 +1176,11 @@ static void on_client_message(struct daemon *d, struct window **owner, int fd,
         if (!w) return;
         w->client_fd = fd;
         *owner = w;
+        /* Tell it the current pointer shape straight away, so it shows the
+         * right cursor from its first frame rather than nothing until the guest
+         * next changes shape. */
+        if (d->cursor_len)
+            client_send(d, fd, VYPR_MSG_CLIENT_CURSOR, d->cursor_msg, d->cursor_len);
         return;
     }
 

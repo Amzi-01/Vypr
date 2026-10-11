@@ -947,6 +947,23 @@ static void set_capture(SDL_Window *win, bool want, bool announce)
 }
 
 /*
+ * Show, hide or reshape the host's own pointer to match the guest's.
+ *
+ * Only while not captured: a captured pointer is hidden by relative mouse mode,
+ * and the guest bakes its cursor into the frames then, so touching the host
+ * cursor would fight that. When the guest hides its pointer (fullscreen video,
+ * a slideshow) the host hides its pointer too; otherwise the host wears the
+ * last shape the guest sent.
+ */
+static void apply_guest_cursor(SDL_Cursor *shape, bool guest_visible, bool captured)
+{
+    if (captured) return;
+    if (!guest_visible) { SDL_HideCursor(); return; }
+    if (shape) SDL_SetCursor(shape);
+    SDL_ShowCursor();
+}
+
+/*
  * Which parts of the window behave like a title bar.
  *
  * A client cannot place its own window on Wayland - the compositor owns
@@ -1430,6 +1447,26 @@ int main(int argc, char **argv)
             fprintf(stderr, "vypr: could not go fullscreen at %d,%d: %s\n",
                     opt.fs_x, opt.fs_y, SDL_GetError());
         SDL_SyncWindow(views[0].win);
+
+        /*
+         * Immersive means the guest owns the keyboard, including the keys the
+         * desktop would otherwise keep for itself.
+         *
+         * Pressing the Windows key should open the guest's Start menu, not the
+         * Linux launcher; Alt+Tab should switch guest windows, not host ones.
+         * Grabbing the keyboard tells the compositor to stop handling its own
+         * shortcuts while this window is focused (on Wayland, through the
+         * keyboard-shortcuts-inhibit protocol KWin supports), so every key
+         * reaches the window and is forwarded to the guest - the Windows key
+         * included, which is already in the scancode table as 0xE05B. Ctrl+Esc
+         * is still caught host-side below and always releases the window, so a
+         * grabbed keyboard can never trap the user.
+         */
+        SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
+        if (!SDL_SetWindowKeyboardGrab(views[0].win, true))
+            fprintf(stderr, "vypr: could not grab the keyboard (the Windows key "
+                            "may open the Linux launcher instead): %s\n",
+                    SDL_GetError());
     }
 
     views[0].pres = presenter_create(views[0].win, opt.backend, NULL);
@@ -1484,6 +1521,15 @@ int main(int argc, char **argv)
      * cursor nominally visible, so there has to be a way to say "capture"
      * that does not depend on guessing. */
     bool capture_forced = opt.capture != 0;
+
+    /* The guest's own pointer, shown as this window's cursor so it moves at the
+     * compositor's rate with no round trip. `guest_cursor` is the live SDL
+     * cursor built from the last shape; `guest_cursor_visible` is whether the
+     * guest wants a pointer shown at all. Applied only while not captured - a
+     * captured pointer is hidden by relative mouse mode, and the guest bakes its
+     * cursor into the frames then instead. */
+    SDL_Cursor *guest_cursor = NULL;
+    bool guest_cursor_visible = true;
 
     /* Height of the guest window's own title bar, kept in step with the window
      * - it changes when a window is maximised, restored or goes fullscreen. */
@@ -1708,6 +1754,8 @@ int main(int argc, char **argv)
                     set_capture(views[0].win,
                                 !opt.never_capture && (pointer_locked || capture_forced),
                                 true);
+                    apply_guest_cursor(guest_cursor, guest_cursor_visible,
+                                       !opt.never_capture && (pointer_locked || capture_forced));
 
                     /* The Ctrl and Shift presses already went to the guest, and
                      * the M never will - so release the modifiers explicitly or
@@ -2054,10 +2102,39 @@ drop_pump(&drop);
                         const struct vypr_msg_pointer_lock *m = (const void *)payload;
                         pointer_locked = m->locked != 0;
                         set_capture(views[0].win, pointer_locked || capture_forced, false);
+                        /* Coming out of capture, put the guest's pointer back. */
+                        apply_guest_cursor(guest_cursor, guest_cursor_visible,
+                                           pointer_locked || capture_forced);
                         printf("vypr: guest %s the pointer%s\n",
                                pointer_locked ? "captured" : "released",
                                capture_forced ? " (manual capture still on)" : "");
                         fflush(stdout);
+                    } else if (head.type == VYPR_MSG_CLIENT_CURSOR &&
+                               head.bytes >= sizeof(struct vypr_msg_cursor)) {
+                        const struct vypr_msg_cursor *m = (const void *)payload;
+                        guest_cursor_visible = m->visible != 0;
+                        /* A shape with an image makes a new cursor; visible with
+                         * no image (an unreadable shape) keeps the one we have. */
+                        const uint32_t need = (uint32_t)m->width * m->height * 4;
+                        if (m->bitmap_bytes && m->bitmap_bytes == need &&
+                            head.bytes >= sizeof(*m) + m->bitmap_bytes) {
+                            const void *pix = payload + sizeof(*m);
+                            SDL_Surface *surf = SDL_CreateSurfaceFrom(
+                                (int)m->width, (int)m->height,
+                                SDL_PIXELFORMAT_ARGB8888,
+                                (void *)pix, (int)m->width * 4);
+                            if (surf) {
+                                SDL_Cursor *c = SDL_CreateColorCursor(
+                                    surf, m->hotspot_x, m->hotspot_y);
+                                SDL_DestroySurface(surf);
+                                if (c) {
+                                    if (guest_cursor) SDL_DestroyCursor(guest_cursor);
+                                    guest_cursor = c;
+                                }
+                            }
+                        }
+                        apply_guest_cursor(guest_cursor, guest_cursor_visible,
+                                           pointer_locked || capture_forced);
                     } else if (head.type == VYPR_MSG_CLIENT_POPUP_END &&
                                head.bytes >= sizeof(struct vypr_msg_window_id)) {
                         const struct vypr_msg_window_id *m = (const void *)payload;
@@ -2235,6 +2312,7 @@ drop_pump(&drop);
                   gx, gy, gw, gh);
     }
 
+    if (guest_cursor) SDL_DestroyCursor(guest_cursor);
     for (int i = view_count - 1; i >= 0; i--) {
                 if (views[i].pres) presenter_destroy(views[i].pres);
         if (views[i].win)  SDL_DestroyWindow(views[i].win);

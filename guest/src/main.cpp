@@ -29,6 +29,7 @@
 #include "clipboard.hpp"
 #include "gamepad.hpp"
 #include "capture.hpp"
+#include "cursor.hpp"
 #include "control.hpp"
 #include "drop.hpp"
 #include "notify.hpp"
@@ -75,6 +76,7 @@ private:
     vypr::Control      audio_link_;   /* audio only; written by one thread */
     vypr::AudioCapture audio_;
     vypr::Clipboard    clipboard_;
+    vypr::CursorWatcher cursor_;
     vypr::Gamepads     gamepads_;
     vypr::Drop         drop_;
     std::vector<std::uint8_t> clip_in_;   /* a clipboard image being received */
@@ -256,6 +258,21 @@ void Agent::poll_pointer_lock() {
     if (locked) vypr::suspend_pointer_acceleration();
     else        vypr::restore_pointer_acceleration();
 
+    /*
+     * While an app has the pointer, bake the cursor back into the frames.
+     *
+     * A locked pointer means the host has hidden its own cursor and has no
+     * absolute position to draw one at anyway - a game is warping it. So the
+     * guest's own cursor, drawn into the capture, is the only one that can
+     * show. On release, take it out again and ask the watcher to resend the
+     * shape, so the host's native pointer comes straight back.
+     */
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        for (auto& [id, s] : streams_) s->capture.set_cursor_in_frame(locked);
+    }
+    if (!locked) cursor_.resend();
+
     vypr_msg_pointer_lock msg{};
     msg.window_id = lock_window_;
     msg.locked    = locked ? 1u : 0u;
@@ -409,7 +426,8 @@ void Agent::handle_ring_ready(const vypr_msg_ring_ready& msg) {
         return;
     }
 
-    if (!stream->capture.start(stream->hwnd, &stream->pub, stream->want_damage)) {
+    if (!stream->capture.start(stream->hwnd, &stream->pub, stream->want_damage,
+                               lock_state_)) {
         /* Late, but the host handles a refusal after the ring went out the
          * same way as one before it: it drops the window. */
         stream->pub.close();
@@ -680,7 +698,8 @@ void Agent::watch_windows() {
                                 "restarting capture (attempt %u)\n",
                                 (unsigned long long)id, s->restarts);
                             s->capture.stop();
-                            if (!s->capture.start(hwnd, &s->pub, s->want_damage))
+                            if (!s->capture.start(hwnd, &s->pub, s->want_damage,
+                                                  lock_state_))
                                 std::fprintf(stderr,
                                     "vypr: hwnd %llx would not restart\n",
                                     (unsigned long long)id);
@@ -795,6 +814,35 @@ bool Agent::run(const char* host, std::uint16_t port) {
                           static_cast<std::uint32_t>(msg.size()));
     });
 
+    /*
+     * The guest's pointer shape, for the host to draw as its own cursor.
+     *
+     * This is what lets the cursor be left out of the frames: the host moves a
+     * real pointer at the compositor's rate and only needs to be told the shape
+     * when it changes. Capped to a message, with the image downscaled to fit if
+     * some accessibility cursor is enormous.
+     */
+    cursor_.start([this](const vypr::CursorShape& c) {
+        const std::uint32_t max_img =
+            VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor);
+        std::uint32_t img = (std::uint32_t)c.bgra.size();
+        if (img > max_img) img = 0;   // should not happen; watcher pre-shrinks
+
+        std::vector<std::uint8_t> msg(sizeof(vypr_msg_cursor) + img);
+        auto* h = reinterpret_cast<vypr_msg_cursor*>(msg.data());
+        *h = {};
+        h->window_id    = 0;   // one pointer for the whole guest
+        h->hotspot_x    = c.hotspot_x;
+        h->hotspot_y    = c.hotspot_y;
+        h->width        = img ? c.width  : 0;
+        h->height       = img ? c.height : 0;
+        h->visible      = c.visible ? 1u : 0u;
+        h->bitmap_bytes = img;
+        if (img) std::memcpy(msg.data() + sizeof(*h), c.bgra.data(), img);
+        control_.send(VYPR_MSG_CURSOR, msg.data(),
+                      static_cast<std::uint32_t>(msg.size()));
+    }, VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor));
+
     /* Guest clipboard -> host. Sent on the control channel: it is text, it is
      * rare, and it must not overtake or be overtaken by anything. */
     clipboard_.start(
@@ -851,7 +899,7 @@ bool Agent::run(const char* host, std::uint16_t port) {
     hello.version      = VYPR_PROTO_VERSION;
     hello.qpc_freq     = static_cast<std::uint64_t>(freq.QuadPart);
     hello.agent_pid    = GetCurrentProcessId();
-    hello.capabilities = VYPR_CAP_RESIZE;
+    hello.capabilities = VYPR_CAP_RESIZE | VYPR_CAP_CURSOR_SHAPES;
     control_.send(VYPR_MSG_HELLO, &hello, sizeof(hello));
 
 
