@@ -27,7 +27,7 @@ virsh dominfo "$VM_NAME" >/dev/null 2>&1 || die "no VM called '$VM_NAME'"
 
 # The firmware image has to be the Secure Boot one, or the keys do nothing.
 if ! virsh dumpxml --inactive "$VM_NAME" | grep -q "OVMF_CODE.secboot"; then
-    die "the VM does not use the Secure Boot firmware image; run anti-detect.py --vanguard first"
+    die "the VM does not use the Secure Boot firmware image; run anti-detect.py --secure-windows first"
 fi
 
 # Never with the VM running: QEMU owns the file then and would overwrite it.

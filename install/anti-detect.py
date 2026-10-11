@@ -8,7 +8,7 @@ change below closes one of them. Nothing here is subtle or clever - it is the
 standard set, and anything determined to find a VM still will.
 
 Usage: anti-detect.py <in.xml> <out.xml> [--dmi KEY=VALUE ...] [--mac XX:XX:XX]
-       [--paranoid] [--disable-nested-virt] [--mild] [--deep]
+       [--paranoid] [--disable-nested-virt] [--mild] [--deep] [--secure-windows]
        anti-detect.py <in.xml> --status
        anti-detect.py <in.xml> <out.xml> --undo
 
@@ -34,11 +34,14 @@ Options:
                         ACPI battery emulation, CPU topology refinement, and
                         chipset device identity spoofing. This mode provides
                         maximum evasion for kernel-level anti-cheat systems.
-  --vanguard            Enable security features required by Riot Vanguard:
-                        UEFI Secure Boot, IOMMU, VBS/HVCI, and Hyper-V
-                        enlightenments. This enables Windows security features
-                        instead of hiding virtualization. Incompatible with
-                        --paranoid and --disable-nested-virt.
+  --secure-windows      Turn on the Windows security features some software
+                        checks for: the Secure Boot firmware image, nested
+                        virtualisation (VBS and HVCI run on it), the Hyper-V
+                        enlightenments, and TPM 2.0. Leaves the hiding measures
+                        alone. Needs nested virtualisation, so it refuses
+                        --disable-nested-virt. The keys for Secure Boot are
+                        enrolled by fix-secureboot.sh, and the virtual IOMMU is
+                        added by apply-secure-windows.sh, which runs all three.
   --status              Print what is and is not applied, and change nothing.
   --undo                Put the domain back to a stock one.
 
@@ -511,14 +514,14 @@ def enable_tsc_features(root, changes):
         changes.extend(changed)
 
 
-def enable_vanguard_security(root, changes):
+def enable_windows_security(root, changes):
     """Turn on the Windows security features some software checks for.
 
     Secure Boot firmware, nested virtualisation (which VBS and HVCI need), the
-    Hyper-V enlightenments, and TPM 2.0 (ensure_tpm_for_vanguard). The virtual
-    IOMMU, which Windows reports as DMA protection, is added by
-    apply-vanguard.sh rather than here, because libvirt cannot set the option
-    it needs.
+    Hyper-V enlightenments, and TPM 2.0 (ensure_tpm). The virtual IOMMU,
+    which Windows reports as DMA protection, is added by
+    apply-secure-windows.sh rather than here, because libvirt cannot set the
+    option it needs.
 
     Measured on the VM this was written against: VBS, HVCI and DMA protection
     all run with the hiding measures in place (the KVM leaf hidden, the Hyper-V
@@ -561,12 +564,11 @@ def enable_vanguard_security(root, changes):
                     changed.append("nvram template %s does not exist; using OVMF_VARS.4m.fd" % tmpl)
             changed.append("set the Secure Boot firmware image (enrol keys with fix-secureboot.sh)")
 
-    # 2. IOMMU for Vanguard
-    # NOTE: We do NOT add the intel-iommu QEMU device here because it conflicts
-    # with VFIO GPU passthrough (causes "Cannot allocate memory" errors).
-    # Instead, IOMMU is reported at the firmware level via DMAR ACPI table
-    # (see fake-iommu-in-firmware.py), which satisfies Vanguard's check without
-    # breaking VFIO.
+    # 2. The IOMMU is not done here. libvirt's <iommu> cannot set the
+    # dma-remap option Windows needs before it counts the device as DMA
+    # protection, so apply-secure-windows.sh launches it through
+    # qemu:commandline instead. (The intel-iommu device does conflict with
+    # VFIO passthrough; the AMD one used there does not.)
 
     feats = root.find("features")
     if feats is None:
@@ -636,8 +638,8 @@ def enable_vanguard_security(root, changes):
         changes.extend(changed)
 
 
-def ensure_tpm_for_vanguard(root, changes):
-    """Ensure TPM 2.0 is present (Vanguard checks for it)."""
+def ensure_tpm(root, changes):
+    """Ensure a TPM 2.0 is present; Windows' security features expect one."""
     changed = []
 
     devices = root.find("devices")
@@ -780,15 +782,18 @@ def main():
             print("  " + c)
         return
 
-    # Vanguard mode: enable Windows security features instead of hiding virtualization
-    if "--vanguard" in args:
+    # Windows security features, which is a different job from hiding: it
+    # turns things on rather than off. --vanguard was this flag's first name
+    # and still works, so nothing that used it breaks.
+    if "--secure-windows" in args or "--vanguard" in args:
         if "--disable-nested-virt" in args:
-            sys.exit("anti-detect: --vanguard needs nested virtualisation (VBS runs on it); drop --disable-nested-virt")
+            sys.exit("anti-detect: --secure-windows needs nested virtualisation (VBS runs on it); drop --disable-nested-virt")
 
-        enable_vanguard_security(root, changed)
-        ensure_tpm_for_vanguard(root, changed)
+        enable_windows_security(root, changed)
+        ensure_tpm(root, changed)
 
-        # Skip the normal anti-detection measures - they conflict with Vanguard requirements
+        # Only these, not the hiding measures: a user asking for both runs the
+        # script twice, and the two sets do not interfere (measured).
         ET.indent(tree, space="  ")
         tree.write(dst, encoding="unicode")
         for c in changed:
