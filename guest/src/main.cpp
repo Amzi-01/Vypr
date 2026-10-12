@@ -916,6 +916,8 @@ bool Agent::run(const char* host, std::uint16_t port) {
      * lags with the window instead of the host's instant cursor running ahead
      * of it. The watcher hides the host cursor for the same span. */
     [this](bool active) {
+        std::fprintf(stderr, "vypr: window drag %s at %llu ms\n",
+                     active ? "BEGIN" : "END", (unsigned long long)GetTickCount64());
         std::lock_guard<std::mutex> guard(lock_);
         for (auto& [id, s] : streams_) s->capture.set_cursor_in_frame(active);
     });

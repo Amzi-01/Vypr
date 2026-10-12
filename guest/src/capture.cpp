@@ -169,6 +169,7 @@ struct WindowCapture::Impl {
         StageState               state = StageState::Free;
         std::uint32_t            w = 0, h = 0;
         std::int64_t             composed = 0;  // SystemRelativeTime, 100ns ticks
+        std::int64_t             arrived = 0;   // when on_frame got it, 100ns ticks
         // Held until the copy out of it has finished, so the pool cannot hand
         // its surface back to DWM while the GPU is still reading it.
         Direct3D11CaptureFrame   frame{nullptr};
@@ -262,28 +263,39 @@ struct WindowCapture::Impl {
     unsigned                      min_frame_ms = 0;
     unsigned long long            last_accepted_ms = 0;
     std::atomic<unsigned long long> last_publish_ms{0};
-    // One keyframe per settle, not a steady stream. A full 4K GDI grab and a
-    // full-frame publish is expensive; firing it every 400ms on an idle monitor
-    // (the common case with two monitors) competed with the one being used.
-    // Reset to false on any WGC publish, set true after the one keyframe.
-    std::atomic<bool>             keyframe_done{false};
-    // GDI scratch for keyframes, used only by the reader thread.
-    HDC     kf_screen = nullptr;
-    HDC     kf_mem = nullptr;
-    HBITMAP kf_dib = nullptr;
-    void*   kf_bits = nullptr;
-    int     kf_w = 0, kf_h = 0;
+
+    /*
+     * The newest frame, held back rather than dropped.
+     *
+     * WGC only delivers a frame when something changes, so a frame dropped at
+     * the end of a burst - by the rate cap, or because every stage was busy -
+     * is a change the host never sees: drop a window and it stays drawn short
+     * of where it landed until something else on screen moves. So instead the
+     * newest frame waits here, and the reader thread submits it the moment the
+     * cap or a free stage allows. A newer arrival replaces it. Guarded by
+     * frame_lock; has_deferred lets the reader poll without taking it.
+     *
+     * This replaced an idle "keyframe" that grabbed the whole monitor with GDI
+     * on the reader thread. The grab took long enough that capture buffers
+     * were not released, Windows had nowhere to put new frames, and a moved
+     * window showed up about a second late.
+     */
+    Direct3D11CaptureFrame        deferred{nullptr};
+    std::int64_t                  deferred_arrived = 0;
+    std::atomic<bool>             has_deferred{false};
 
     bool ensure_staging(std::uint32_t w, std::uint32_t h);
     void on_frame(const Direct3D11CaptureFramePool& sender);
+    void accept_frame(Direct3D11CaptureFrame frame, std::int64_t arrived_at);
+    void defer_frame(Direct3D11CaptureFrame frame, std::int64_t arrived_at);
+    void try_deferred();
     void reader_loop();
     void write_out(Stage& st);
     void wait_band(Stage& st, std::uint32_t band);
     bool write_out_banded(Stage& st);
     void stop_reader();
     void gdi_loop();
-    void maybe_keyframe();
-    void note_published() { last_publish_ms.store(GetTickCount64()); keyframe_done.store(false); }
+    void note_published() { last_publish_ms.store(GetTickCount64()); }
 };
 
 /*
@@ -361,73 +373,6 @@ void WindowCapture::Impl::gdi_loop() {
     ReleaseDC(nullptr, screen);
 }
 
-/*
- * A full frame of an idle monitor, grabbed with GDI.
- *
- * Called from the reader thread when it has waited out its timeout with no WGC
- * frame to process - so it is the only thing publishing, never racing the WGC
- * path. WGC stops delivering on a still screen, and with the cursor no longer
- * baked in to keep frames coming, a frame captured mid-transition could sit on
- * screen until something repainted; this repaints it. GDI does not capture the
- * cursor, which is what we want (the host draws its own). Skipped while the
- * pointer is locked, where the cursor belongs in the frame.
- */
-void WindowCapture::Impl::maybe_keyframe() {
-    if (!is_monitor) return;
-    if (keyframe_done.load()) return;                              // already healed this settle
-    if (GetTickCount64() - last_publish_ms.load() < 400) return;  // WGC keeping up
-    if (cursor_in_frame) return;                                   // locked: leave to WGC
-
-    const RECT r = vypr_desktop_monitor_rect(desktop_id);
-    const int w = r.right - r.left;
-    const int h = r.bottom - r.top;
-    if (w <= 0 || h <= 0) return;
-
-    if (!kf_screen) { kf_screen = GetDC(nullptr); kf_mem = CreateCompatibleDC(kf_screen); }
-    if (!kf_mem) return;
-    if (!kf_dib || w != kf_w || h != kf_h) {
-        if (kf_dib) DeleteObject(kf_dib);
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-        bi.bmiHeader.biWidth       = w;
-        bi.bmiHeader.biHeight      = -h;   // top-down, like everything else here
-        bi.bmiHeader.biPlanes      = 1;
-        bi.bmiHeader.biBitCount    = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        kf_dib = CreateDIBSection(kf_mem, &bi, DIB_RGB_COLORS, &kf_bits, nullptr, 0);
-        if (!kf_dib) return;
-        SelectObject(kf_mem, kf_dib);
-        kf_w = w; kf_h = h;
-    }
-
-    if (!BitBlt(kf_mem, 0, 0, w, h, kf_screen, r.left, r.top, SRCCOPY | CAPTUREBLT))
-        return;
-
-    std::lock_guard<std::mutex> guard(lock);
-    if (!pub || !pub->bound()) return;
-    if (static_cast<std::uint32_t>(w) > pub->max_width() ||
-        static_cast<std::uint32_t>(h) > pub->max_height())
-        return;
-    std::uint32_t stride = 0;
-    std::uint8_t* dst = pub->begin_frame(&stride);
-    if (!dst) return;
-    const auto* srcp = static_cast<const std::uint8_t*>(kf_bits);
-    const std::size_t row = static_cast<std::size_t>(w) * 4;
-    for (int y = 0; y < h; y++)
-        std::memcpy(dst + static_cast<std::size_t>(y) * stride,
-                    srcp + static_cast<std::size_t>(y) * row, row);
-    LARGE_INTEGER qpc{};
-    QueryPerformanceCounter(&qpc);
-    if (pub->publish(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h),
-                     stride, static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
-                     VYPR_PUB_DAMAGE_FULL)) {
-        captured++;
-        // Not note_published(): that would clear keyframe_done and re-arm the
-        // keyframe. One heal per settle - update the time, mark it done.
-        last_publish_ms.store(GetTickCount64());
-        keyframe_done.store(true);
-    }
-}
 
 /*
  * Ask the scheduler to treat this thread as a capture thread.
@@ -528,14 +473,46 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
         dropped++;
     }
 
-    // Frame-rate cap: drop a frame that arrives too soon after the last one we
-    // took, so a fast burst (a window drag) does not push more full-frame
-    // readback over the PCIe x4 link than it can carry. The frame is released
-    // here, before the GPU copy, so the capacity is actually saved. A still
-    // screen is unaffected: frames come slower than the cap, none are dropped.
+    // A frame held back earlier is older than this one; this replaces it.
+    if (deferred) { deferred = nullptr; has_deferred = false; dropped++; }
+
+    accept_frame(std::move(frame), arrived_at);
+}
+
+/*
+ * Hold the newest frame for the reader to submit when it can (see `deferred`).
+ * Called with frame_lock held.
+ */
+void WindowCapture::Impl::defer_frame(Direct3D11CaptureFrame frame, std::int64_t arrived_at) {
+    deferred = std::move(frame);
+    deferred_arrived = arrived_at;
+    has_deferred = true;
+    job_cv.notify_all();   // the reader may be sleeping on its long timeout
+}
+
+/* Called by the reader when it has a moment: submit a held-back frame if the
+ * cap and the stages now allow it. */
+void WindowCapture::Impl::try_deferred() {
+    if (!has_deferred.load()) return;
+    std::lock_guard<std::mutex> in_frame(frame_lock);
+    if (!deferred) { has_deferred = false; return; }
+    if (min_frame_ms && GetTickCount64() - last_accepted_ms < min_frame_ms) return;
+    auto f = std::move(deferred);
+    deferred = nullptr;
+    has_deferred = false;
+    accept_frame(std::move(f), deferred_arrived);
+}
+
+/* Start the GPU copy of one frame and queue it for the reader. Called with
+ * frame_lock held. A frame that cannot go now is deferred, never dropped. */
+void WindowCapture::Impl::accept_frame(Direct3D11CaptureFrame frame, std::int64_t arrived_at) {
+    // Frame-rate cap: a frame too soon after the last one is held back, so a
+    // fast burst (a window drag) does not push more full-frame readback over
+    // the PCIe x4 link than it can carry. Held, not dropped: if it is the last
+    // of the burst it still goes out once the interval is up.
     if (min_frame_ms) {
         const unsigned long long now = GetTickCount64();
-        if (now - last_accepted_ms < min_frame_ms) { dropped++; return; }
+        if (now - last_accepted_ms < min_frame_ms) { defer_frame(std::move(frame), arrived_at); return; }
         last_accepted_ms = now;
     }
 
@@ -588,7 +565,12 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
             stages[i].frame = nullptr;
             dropped++;
         }
-        if (i < 0) { dropped++; return; }
+        if (i < 0) {
+            // Every stage busy: hold this one for when a stage frees up.
+            last_accepted_ms = 0;
+            defer_frame(std::move(frame), arrived_at);
+            return;
+        }
         stages[i].state = StageState::Copying;
     }
     Stage& st = stages[i];
@@ -623,6 +605,7 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
      */
     st.composed = std::min<std::int64_t>(frame.SystemRelativeTime().count(),
                                          arrived_at);
+    st.arrived = arrived_at;
     st.frame = std::move(frame);
 
     {
@@ -645,9 +628,12 @@ void WindowCapture::Impl::reader_loop() {
         int i = -1;
         {
             std::unique_lock<std::mutex> lk(job_lock);
-            // Wake on a queued frame, or time out to keyframe an idle monitor.
-            job_cv.wait_for(lk, std::chrono::milliseconds(200),
-                            [this] { return reader_stop || queued >= 0; });
+            // Wake on a queued frame. While a frame is held back, wake often
+            // enough to send it as soon as the rate cap allows; otherwise there
+            // is nothing to do until WGC delivers.
+            const auto wait = has_deferred.load() ? std::chrono::milliseconds(4)
+                                                  : std::chrono::milliseconds(250);
+            job_cv.wait_for(lk, wait, [this] { return reader_stop || queued >= 0; });
             if (reader_stop) break;
             if (queued >= 0) {
                 i = queued;
@@ -655,18 +641,15 @@ void WindowCapture::Impl::reader_loop() {
                 stages[i].state = StageState::Reading;
             }
         }
-        if (i < 0) { maybe_keyframe(); continue; }   // timed out: still screen
+        if (i < 0) { try_deferred(); continue; }
         write_out(stages[i]);
         {
             std::lock_guard<std::mutex> lk(job_lock);
             stages[i].state = StageState::Free;
         }
         job_cv.notify_all();
+        try_deferred();   // a stage just freed: a held-back frame can go now
     }
-
-    if (kf_dib)    { DeleteObject(kf_dib);     kf_dib = nullptr; }
-    if (kf_mem)    { DeleteDC(kf_mem);         kf_mem = nullptr; }
-    if (kf_screen) { ReleaseDC(nullptr, kf_screen); kf_screen = nullptr; }
 }
 
 /*
@@ -947,7 +930,13 @@ void WindowCapture::Impl::write_out(Stage& st) {
     // says the frame was captured to the moment it is published. This needs no
     // host/guest alignment, so it cannot be blamed on clock error.
     if (st.composed > 0) {
-        const double ms = (qpc_100ns(qpc_freq) - st.composed) / 10000.0;
+        const std::int64_t now_t = qpc_100ns(qpc_freq);
+        const double ms = (now_t - st.composed) / 10000.0;
+        // Slow-frame breakdown: how late Windows delivered it vs. our pipeline.
+        if (ms > 150.0)
+            std::fprintf(stderr, "vypr: SLOW frame %.0f ms = deliver %.0f ms + pipeline %.0f ms (%ux%u)\n",
+                         ms, (st.arrived - st.composed) / 10000.0,
+                         (now_t - st.arrived) / 10000.0, st.w, st.h);
         pipeline_ms_total += ms;
         if (ms > pipeline_ms_worst) pipeline_ms_worst = ms;
         if (++pipeline_n >= 240) {
@@ -1178,7 +1167,11 @@ void WindowCapture::stop() {
 
     // Closing the session stops new callbacks, not one already running. Wait
     // that out, then the reader, and only then free what both of them use.
-    { std::lock_guard<std::mutex> in_frame(impl_->frame_lock); }
+    {
+        std::lock_guard<std::mutex> in_frame(impl_->frame_lock);
+        impl_->deferred = nullptr;
+        impl_->has_deferred = false;
+    }
     impl_->stop_reader();
 
     std::lock_guard<std::mutex> guard(impl_->lock);
@@ -1201,8 +1194,15 @@ void WindowCapture::set_cursor_in_frame(bool on) {
     impl_->cursor_in_frame = on;
     // The session can take this live; no need to restart the capture.
     if (impl_->session) {
+        LARGE_INTEGER a{}, b{}, f{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
         if (auto s2 = impl_->session.try_as<IGraphicsCaptureSession2>())
             s2.IsCursorCaptureEnabled(on);
+        QueryPerformanceCounter(&b);
+        const double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+        std::fprintf(stderr, "vypr: cursor-in-frame %s took %.1f ms (thread %lu)\n",
+                     on ? "on" : "off", ms, GetCurrentThreadId());
     }
 }
 
