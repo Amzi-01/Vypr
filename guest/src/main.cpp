@@ -911,7 +911,14 @@ bool Agent::run(const char* host, std::uint16_t port) {
         if (img) std::memcpy(msg.data() + sizeof(*h), c.bgra.data(), img);
         control_.send(VYPR_MSG_CURSOR, msg.data(),
                       static_cast<std::uint32_t>(msg.size()));
-    }, VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor));
+    }, VYPR_MAX_MSG_BYTES - 64u - (std::uint32_t)sizeof(vypr_msg_cursor),
+    /* While a window is being dragged, bake the cursor into the frames so it
+     * lags with the window instead of the host's instant cursor running ahead
+     * of it. The watcher hides the host cursor for the same span. */
+    [this](bool active) {
+        std::lock_guard<std::mutex> guard(lock_);
+        for (auto& [id, s] : streams_) s->capture.set_cursor_in_frame(active);
+    });
 
     std::thread watcher([this] { watch_windows(); });
 

@@ -26,13 +26,20 @@ struct CursorShape {
 class CursorWatcher {
 public:
     using Callback = std::function<void(const CursorShape&)>;
+    // Called when a window move/resize begins (true) and ends (false). The host
+    // draws its own cursor, which is instant, while the dragged window comes
+    // back over the pipeline a step behind - so during a drag the cursor runs
+    // ahead of the window. For that moment the agent puts the cursor back into
+    // the captured frame (so it lags in lockstep with the window, as it used
+    // to) and hides the host cursor; this is the signal to do so.
+    using MoveSizeCallback = std::function<void(bool active)>;
 
     ~CursorWatcher();
 
     // Polls the pointer on its own thread and calls back on every change of
     // shape or visibility, plus once at start. `max_bytes` bounds the image;
-    // a bigger cursor is downscaled to fit.
-    void start(Callback cb, std::uint32_t max_bytes);
+    // a bigger cursor is downscaled to fit. `on_movesize` may be empty.
+    void start(Callback cb, std::uint32_t max_bytes, MoveSizeCallback on_movesize = {});
     void stop();
 
     // Ask for the current shape to be sent again, changed or not - for a host
@@ -43,6 +50,7 @@ private:
     void loop();
 
     Callback          cb_;
+    MoveSizeCallback  on_movesize_;
     std::uint32_t     max_bytes_ = 0;
     std::atomic<bool> stop_{false};
     std::atomic<bool> force_{true};

@@ -134,10 +134,11 @@ void fit(CursorShape& s, std::uint32_t max_bytes)
 
 CursorWatcher::~CursorWatcher() { stop(); }
 
-void CursorWatcher::start(Callback cb, std::uint32_t max_bytes)
+void CursorWatcher::start(Callback cb, std::uint32_t max_bytes, MoveSizeCallback on_movesize)
 {
     stop();
     cb_ = std::move(cb);
+    on_movesize_ = std::move(on_movesize);
     max_bytes_ = max_bytes;
     stop_ = false;
     force_ = true;
@@ -154,11 +155,32 @@ void CursorWatcher::loop()
 {
     HCURSOR last = nullptr;
     bool    last_visible = false;
+    bool    last_movesize = false;
 
     // 60 Hz: shape changes (arrow to I-beam on entering a text box) are rare
     // and the check is one call, so this costs nothing while making a new shape
     // appear within a frame of the guest choosing it.
     while (!stop_) {
+        // A window being dragged or resized. While it is, the cursor goes back
+        // into the frame (on_movesize) and the host cursor is hidden, so the
+        // pointer lags in lockstep with the window instead of racing ahead.
+        GUITHREADINFO gti{};
+        gti.cbSize = sizeof gti;
+        const bool movesize = GetGUIThreadInfo(0, &gti) && (gti.flags & GUI_INMOVESIZE);
+        if (movesize != last_movesize) {
+            if (on_movesize_) on_movesize_(movesize);
+            if (movesize) {
+                // Hide the host cursor; the in-frame one takes over.
+                CursorShape hidden; hidden.visible = false;
+                cb_(hidden);
+            } else {
+                force_ = true;   // drag over: resend the real shape, host shows it again
+            }
+            last_movesize = movesize;
+            last_visible = false;   // force the next shape through
+        }
+        if (movesize) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+
         CURSORINFO ci{};
         ci.cbSize = sizeof ci;
         if (GetCursorInfo(&ci)) {
