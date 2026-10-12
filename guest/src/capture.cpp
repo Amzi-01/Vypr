@@ -249,6 +249,11 @@ struct WindowCapture::Impl {
     bool                          is_monitor = false;
     std::uint64_t                 desktop_id = 0;
     std::atomic<unsigned long long> last_publish_ms{0};
+    // One keyframe per settle, not a steady stream. A full 4K GDI grab and a
+    // full-frame publish is expensive; firing it every 400ms on an idle monitor
+    // (the common case with two monitors) competed with the one being used.
+    // Reset to false on any WGC publish, set true after the one keyframe.
+    std::atomic<bool>             keyframe_done{false};
     // GDI scratch for keyframes, used only by the reader thread.
     HDC     kf_screen = nullptr;
     HDC     kf_mem = nullptr;
@@ -265,7 +270,7 @@ struct WindowCapture::Impl {
     void stop_reader();
     void gdi_loop();
     void maybe_keyframe();
-    void note_published() { last_publish_ms.store(GetTickCount64()); }
+    void note_published() { last_publish_ms.store(GetTickCount64()); keyframe_done.store(false); }
 };
 
 /*
@@ -356,6 +361,7 @@ void WindowCapture::Impl::gdi_loop() {
  */
 void WindowCapture::Impl::maybe_keyframe() {
     if (!is_monitor) return;
+    if (keyframe_done.load()) return;                              // already healed this settle
     if (GetTickCount64() - last_publish_ms.load() < 400) return;  // WGC keeping up
     if (cursor_in_frame) return;                                   // locked: leave to WGC
 
@@ -403,7 +409,10 @@ void WindowCapture::Impl::maybe_keyframe() {
                      stride, static_cast<std::uint64_t>(qpc.QuadPart), qpc_freq,
                      VYPR_PUB_DAMAGE_FULL)) {
         captured++;
-        note_published();
+        // Not note_published(): that would clear keyframe_done and re-arm the
+        // keyframe. One heal per settle - update the time, mark it done.
+        last_publish_ms.store(GetTickCount64());
+        keyframe_done.store(true);
     }
 }
 
