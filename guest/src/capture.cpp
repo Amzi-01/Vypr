@@ -248,6 +248,19 @@ struct WindowCapture::Impl {
      */
     bool                          is_monitor = false;
     std::uint64_t                 desktop_id = 0;
+    /*
+     * Frame-rate cap for a monitor capture, in ms between accepted frames.
+     *
+     * A 4K frame is ~33 MB and the readback crosses the guest GPU's PCIe x4
+     * link - on this host a downgraded x16, ~3.5 GB/s. One 4K monitor at 60 fps
+     * is ~2 GB/s of that, competing with the GPU's own rendering over the same
+     * link, so a window drag (full-frame changes every frame) saturates it and
+     * stalls everything. Capping the capture rate keeps the readback inside the
+     * link's budget; the desktop does not need 60 fps. 0 means uncapped.
+     * VYPR_MAX_FPS overrides; default 30 for a monitor, uncapped for a window.
+     */
+    unsigned                      min_frame_ms = 0;
+    unsigned long long            last_accepted_ms = 0;
     std::atomic<unsigned long long> last_publish_ms{0};
     // One keyframe per settle, not a steady stream. A full 4K GDI grab and a
     // full-frame publish is expensive; firing it every 400ms on an idle monitor
@@ -513,6 +526,17 @@ void WindowCapture::Impl::on_frame(const Direct3D11CaptureFramePool& sender) {
     while (auto newer = sender.TryGetNextFrame()) {
         frame = newer;
         dropped++;
+    }
+
+    // Frame-rate cap: drop a frame that arrives too soon after the last one we
+    // took, so a fast burst (a window drag) does not push more full-frame
+    // readback over the PCIe x4 link than it can carry. The frame is released
+    // here, before the GPU copy, so the capacity is actually saved. A still
+    // screen is unaffected: frames come slower than the cap, none are dropped.
+    if (min_frame_ms) {
+        const unsigned long long now = GetTickCount64();
+        if (now - last_accepted_ms < min_frame_ms) { dropped++; return; }
+        last_accepted_ms = now;
     }
 
     const auto size = frame.ContentSize();
@@ -988,6 +1012,15 @@ bool WindowCapture::start(void* hwnd_raw, Publisher* pub, bool damage,
     impl_->is_monitor = whole_desktop;
     impl_->desktop_id = id;
     impl_->last_publish_ms.store(GetTickCount64());
+
+    // Frame-rate cap: 30 fps for a monitor by default, overridable, off for a
+    // window. Keeps the 4K readback within the PCIe x4 budget (see min_frame_ms).
+    {
+        int max_fps = whole_desktop ? 30 : 0;
+        if (const char* e = std::getenv("VYPR_MAX_FPS")) max_fps = std::atoi(e);
+        impl_->min_frame_ms = max_fps > 0 ? (unsigned)(1000 / max_fps) : 0;
+        impl_->last_accepted_ms = 0;
+    }
 
     if (!whole_desktop && !IsWindow(hwnd)) return false;
 
