@@ -1366,11 +1366,28 @@ cmd_immersive() {
     say "Found $n host monitor(s)."
 
     # One WxH per output, in order, for the VDD.
-    local whs=() xy res
+    #
+    # The guest can be run below the monitor's native resolution and upscaled to
+    # fill it, which is the practical fix when the passed-through GPU is on a
+    # narrow PCIe link: a 4K frame is ~33 MB and crosses that link every frame,
+    # so two 4K monitors saturate a gen3 x4 slot and stutter, while 1440p
+    # (~15 MB) fits with room to spare. VYPR_MAX_HEIGHT caps the guest height
+    # (e.g. 1440 or 1080); 0/unset uses the monitor's full resolution. The width
+    # is scaled to keep the shape, and lands on a mode the virtual display has
+    # for a 16:9 screen (2560x1440, 1920x1080).
+    local cap_h="${VYPR_MAX_HEIGHT:-0}"
+    local whs=() xy res ow oh
     for line in "${outs[@]}"; do
         res=${line#* }; res=${res%% *}   # the WxH field
+        ow=${res%x*}; oh=${res#*x}
+        if [ "$cap_h" -gt 0 ] 2>/dev/null && [ "$oh" -gt "$cap_h" ]; then
+            # Proportional width, rounded to an even number.
+            local nw=$(( (ow * cap_h / oh + 1) / 2 * 2 ))
+            res="${nw}x${cap_h}"
+        fi
         whs+=("$res")
     done
+    [ "$cap_h" -gt 0 ] 2>/dev/null && say "Running the guest at ${whs[0]} (upscaled to fill your monitor) to fit the GPU's PCIe link."
 
     local vdd; vdd=$(guest_vdd_exe)
     if ! guest "if exist \"$vdd\" (echo yes)" 2>/dev/null | grep -qi yes; then
